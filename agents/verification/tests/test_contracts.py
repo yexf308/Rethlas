@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
+import json
 from pathlib import Path
 import sys
 
@@ -19,6 +20,40 @@ from agents.verification.api.contracts import (  # noqa: E402
 EXPECTED_IDS = ["statement:1", "statement:2"]
 PROOF_DIGEST = "proof-sha256"
 CONTEXT_DIGEST = "context-sha256"
+OUTPUT_SCHEMA_PATH = (
+    REPOSITORY_ROOT
+    / "agents"
+    / "verification"
+    / "schemas"
+    / "verification_output.schema.json"
+)
+
+
+_SUPPORTED_RESPONSE_SCHEMA_KEYWORDS = {
+    "type",
+    "properties",
+    "required",
+    "additionalProperties",
+    "enum",
+    "items",
+    "$defs",
+    "$ref",
+}
+
+
+def _unsupported_schema_keywords(schema: object) -> set[str]:
+    assert isinstance(schema, dict)
+    unsupported = set(schema) - _SUPPORTED_RESPONSE_SCHEMA_KEYWORDS
+
+    for container_keyword in ("properties", "$defs"):
+        children = schema.get(container_keyword, {})
+        assert isinstance(children, dict)
+        for child in children.values():
+            unsupported.update(_unsupported_schema_keywords(child))
+
+    if "items" in schema:
+        unsupported.update(_unsupported_schema_keywords(schema["items"]))
+    return unsupported
 
 
 def correct_payload() -> dict[str, object]:
@@ -63,6 +98,12 @@ def validate(payload: dict[str, object]) -> dict[str, object]:
         expected_proof_digest=PROOF_DIGEST,
         expected_context_digest=CONTEXT_DIGEST,
     )
+
+
+def test_response_schema_uses_only_portable_strict_output_keywords() -> None:
+    schema = json.loads(OUTPUT_SCHEMA_PATH.read_text(encoding="utf-8"))
+
+    assert _unsupported_schema_keywords(schema) == set()
 
 
 def test_builds_happy_correct_output() -> None:

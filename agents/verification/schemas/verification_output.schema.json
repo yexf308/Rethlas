@@ -1,6 +1,4 @@
 {
-  "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "title": "VerificationOutput",
   "type": "object",
   "additionalProperties": false,
   "required": [
@@ -22,8 +20,7 @@
       ],
       "properties": {
         "summary": {
-          "type": "string",
-          "minLength": 1
+          "type": "string"
         },
         "critical_errors": {
           "type": "array",
@@ -51,19 +48,15 @@
     },
     "checked_item_ids": {
       "type": "array",
-      "uniqueItems": true,
       "items": {
-        "type": "string",
-        "pattern": "^pi_[0-9a-f]{24}$"
+        "type": "string"
       }
     },
     "proof_digest": {
-      "type": "string",
-      "pattern": "^[0-9a-f]{64}$"
+      "type": "string"
     },
     "context_digest": {
-      "type": "string",
-      "pattern": "^[0-9a-f]{64}$"
+      "type": "string"
     }
   },
   "$defs": {
@@ -76,82 +69,12 @@
       ],
       "properties": {
         "location": {
-          "type": "string",
-          "minLength": 1
+          "type": "string"
         },
         "issue": {
-          "type": "string",
-          "minLength": 1
+          "type": "string"
         }
       }
     }
-  },
-  "allOf": [
-    {
-      "if": {
-        "properties": {
-          "verdict": {
-            "const": "correct"
-          }
-        },
-        "required": [
-          "verdict"
-        ]
-      },
-      "then": {
-        "properties": {
-          "verification_report": {
-            "properties": {
-              "critical_errors": {
-                "maxItems": 0
-              },
-              "gaps": {
-                "maxItems": 0
-              }
-            }
-          },
-          "repair_hints": {
-            "const": ""
-          }
-        }
-      }
-    },
-    {
-      "if": {
-        "properties": {
-          "verdict": {
-            "const": "wrong"
-          }
-        },
-        "required": [
-          "verdict"
-        ]
-      },
-      "then": {
-        "properties": {
-          "verification_report": {
-            "anyOf": [
-              {
-                "properties": {
-                  "critical_errors": {
-                    "minItems": 1
-                  }
-                }
-              },
-              {
-                "properties": {
-                  "gaps": {
-                    "minItems": 1
-                  }
-                }
-              }
-            ]
-          },
-          "repair_hints": {
-            "pattern": "\\S"
-          }
-        }
-      }
-    }
-  ]
+  }
 }

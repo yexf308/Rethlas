@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import sys
 import threading
 from types import SimpleNamespace
@@ -201,15 +202,27 @@ def test_prompt_delimiter_cannot_be_closed_by_proof_text() -> None:
     )[0]
     assert "</untrusted_math_data>" not in data_region
     assert "\\u003c/" in data_region
+    assert prompt.endswith(
+        "Do not write files or invoke a tool to persist the verdict."
+    )
+    assert "do not call MCP memory or output tools" in prompt
 
 
 def test_codex_command_uses_read_only_ephemeral_sandbox() -> None:
-    command = server.build_codex_command("prompt")
+    work_dir = Path("/isolated/workspace")
+    output_path = work_dir / "results" / "run" / "verification.json"
+    command = server.build_codex_command(
+        "prompt",
+        work_dir=work_dir,
+        output_path=output_path,
+    )
     assert "--dangerously-bypass-approvals-and-sandbox" not in command
     assert command[command.index("--sandbox") + 1] == "read-only"
     assert "--ephemeral" in command
     assert "--ignore-user-config" in command
     assert "--output-schema" in command
+    assert command[command.index("--output-last-message") + 1] == str(output_path)
+    assert not any("mcp_servers.verification_agent" in part for part in command)
 
 
 def test_endpoint_token_and_busy_slot_fail_closed(
@@ -350,13 +363,16 @@ def test_codex_item_output_is_bound_to_expected_context(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(server, "RESULTS_ROOT", tmp_path / "results")
-    manifest = parse_blueprint("candidate proof", target_statement="S")
+    secret_proof = "SECRET_PROOF_TEXT_MUST_NOT_ENTER_LOG"
+    secret_model_output = "SECRET_UNVALIDATED_MODEL_OUTPUT"
+    manifest = parse_blueprint(secret_proof, target_statement="S")
     item_id = manifest.item_ids[0]
     context = server.build_item_context(manifest, item_id, max_chars=10_000)
     payload = model_output(
         proof_digest=manifest.proof_digest,
         context=context,
     )
+    payload["verification_report"]["summary"] = secret_model_output
     if corrupt_digest:
         payload["context_digest"] = "0" * 64
 
@@ -365,8 +381,16 @@ def test_codex_item_output_is_bound_to_expected_context(
         assert command[-1] == "-"
         assert context["current_item"]["proof"] in kwargs["input"]
         assert context["current_item"]["proof"] not in " ".join(command)
-        output_path = Path(kwargs["cwd"]) / "results" / "item-run" / "verification.json"
-        output_path.parent.mkdir(parents=True)
+        assert kwargs["stdout"] == server.subprocess.DEVNULL
+        assert kwargs["stderr"] == server.subprocess.STDOUT
+        workspace = Path(kwargs["cwd"])
+        assert not (workspace / "mcp").exists()
+        assert not (workspace / ".codex").exists()
+        assert not any("mcp_servers.verification_agent" in part for part in command)
+        output_path = Path(command[command.index("--output-last-message") + 1])
+        assert output_path == workspace.parent / "output" / "verification.json"
+        assert output_path.is_absolute()
+        assert output_path.parent.is_dir()
         output_path.write_text(json.dumps(payload), encoding="utf-8")
         return SimpleNamespace(returncode=0)
 
@@ -391,3 +415,129 @@ def test_codex_item_output_is_bound_to_expected_context(
         assert output == payload
         persisted = server._results_dir("item-run") / "verification.json"
         assert json.loads(persisted.read_text(encoding="utf-8")) == payload
+
+    log_text = server._log_path("item-run").read_text(encoding="utf-8")
+    assert secret_proof not in log_text
+    assert secret_model_output not in log_text
+    assert "codex_returncode: 0" in log_text
+    assert "codex_status: completed" in log_text
+    assert (
+        "output_status: contract_rejected" if corrupt_digest
+        else "output_status: validated"
+    ) in log_text
+
+
+@pytest.mark.parametrize(
+    ("artifact", "expected_error"),
+    [
+        ("missing", "verification output missing"),
+        ("invalid_json", "invalid verification output"),
+        ("oversized", "VERIFY_MAX_OUTPUT_BYTES"),
+        ("symlink", "invalid verification output"),
+        ("hardlink", "exactly one hard link"),
+        ("fifo", "regular file"),
+        ("directory", "regular file"),
+        ("invalid_utf8", "invalid verification output"),
+        ("duplicate_keys", "duplicate JSON key"),
+    ],
+)
+def test_codex_item_output_rejects_unsafe_or_invalid_artifacts(
+    artifact: str,
+    expected_error: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(server, "RESULTS_ROOT", tmp_path / "results")
+    monkeypatch.setattr(
+        server,
+        "VERIFY_MAX_OUTPUT_BYTES",
+        256 if artifact == "oversized" else 10_000,
+    )
+    manifest = parse_blueprint("candidate proof", target_statement="S")
+    item_id = manifest.item_ids[0]
+    context = server.build_item_context(manifest, item_id, max_chars=10_000)
+    payload = model_output(proof_digest=manifest.proof_digest, context=context)
+
+    def fake_subprocess_run(*args: Any, **kwargs: Any) -> SimpleNamespace:
+        command = args[0]
+        output_path = Path(command[command.index("--output-last-message") + 1])
+        if artifact == "missing":
+            # A legacy misspelling must not be discovered or accepted.
+            (output_path.parent / "verificationt.json").write_text(
+                json.dumps(payload), encoding="utf-8"
+            )
+        elif artifact == "invalid_json":
+            output_path.write_text("{", encoding="utf-8")
+        elif artifact == "oversized":
+            output_path.write_bytes(b"x" * 257)
+        elif artifact == "symlink":
+            target = output_path.parent / "symlink-target.json"
+            target.write_text(json.dumps(payload), encoding="utf-8")
+            output_path.symlink_to(target.name)
+        elif artifact == "hardlink":
+            target = output_path.parent / "hardlink-target.json"
+            target.write_text(json.dumps(payload), encoding="utf-8")
+            os.link(target, output_path)
+        elif artifact == "fifo":
+            os.mkfifo(output_path)
+        elif artifact == "directory":
+            output_path.mkdir()
+        elif artifact == "invalid_utf8":
+            output_path.write_bytes(b"\xff")
+        elif artifact == "duplicate_keys":
+            duplicate = json.dumps(payload).replace(
+                '"verdict": "correct"',
+                '"verdict": "correct", "verdict": "correct"',
+                1,
+            )
+            output_path.write_text(duplicate, encoding="utf-8")
+        else:  # pragma: no cover - guards the parametrization itself
+            raise AssertionError(f"unknown artifact {artifact}")
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(server.subprocess, "run", fake_subprocess_run)
+    with pytest.raises(HTTPException) as exc_info:
+        server.run_codex_item_verification(
+            run_id="unsafe-output-run",
+            target_statement="S",
+            proof_digest=manifest.proof_digest,
+            context=context,
+        )
+
+    assert exc_info.value.status_code == 500
+    assert expected_error in str(exc_info.value.detail)
+
+
+def test_nonzero_codex_exit_is_rejected_even_with_valid_output(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(server, "RESULTS_ROOT", tmp_path / "results")
+    manifest = parse_blueprint("candidate proof", target_statement="S")
+    item_id = manifest.item_ids[0]
+    context = server.build_item_context(manifest, item_id, max_chars=10_000)
+    payload = model_output(proof_digest=manifest.proof_digest, context=context)
+
+    def fake_subprocess_run(*args: Any, **kwargs: Any) -> SimpleNamespace:
+        command = args[0]
+        output_path = Path(command[command.index("--output-last-message") + 1])
+        assert kwargs["stdout"] == server.subprocess.DEVNULL
+        output_path.write_text(json.dumps(payload), encoding="utf-8")
+        return SimpleNamespace(returncode=7)
+
+    monkeypatch.setattr(server.subprocess, "run", fake_subprocess_run)
+    with pytest.raises(HTTPException) as exc_info:
+        server.run_codex_item_verification(
+            run_id="failed-codex-run",
+            target_statement="S",
+            proof_digest=manifest.proof_digest,
+            context=context,
+        )
+
+    assert exc_info.value.status_code == 500
+    assert "codex exec failed" in str(exc_info.value.detail)
+    log_text = server._log_path("failed-codex-run").read_text(encoding="utf-8")
+    assert context["current_item"]["proof"] not in log_text
+    assert json.dumps(payload) not in log_text
+    assert "codex_returncode: 7" in log_text
+    assert "codex_status: failed" in log_text

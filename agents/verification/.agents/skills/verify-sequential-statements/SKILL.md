@@ -42,12 +42,13 @@ bodies. `Target_statement` contains the overall theorem and hypotheses.
 10. Classify findings:
    - `critical_error`: logical contradiction, invalid theorem use, false implication.
    - `gap`: missing derivation, vague justification, unsupported step, unjustified existence or property assumptions about objects, suspiciously unused assumptions whose role is not justified, failure to distinguish between similar-looking definitions or formulas, or a hand-wavy deduction from one property to another.
-11. Persist a check for the supplied current item to `statement_checks` using
-    `memory_append`. Do not claim coverage of any other item.
+11. Keep a structured check for the supplied current item in the current
+    response's finding ledger. Do not call memory tools and do not claim
+    coverage of any other item.
 
 ## Output Contract
 
-Append records to `statement_checks` with structure like:
+Keep records in the finding ledger with structure like:
 
 ```json
 {
@@ -62,7 +63,7 @@ Append records to `statement_checks` with structure like:
 }
 ```
 
-## MCP Tools
+## Tool Policy
 
-- `memory_append`
-- `memory_query`
+Do not use MCP memory or output tools. The current item is deliberately bounded
+so its complete finding ledger must stay in the current response context.

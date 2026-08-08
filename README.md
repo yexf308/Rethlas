@@ -32,7 +32,7 @@ npm install -g @openai/codex
 ## 2. Clone the Repository
 
 ```bash
-git clone https://github.com/frenzymath/Rethlas.git
+git clone https://github.com/yexf308/Rethlas.git
 cd Rethlas
 ```
 
@@ -43,7 +43,7 @@ cd Rethlas
 cd agents/verification
 python3 -m venv .venv
 source .venv/bin/activate
-pip install -r requirements.txt
+pip install -r api/requirements.txt
 uvicorn api.server:app --host 127.0.0.1 --port 8091
 ```
 
@@ -51,7 +51,7 @@ Using uv
 ```bash
 cd agents/verification
 uv venv 
-uv pip install -r requirements.txt
+uv pip install -r api/requirements.txt
 uv run uvicorn api.server:app --host 127.0.0.1 --port 8091
 ```
 
@@ -68,6 +68,24 @@ under a read-only Codex sandbox; user-level Codex configuration is ignored and
 only a validated JSON result is copied back. This reduces prompt-injection
 impact; it is not a host-read confidentiality boundary.
 
+The production verifier does not configure or call an MCP server. Codex returns
+one schema-constrained JSON object, and the CLI writes that last message to the
+isolated run directory with `--output-last-message`. The service then applies a
+stricter production validator: checked item ids must match exactly and in
+order, proof and context digests must match, findings must be well formed, and
+the verdict/repair hints must be consistent. Only validated JSON is copied into
+the persistent results directory. Persistent logs contain only service-authored
+metadata, status, and the Codex exit code; the raw Codex stdout/stderr stream is
+discarded because it may contain the full proof or unvalidated model output.
+This avoids non-interactive MCP approval failures and removes `fastmcp` from
+the live verification dependency path.
+
+The old `agents/verification/mcp` implementation and its tests remain for
+standalone compatibility. Install `mcp/requirements.txt` only when explicitly
+running that legacy MCP, or install the combined `requirements.txt` for local
+development of both paths. It is not copied into the isolated production
+workspace and is not required by the verification API.
+
 The verifier is resource-bounded by default. The main controls are:
 
 - `VERIFY_CONTEXT_MAX_CHARS=200000` per proof item
@@ -78,6 +96,7 @@ The verifier is resource-bounded by default. The main controls are:
 - `VERIFY_MAX_ITEMS=128`
 - `VERIFY_MAX_PROMPT_BYTES=500000` per serialized model prompt
 - `VERIFY_MAX_TOTAL_PROMPT_BYTES=5000000` per request
+- `VERIFY_MAX_OUTPUT_BYTES=1000000` for each direct verifier JSON result
 - `VERIFY_MAX_CONCURRENT_REQUESTS=1`
 - `CODEX_TIMEOUT_SECONDS=3600` per item
 - `VERIFY_REQUEST_TIMEOUT_SECONDS=3500` for the complete HTTP request

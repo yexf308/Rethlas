@@ -1,6 +1,6 @@
 ---
 name: check-referenced-statements
-description: Validate externally referenced theorems by querying arXiv theorem search first and Codex's built-in web search second. Use when a markdown proof cites statements from external papers.
+description: Validate externally referenced theorems against arXiv or other authoritative sources with built-in web search. Use when a markdown proof cites statements from external papers.
 ---
 
 # Check Referenced Statements
@@ -16,7 +16,8 @@ For each cited external theorem/lemma/definition:
 
 ## Procedure
 
-1. Query `search_arxiv_theorems` using the full referenced statement as `query`.
+1. Use built-in web search with the full referenced statement, targeting arXiv
+   and the cited paper or its authoritative source first.
 2. Inspect returned results and compare theorem text directly to the referenced statement in reasoning.
 3. Expand the definitions and terminology appearing in the cited statement using the cited paper's context before deciding whether the theorem applies.
 4. Check whether the same words in the current proof mean the same thing as they do in the cited paper. In mathematics, identical words can carry different definitions in different contexts.
@@ -29,17 +30,18 @@ For each cited external theorem/lemma/definition:
 9. Treat a logically invalid transition from the cited theorem to the claimed conclusion as a critical error.
 10. If that downstream step deduces one property from another, compare the exact definitions and defining formulas of both properties before accepting the deduction.
 11. If the theorem exists but the current proof uses different definitions, hypotheses, ambient objects, or a subtly different defining formula, record a critical error for incorrect application.
-12. If no match is found, use Codex's built-in web search with the same statement text.
+12. If no match is found, broaden built-in web search while preserving the
+    exact statement and citation details.
 13. If still not found, emit a critical error:
    - location: where the citation is used,
    - issue: referenced theorem appears non-existent or incorrectly cited.
-14. Persist each reference check in `reference_checks`.
+14. Keep each reference check in the current response's finding ledger.
 
 Do not rely on dedicated comparison utility code; perform comparison through careful reasoning.
 
 ## Output Contract
 
-Append records to `reference_checks` like:
+Keep records in the finding ledger like:
 
 ```json
 {
@@ -55,8 +57,7 @@ Append records to `reference_checks` like:
 }
 ```
 
-## Tools
+## Tool Policy
 
-- `search_arxiv_theorems`
-- `memory_append`
-- Codex's built-in web search
+- Codex's built-in web search is allowed for external citations.
+- Do not use MCP search, memory, validation, or output tools.
