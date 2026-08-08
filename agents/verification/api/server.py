@@ -42,7 +42,7 @@ RESULTS_ROOT = WORK_DIR / "results"
 
 CODEX_BIN = os.getenv("CODEX_BIN", "codex")
 CODEX_MODEL = os.getenv("CODEX_MODEL", "gpt-5.6-sol")
-CODEX_REASONING_EFFORT = os.getenv("CODEX_REASONING_EFFORT", "max")
+CODEX_REASONING_EFFORT = os.getenv("CODEX_REASONING_EFFORT", "xhigh")
 VERIFICATION_FILENAME = "verification.json"
 _TOKEN_USAGE_RE = re.compile(r"tokens\s+used\s*\n?\s*([0-9][0-9,]*)", re.IGNORECASE)
 _MCP_RUNTIME_MODULES = ("fastmcp", "requests", "jsonschema")

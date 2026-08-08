@@ -5,6 +5,12 @@ Rethlas is a natural-language reasoning system for mathematics built around two 
 - The generation agent reads a math problem from a markdown file and writes an informal proof blueprint.
 - The verification agent checks that proof blueprint, produces a structured verdict, and serves as the generation agent's verifier.
 
+Both agents default to `gpt-5.6-sol`. Generation, including its subgoal
+prover, defaults to `max` reasoning effort; verification defaults to `xhigh`.
+The generation runner preserves explicit `MODEL` and `REASONING_EFFORT`
+overrides, while the verification service preserves explicit `CODEX_MODEL`
+and `CODEX_REASONING_EFFORT` overrides.
+
 The intended deployment order is:
 
 1. Start the verification agent as a local HTTP service.

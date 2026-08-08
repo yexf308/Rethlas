@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import subprocess
 import sys
 import threading
 import tomllib
@@ -456,6 +457,51 @@ def test_codex_command_uses_read_only_ephemeral_sandbox() -> None:
     assert f"cwd={json.dumps(str(work_dir.resolve()))}" in mcp_config
     assert "tool_timeout_sec=" in mcp_config
     assert "approval_policy=\"never\"" in command
+
+
+def _isolated_verifier_model_settings(
+    overrides: dict[str, str] | None = None,
+) -> dict[str, str]:
+    environment = dict(os.environ)
+    environment.pop("CODEX_MODEL", None)
+    environment.pop("CODEX_REASONING_EFFORT", None)
+    environment["PYTHONDONTWRITEBYTECODE"] = "1"
+    environment.update(overrides or {})
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import json; from api import server; "
+                "print(json.dumps({'model': server.CODEX_MODEL, "
+                "'effort': server.CODEX_REASONING_EFFORT}))"
+            ),
+        ],
+        cwd=VERIFICATION_ROOT,
+        env=environment,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return json.loads(completed.stdout)
+
+
+def test_verifier_defaults_to_sol_xhigh_and_preserves_environment_overrides() -> None:
+    config = tomllib.loads(
+        (VERIFICATION_ROOT / ".codex" / "config.toml").read_text(encoding="utf-8")
+    )
+    assert config["model"] == "gpt-5.6-sol"
+    assert config["model_reasoning_effort"] == "xhigh"
+    assert _isolated_verifier_model_settings() == {
+        "model": "gpt-5.6-sol",
+        "effort": "xhigh",
+    }
+    assert _isolated_verifier_model_settings(
+        {
+            "CODEX_MODEL": "override-model",
+            "CODEX_REASONING_EFFORT": "medium",
+        }
+    ) == {"model": "override-model", "effort": "medium"}
 
 
 def test_codex_command_injects_one_complete_mcp_object_and_preserves_venv_path(
