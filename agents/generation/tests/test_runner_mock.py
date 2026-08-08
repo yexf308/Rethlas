@@ -8,9 +8,58 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 
 RUNNER = Path(__file__).with_name("run_example.sh")
 GENERATION_ROOT = RUNNER.parents[1]
+REQUIRED_MODULES = (
+    "fastmcp",
+    "requests",
+    "numpy",
+    "scipy",
+    "sympy",
+    "mpmath",
+    "gmpy2",
+)
+
+
+def _site_packages(runtime_bin: Path) -> Path:
+    return Path(
+        subprocess.run(
+            [
+                str(runtime_bin / "python3"),
+                "-I",
+                "-B",
+                "-c",
+                "import sysconfig; print(sysconfig.get_paths()['purelib'])",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+    )
+
+
+def _make_math_runtime(agents_dir: Path) -> Path:
+    runtime = agents_dir / ".generation-venv"
+    subprocess.run(
+        [sys.executable, "-m", "venv", "--without-pip", str(runtime)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    runtime_bin = runtime / "bin"
+    site_packages = _site_packages(runtime_bin)
+    for module_name in REQUIRED_MODULES:
+        package = site_packages / module_name
+        package.mkdir()
+        (package / "__init__.py").write_text("", encoding="utf-8")
+    return runtime_bin
+
+
+def _module_stub(fake_bin: Path, module_name: str) -> Path:
+    return _site_packages(fake_bin) / module_name
 
 
 def _make_runner_tree(tmp_path: Path) -> tuple[Path, Path]:
@@ -21,6 +70,10 @@ def _make_runner_tree(tmp_path: Path) -> tuple[Path, Path]:
     data_dir.mkdir()
     shutil.copy2(RUNNER, tests_dir / "run_example.sh")
     shutil.copy2(GENERATION_ROOT / "AGENTS.md", generation / "AGENTS.md")
+    shutil.copy2(
+        GENERATION_ROOT / "requirements-math-research.txt",
+        generation / "requirements-math-research.txt",
+    )
     shutil.copytree(GENERATION_ROOT / ".codex", generation / ".codex")
     shutil.copytree(GENERATION_ROOT / ".agents", generation / ".agents")
     shutil.copytree(
@@ -30,8 +83,7 @@ def _make_runner_tree(tmp_path: Path) -> tuple[Path, Path]:
     )
     (data_dir / "example.md").write_text("S", encoding="utf-8")
 
-    fake_bin = tmp_path / "bin"
-    fake_bin.mkdir()
+    fake_bin = _make_math_runtime(generation.parent)
     fake_codex = fake_bin / "codex"
     fake_codex.write_text(
         """#!/usr/bin/env python3
@@ -39,14 +91,49 @@ import hashlib
 import json
 import os
 import pathlib
+import shutil
 import sys
 import tomllib
 
+calls_file = os.environ.get("MOCK_CODEX_CALLS_FILE")
+if calls_file:
+    with pathlib.Path(calls_file).open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(sys.argv) + "\\n")
 if "--version" in sys.argv:
     print("codex-mock 1.0")
     raise SystemExit(0)
 assert "--dangerously-bypass-approvals-and-sandbox" not in sys.argv
 assert sys.argv[sys.argv.index("--sandbox") + 1] == "workspace-write"
+shell_policy_configs = [
+    value
+    for index, value in enumerate(sys.argv)
+    if index > 0
+    and sys.argv[index - 1] == "--config"
+    and value.startswith("shell_environment_policy=")
+]
+assert len(shell_policy_configs) == 1
+shell_policy = tomllib.loads(
+    "value=" + shell_policy_configs[0].split("=", 1)[1]
+)["value"]
+assert shell_policy == {
+    "inherit": "none",
+    "set": {
+        "PATH": (
+            f"{pathlib.Path(sys.executable).parent.resolve()}"
+            ":/usr/bin:/bin:/usr/sbin:/sbin"
+        )
+    },
+}
+safe_path = shell_policy["set"]["PATH"]
+assert shutil.which("python", path=safe_path) == str(
+    pathlib.Path(sys.executable).parent / "python"
+)
+assert shutil.which("python3", path=safe_path) == str(
+    pathlib.Path(sys.executable).parent / "python3"
+)
+(pathlib.Path.cwd() / "shell_environment_policy_seen.json").write_text(
+    json.dumps(shell_policy), encoding="utf-8"
+)
 reasoning_mcp_configs = [
     value
     for index, value in enumerate(sys.argv)
@@ -68,6 +155,9 @@ assert set(reasoning_mcp) == {
     "default_tools_approval_mode",
 }
 assert pathlib.Path(reasoning_mcp["command"]).is_absolute()
+assert pathlib.Path(reasoning_mcp["command"]).resolve() == pathlib.Path(
+    sys.executable
+).resolve()
 assert reasoning_mcp["args"][0] == "-B"
 assert pathlib.Path(reasoning_mcp["args"][1]).is_absolute()
 assert pathlib.Path(reasoning_mcp["args"][1]).name == "server.py"
@@ -77,6 +167,7 @@ assert reasoning_mcp["tool_timeout_sec"] == 3600
 # every tool on this server noninteractive; approval_policy=never cannot cancel
 # the call while waiting for an unavailable prompt.
 assert reasoning_mcp["default_tools_approval_mode"] == "approve"
+assert "NumPy, SciPy, SymPy, mpmath, and gmpy2" in sys.argv[-1]
 (pathlib.Path.cwd() / "reasoning_mcp_config_seen.json").write_text(
     json.dumps(reasoning_mcp), encoding="utf-8"
 )
@@ -151,6 +242,33 @@ elif os.environ.get("MOCK_PUBLICATION") == "transient_tamper":
     return tests_dir / "run_example.sh", fake_bin
 
 
+def _mock_environment(
+    runner: Path,
+    fake_bin: Path,
+    *,
+    mode: str,
+    problem_file: str = "data/example.md",
+    extra_environment: dict[str, str] | None = None,
+) -> dict[str, str]:
+    runner_tmp = runner.parent.parent / ".runner-tmp"
+    runner_tmp.mkdir(exist_ok=True)
+    environment = dict(os.environ)
+    environment.update(
+        {
+            "PATH": f"{fake_bin}{os.pathsep}{environment['PATH']}",
+            "TMPDIR": str(runner_tmp),
+            "MAX_ITERATIONS": "1",
+            "TIMER_INTERVAL_SECONDS": "1",
+            "LOG_DIR": str(runner.parents[3] / "logs"),
+            "VERIFY_HEALTH_URL": "http://127.0.0.1:1/health",
+            "MOCK_PUBLICATION": mode,
+            "PROBLEM_FILE": problem_file,
+        }
+    )
+    environment.update(extra_environment or {})
+    return environment
+
+
 def _run_mock(
     tmp_path: Path,
     *,
@@ -159,19 +277,13 @@ def _run_mock(
     extra_environment: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     runner, fake_bin = _make_runner_tree(tmp_path)
-    environment = dict(os.environ)
-    environment.update(
-        {
-            "PATH": f"{fake_bin}{os.pathsep}{environment['PATH']}",
-            "MAX_ITERATIONS": "1",
-            "TIMER_INTERVAL_SECONDS": "1",
-            "LOG_DIR": str(tmp_path / "logs"),
-            "VERIFY_HEALTH_URL": "http://127.0.0.1:1/health",
-            "MOCK_PUBLICATION": mode,
-            "PROBLEM_FILE": problem_file,
-        }
+    environment = _mock_environment(
+        runner,
+        fake_bin,
+        mode=mode,
+        problem_file=problem_file,
+        extra_environment=extra_environment,
     )
-    environment.update(extra_environment or {})
     return subprocess.run(
         [str(runner)],
         cwd=runner.parent.parent,
@@ -212,6 +324,250 @@ def test_runner_injects_complete_mcp_and_auto_approves_memory_tools(
     assert config["tool_timeout_sec"] == 3600
     assert Path(config["args"][1]).is_absolute()
     assert not Path(config["args"][1]).is_relative_to(generation_root.resolve())
+
+
+def test_runner_injects_minimal_shell_path_with_preflighted_python(
+    tmp_path: Path,
+) -> None:
+    completed = _run_mock(tmp_path, mode="trusted")
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    generation_root = tmp_path / "agents" / "generation"
+    policy = json.loads(
+        (generation_root / "shell_environment_policy_seen.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    runtime_bin = tmp_path / "agents" / ".generation-venv" / "bin"
+    assert policy == {
+        "inherit": "none",
+        "set": {
+            "PATH": f"{runtime_bin}:/usr/bin:/bin:/usr/sbin:/sbin",
+        },
+    }
+
+
+@pytest.mark.parametrize("missing_module", REQUIRED_MODULES)
+def test_runner_missing_runtime_module_starts_zero_codex_processes(
+    tmp_path: Path,
+    missing_module: str,
+) -> None:
+    runner, fake_bin = _make_runner_tree(tmp_path)
+    shutil.rmtree(_module_stub(fake_bin, missing_module))
+    calls_file = tmp_path / "codex-calls.jsonl"
+    environment = _mock_environment(
+        runner,
+        fake_bin,
+        mode="forged",
+        extra_environment={"MOCK_CODEX_CALLS_FILE": str(calls_file)},
+    )
+
+    completed = subprocess.run(
+        [str(runner)],
+        cwd=runner.parent.parent,
+        env=environment,
+        text=True,
+        capture_output=True,
+        timeout=20,
+        check=False,
+    )
+
+    assert completed.returncode == 1
+    assert missing_module in completed.stderr
+    assert "module not found" in completed.stderr
+    assert not calls_file.exists()
+
+
+def test_runner_broken_runtime_import_starts_zero_codex_processes(
+    tmp_path: Path,
+) -> None:
+    runner, fake_bin = _make_runner_tree(tmp_path)
+    (_module_stub(fake_bin, "sympy") / "__init__.py").write_text(
+        "raise RuntimeError('mock native import failure')\n",
+        encoding="utf-8",
+    )
+    calls_file = tmp_path / "codex-calls.jsonl"
+    environment = _mock_environment(
+        runner,
+        fake_bin,
+        mode="forged",
+        extra_environment={"MOCK_CODEX_CALLS_FILE": str(calls_file)},
+    )
+
+    completed = subprocess.run(
+        [str(runner)],
+        cwd=runner.parent.parent,
+        env=environment,
+        text=True,
+        capture_output=True,
+        timeout=20,
+        check=False,
+    )
+
+    assert completed.returncode == 1
+    assert "sympy: import raised RuntimeError: mock native import failure" in completed.stderr
+    assert not calls_file.exists()
+
+
+def test_runner_workspace_pth_entry_starts_zero_codex_processes(
+    tmp_path: Path,
+) -> None:
+    runner, fake_bin = _make_runner_tree(tmp_path)
+    generation_root = runner.parent.parent
+    workspace_package = generation_root / "sympy"
+    workspace_package.mkdir()
+    (workspace_package / "__init__.py").write_text("", encoding="utf-8")
+    shutil.rmtree(_module_stub(fake_bin, "sympy"))
+    (_site_packages(fake_bin) / "workspace-origin.pth").write_text(
+        f"{generation_root}\n",
+        encoding="utf-8",
+    )
+    calls_file = tmp_path / "codex-calls.jsonl"
+    environment = _mock_environment(
+        runner,
+        fake_bin,
+        mode="forged",
+        extra_environment={"MOCK_CODEX_CALLS_FILE": str(calls_file)},
+    )
+
+    completed = subprocess.run(
+        [str(runner)],
+        cwd=generation_root,
+        env=environment,
+        text=True,
+        capture_output=True,
+        timeout=20,
+        check=False,
+    )
+
+    assert completed.returncode == 1
+    assert ".pth path entry" in completed.stderr
+    assert "model-writable generation workspace" in completed.stderr
+    assert not calls_file.exists()
+
+
+def test_runner_executable_pth_starts_zero_codex_processes(
+    tmp_path: Path,
+) -> None:
+    runner, fake_bin = _make_runner_tree(tmp_path)
+    generation_root = runner.parent.parent
+    workspace_package = generation_root / "sympy"
+    workspace_package.mkdir()
+    (workspace_package / "__init__.py").write_text("", encoding="utf-8")
+    shutil.rmtree(_module_stub(fake_bin, "sympy"))
+    site_packages = _site_packages(fake_bin)
+    (site_packages / "workspace_editable_finder.py").write_text(
+        """import importlib.abc
+import importlib.util
+import sys
+from pathlib import Path
+
+TARGET = Path({target!r})
+
+
+class WorkspaceEditableFinder(importlib.abc.MetaPathFinder):
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname != "sympy":
+            return None
+        return importlib.util.spec_from_file_location(
+            fullname,
+            TARGET / "__init__.py",
+            submodule_search_locations=[str(TARGET)],
+        )
+
+
+def install():
+    sys.meta_path.insert(0, WorkspaceEditableFinder())
+""".format(target=str(workspace_package)),
+        encoding="utf-8",
+    )
+    (site_packages / "workspace-editable.pth").write_text(
+        "import workspace_editable_finder; workspace_editable_finder.install()\n",
+        encoding="utf-8",
+    )
+    calls_file = tmp_path / "codex-calls.jsonl"
+    environment = _mock_environment(
+        runner,
+        fake_bin,
+        mode="forged",
+        extra_environment={"MOCK_CODEX_CALLS_FILE": str(calls_file)},
+    )
+
+    completed = subprocess.run(
+        [str(runner)],
+        cwd=generation_root,
+        env=environment,
+        text=True,
+        capture_output=True,
+        timeout=20,
+        check=False,
+    )
+
+    assert completed.returncode == 1
+    assert "executable .pth line is forbidden" in completed.stderr
+    assert not calls_file.exists()
+
+
+def test_runner_workspace_editable_origin_starts_zero_codex_processes(
+    tmp_path: Path,
+) -> None:
+    runner, fake_bin = _make_runner_tree(tmp_path)
+    generation_root = runner.parent.parent
+    workspace_package = generation_root / "sympy"
+    workspace_package.mkdir()
+    (workspace_package / "__init__.py").write_text("", encoding="utf-8")
+    shutil.rmtree(_module_stub(fake_bin, "sympy"))
+    editable_packages = fake_bin.parent / "editable-packages"
+    editable_packages.mkdir()
+    (editable_packages / "sympy").symlink_to(workspace_package, target_is_directory=True)
+    (_site_packages(fake_bin) / "workspace-editable-origin.pth").write_text(
+        f"{editable_packages}\n",
+        encoding="utf-8",
+    )
+    calls_file = tmp_path / "codex-calls.jsonl"
+    environment = _mock_environment(
+        runner,
+        fake_bin,
+        mode="forged",
+        extra_environment={"MOCK_CODEX_CALLS_FILE": str(calls_file)},
+    )
+
+    completed = subprocess.run(
+        [str(runner)],
+        cwd=generation_root,
+        env=environment,
+        text=True,
+        capture_output=True,
+        timeout=20,
+        check=False,
+    )
+
+    assert completed.returncode == 1
+    assert "sympy: unsafe module spec" in completed.stderr
+    assert "model-writable generation workspace" in completed.stderr
+    assert not calls_file.exists()
+
+
+@pytest.mark.parametrize("package_kind", ("regular", "namespace"))
+def test_runner_accepts_safe_external_required_package_locations(
+    tmp_path: Path,
+    package_kind: str,
+) -> None:
+    runner, fake_bin = _make_runner_tree(tmp_path)
+    if package_kind == "namespace":
+        (_module_stub(fake_bin, "sympy") / "__init__.py").unlink()
+    environment = _mock_environment(runner, fake_bin, mode="trusted")
+
+    completed = subprocess.run(
+        [str(runner)],
+        cwd=runner.parent.parent,
+        env=environment,
+        text=True,
+        capture_output=True,
+        timeout=20,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stdout + completed.stderr
 
 
 def test_runner_rejects_model_written_verified_file_without_receipt(
@@ -260,17 +616,7 @@ def test_runner_rejects_unchecked_hash_bytecode_before_codex_starts(
         doraise=True,
         invalidation_mode=py_compile.PycInvalidationMode.UNCHECKED_HASH,
     )
-    environment = dict(os.environ)
-    environment.update(
-        {
-            "PATH": f"{fake_bin}{os.pathsep}{environment['PATH']}",
-            "MAX_ITERATIONS": "1",
-            "TIMER_INTERVAL_SECONDS": "1",
-            "LOG_DIR": str(tmp_path / "logs"),
-            "VERIFY_HEALTH_URL": "http://127.0.0.1:1/health",
-            "MOCK_PUBLICATION": "forged",
-        }
-    )
+    environment = _mock_environment(runner, fake_bin, mode="forged")
 
     completed = subprocess.run(
         [str(runner)],
@@ -299,19 +645,10 @@ def test_runner_rejects_python_environment_inside_generation_workspace(
         capture_output=True,
         text=True,
     )
-    environment = dict(os.environ)
-    environment.update(
-        {
-            "PATH": (
-                f"{writable_venv / 'bin'}{os.pathsep}"
-                f"{fake_bin}{os.pathsep}{environment['PATH']}"
-            ),
-            "MAX_ITERATIONS": "1",
-            "TIMER_INTERVAL_SECONDS": "1",
-            "LOG_DIR": str(tmp_path / "logs"),
-            "VERIFY_HEALTH_URL": "http://127.0.0.1:1/health",
-            "MOCK_PUBLICATION": "forged",
-        }
+    environment = _mock_environment(runner, fake_bin, mode="forged")
+    environment["PATH"] = (
+        f"{writable_venv / 'bin'}{os.pathsep}"
+        f"{fake_bin}{os.pathsep}{environment['PATH']}"
     )
 
     completed = subprocess.run(
@@ -332,13 +669,11 @@ def test_runner_rejects_python_environment_inside_generation_workspace(
 def test_runner_rejects_problem_name_that_would_be_normalized(tmp_path: Path) -> None:
     runner, fake_bin = _make_runner_tree(tmp_path)
     (runner.parent.parent / "data" / "foo bar.md").write_text("S", encoding="utf-8")
-    environment = dict(os.environ)
-    environment.update(
-        {
-            "PATH": f"{fake_bin}{os.pathsep}{environment['PATH']}",
-            "PROBLEM_FILE": "data/foo bar.md",
-            "MAX_ITERATIONS": "1",
-        }
+    environment = _mock_environment(
+        runner,
+        fake_bin,
+        mode="forged",
+        problem_file="data/foo bar.md",
     )
     completed = subprocess.run(
         [str(runner)],

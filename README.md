@@ -133,7 +133,7 @@ does not authenticate the response.
 cd agents
 python3 -m venv .generation-venv
 source .generation-venv/bin/activate
-pip install -r generation/mcp/requirements.txt
+pip install -r generation/requirements-math-research.txt
 cd generation
 ./tests/run_example.sh
 ```
@@ -143,6 +143,36 @@ The generation MCP environment deliberately lives beside, rather than inside,
 interpreter or site-packages directory placed there cannot be part of the
 publication trust boundary. The runner rejects Python environments inside the
 generation workspace or the system temporary directory.
+
+`generation/requirements-math-research.txt` is the generation capability
+profile. It includes the authoritative `generation/mcp/requirements.txt`
+rather than duplicating MCP dependencies, then adds NumPy, SciPy, SymPy,
+mpmath, and gmpy2. Before creating run state, snapshotting the trusted runtime,
+or invoking Codex, the runner rejects executable `.pth` hooks and `.pth` paths
+into the writable workspace or temporary directory, then uses the selected
+external interpreter to run both `find_spec` and a real import for every
+required module. Its `sys.path`, module origins/search locations, and imported
+module trees are checked against the same writable boundaries. A missing
+module, broken binary/import, or workspace-backed editable package therefore
+fails with zero Codex invocations.
+
+Model shell commands still use `shell_environment_policy.inherit=none`. The
+runner explicitly sets a minimal `PATH` containing only the trusted Python
+environment's `bin` directory and `/usr/bin:/bin:/usr/sbin:/sbin`, so `python`
+and `python3` resolve to that same preflighted interpreter without exposing the
+host PATH or other host environment variables. Basic system tools such as the
+system `curl` may be present, but shell network access is not a supported
+retrieval path; use Codex web search when enabled. PDF extraction remains a
+runner-side optional preprocessing step using `pdftotext` from the operator's
+launch environment. If it is unavailable, the runner warns and ignores PDF
+references; install it separately or provide `.md`, `.tex`, or `.txt`
+references. `pdftotext` and non-system tools such as `rg` are not added to the
+model shell PATH implicitly.
+
+Operational failures found in paid or mock generation runs are recorded in
+[`agents/generation/INCIDENTS.md`](agents/generation/INCIDENTS.md), including
+their token impact, security classification, remediation, and regression
+evidence.
 
 This script:
 

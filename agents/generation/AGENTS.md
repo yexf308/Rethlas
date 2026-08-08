@@ -39,6 +39,19 @@ Do not flatten category directories out of `problem_id`. A problem in `data/alge
 
 Reference directories are problem-specific. For `data/algebra/modrep.md`, the associated reference directory is `data/algebra/modrep.refs/`. Supported direct reference files include `.md`, `.tex`, and `.txt`. PDF references are pre-extracted by the runner into `.txt` files under `reference_dir/.extracted/`; read those extracted text files instead of trying to inspect PDF binaries. These files are user-provided context, not verified facts; cite them in memory records and proof steps when they influence the proof.
 
+## Local Math Runtime
+
+The runner exposes one preflighted, external math-research Python environment
+as both `python` and `python3`. It includes NumPy, SciPy, SymPy, mpmath, and
+gmpy2 in addition to the reasoning MCP dependencies. Use it for numerical
+experiments, symbolic checks, and exact arithmetic when useful, but treat
+computational evidence as evidence rather than a proof.
+
+The shell inherits no host environment and receives only a restricted tool
+path. Shell network access is not a supported capability; use the configured
+web/arXiv search tools when retrieval is enabled. Read local references only
+through the problem-specific paths described above.
+
 
 ## Required Memory Policy
 

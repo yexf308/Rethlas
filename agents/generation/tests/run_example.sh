@@ -13,6 +13,16 @@ TIMER_INTERVAL_SECONDS="${TIMER_INTERVAL_SECONDS:-30}"
 # artifact, and therefore cannot be excluded safely from the trust decision.
 export PYTHONDONTWRITEBYTECODE=1
 
+REQUIRED_GENERATION_MODULES=(
+  fastmcp
+  requests
+  numpy
+  scipy
+  sympy
+  mpmath
+  gmpy2
+)
+
 # Resolve and constrain the interpreter with shell built-ins/tools before using
 # Python for any trust decision. In particular, never execute a model-writable
 # virtual environment and then ask that same interpreter whether it is safe.
@@ -35,6 +45,286 @@ for candidate in "$TRUSTED_PYTHON_BIN" "$python_target"; do
     exit 1
   fi
 done
+
+# Process .pth files before starting Python with site initialization enabled.
+# Executable .pth lines run before the in-process preflight can inspect
+# sys.path/spec origins, so a PEP 660/editable hook could otherwise execute
+# model-writable code first. Use -S here to keep this scan ahead of all site
+# hooks, and require an isolated environment rather than system-site fallback.
+if ! "$TRUSTED_PYTHON_BIN" -I -S -B - \
+  "$ROOT_DIR" "$temporary_root" "$TRUSTED_PYTHON_BIN" <<'PY'
+import os
+import stat
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1]).resolve(strict=True)
+temporary_root = Path(sys.argv[2]).resolve(strict=True)
+expected_executable = Path(sys.argv[3]).absolute()
+executable = Path(sys.executable).absolute()
+
+
+def fail(message: str) -> None:
+    print(f"generation math-research runtime .pth preflight failed: {message}", file=sys.stderr)
+    raise SystemExit(2)
+
+
+def resolved_outside_writable(value: object, label: str) -> Path:
+    try:
+        raw = os.fspath(value)
+    except TypeError as exc:
+        fail(f"{label} is not a filesystem path: {value!r}: {exc}")
+    candidate = Path(os.fsdecode(raw))
+    try:
+        resolved = candidate.resolve(strict=False)
+    except (OSError, RuntimeError) as exc:
+        fail(f"cannot resolve {label} {candidate}: {exc}")
+    for boundary_label, boundary in (
+        ("generation workspace", root),
+        ("temporary directory", temporary_root),
+    ):
+        if resolved == boundary or resolved.is_relative_to(boundary):
+            fail(f"{label} resolves inside the model-writable {boundary_label}: {resolved}")
+    return resolved
+
+
+if executable != expected_executable:
+    fail(f"Python executable changed during .pth validation: {executable}")
+scripts_dir = resolved_outside_writable(expected_executable.parent, "Python bin directory")
+environment_root = resolved_outside_writable(scripts_dir.parent, "Python environment")
+venv_config = environment_root / "pyvenv.cfg"
+if venv_config.exists() or venv_config.is_symlink():
+    metadata = venv_config.lstat()
+    if not stat.S_ISREG(metadata.st_mode):
+        fail(f"pyvenv.cfg must be a regular non-symlink file: {venv_config}")
+    if metadata.st_size > 65536:
+        fail(f"pyvenv.cfg is unexpectedly large: {venv_config}")
+    try:
+        config_text = venv_config.read_text(encoding="utf-8")
+    except (OSError, UnicodeError) as exc:
+        fail(f"cannot read pyvenv.cfg: {exc}")
+    for line in config_text.splitlines():
+        key, separator, value = line.partition("=")
+        if separator and key.strip().casefold() == "include-system-site-packages":
+            if value.strip().casefold() == "true":
+                fail("include-system-site-packages must be false")
+
+site_directories: set[Path] = set()
+for library_name in ("lib", "lib64"):
+    library_root = environment_root / library_name
+    if not library_root.is_dir():
+        continue
+    for version_directory in library_root.glob("python*"):
+        candidate = version_directory / "site-packages"
+        if candidate.is_dir() or candidate.is_symlink():
+            site_directories.add(
+                resolved_outside_writable(candidate, "Python site-packages directory")
+            )
+windows_site = environment_root / "Lib" / "site-packages"
+if windows_site.is_dir() or windows_site.is_symlink():
+    site_directories.add(
+        resolved_outside_writable(windows_site, "Python site-packages directory")
+    )
+
+for site_directory in sorted(site_directories):
+    try:
+        pth_files = sorted(site_directory.glob("*.pth"))
+    except OSError as exc:
+        fail(f"cannot enumerate .pth files in {site_directory}: {exc}")
+    for pth_file in pth_files:
+        try:
+            metadata = pth_file.lstat()
+        except OSError as exc:
+            fail(f"cannot inspect .pth file {pth_file}: {exc}")
+        if not stat.S_ISREG(metadata.st_mode):
+            fail(f".pth entry must be a regular non-symlink file: {pth_file}")
+        if metadata.st_size > 1_000_000:
+            fail(f".pth file exceeds 1 MB: {pth_file}")
+        try:
+            text = pth_file.read_text(encoding="utf-8")
+        except (OSError, UnicodeError) as exc:
+            fail(f"cannot read .pth file {pth_file}: {exc}")
+        for line_number, line in enumerate(text.splitlines(), start=1):
+            processed = line.rstrip()
+            stripped = processed.strip()
+            if not stripped or stripped.startswith("#"):
+                continue
+            if stripped.startswith(("import ", "import\t")):
+                fail(f"executable .pth line is forbidden: {pth_file}:{line_number}")
+            resolved_outside_writable(
+                site_directory / processed,
+                f".pth path entry {pth_file}:{line_number}",
+            )
+PY
+then
+  echo "Use a wheel-installed, isolated generation environment without executable .pth hooks." >&2
+  exit 1
+fi
+
+# This is the interpreter used both by the immutable MCP snapshot and by the
+# model's local math shell. Validate it, then import every declared runtime
+# module before creating run state, taking a snapshot, or invoking Codex.
+if ! "$TRUSTED_PYTHON_BIN" -I -B - \
+  "$ROOT_DIR" "$TRUSTED_PYTHON_BIN" "${REQUIRED_GENERATION_MODULES[@]}" <<'PY'
+import importlib
+import importlib.util
+import os
+import sys
+import tempfile
+from pathlib import Path
+
+root = Path(sys.argv[1]).resolve(strict=True)
+expected_executable = Path(sys.argv[2]).absolute()
+module_names = sys.argv[3:]
+executable = Path(sys.executable).absolute()
+prefix = Path(sys.prefix).resolve(strict=True)
+temporary_root = Path(tempfile.gettempdir()).resolve(strict=True)
+
+
+def fail(message: str) -> None:
+    print(f"generation math-research runtime preflight failed: {message}", file=sys.stderr)
+    raise SystemExit(2)
+
+
+class UnsafeRuntimePath(RuntimeError):
+    pass
+
+
+def audit_filesystem_path(value: object, label: str) -> None:
+    try:
+        raw = os.fspath(value)
+    except TypeError as exc:
+        raise UnsafeRuntimePath(f"{label} is not a filesystem path: {value!r}") from exc
+    if not isinstance(raw, str):
+        raw = os.fsdecode(raw)
+    candidate = Path.cwd() if raw == "" else Path(raw)
+    try:
+        resolved = candidate.resolve(strict=False)
+    except (OSError, RuntimeError) as exc:
+        raise UnsafeRuntimePath(f"cannot resolve {label} {candidate}: {exc}") from exc
+    for boundary_label, boundary in (
+        ("generation workspace", root),
+        ("temporary directory", temporary_root),
+    ):
+        if resolved == boundary or resolved.is_relative_to(boundary):
+            raise UnsafeRuntimePath(
+                f"{label} resolves inside the model-writable {boundary_label}: {resolved}"
+            )
+
+
+def audit_path_collection(values: object, label: str) -> list[object]:
+    try:
+        entries = list(values)  # type: ignore[arg-type]
+    except BaseException as exc:
+        raise UnsafeRuntimePath(f"cannot inspect {label}: {type(exc).__name__}: {exc}") from exc
+    for index, entry in enumerate(entries):
+        audit_filesystem_path(entry, f"{label}[{index}]")
+    return entries
+
+
+def audit_spec(spec: object, label: str) -> None:
+    origin = getattr(spec, "origin", None)
+    locations = getattr(spec, "submodule_search_locations", None)
+    if origin not in (None, "built-in", "frozen"):
+        audit_filesystem_path(origin, f"{label} spec.origin")
+    if locations is not None:
+        entries = audit_path_collection(locations, f"{label} spec search path")
+        if origin is None and not entries:
+            raise UnsafeRuntimePath(f"{label} namespace package has no search locations")
+    elif origin is None:
+        raise UnsafeRuntimePath(f"{label} has neither an origin nor package search locations")
+
+
+def audit_sys_path(stage: str) -> None:
+    for index, entry in enumerate(sys.path):
+        audit_filesystem_path(entry, f"sys.path[{index}] during {stage}")
+
+
+def audit_loaded_module_tree(module_name: str) -> None:
+    prefix = module_name + "."
+    for loaded_name, loaded_module in list(sys.modules.items()):
+        if loaded_module is None or not (
+            loaded_name == module_name or loaded_name.startswith(prefix)
+        ):
+            continue
+        spec = getattr(loaded_module, "__spec__", None)
+        if spec is not None:
+            audit_spec(spec, f"loaded module {loaded_name}")
+        for attribute in ("__file__", "__cached__"):
+            value = getattr(loaded_module, attribute, None)
+            if value is not None:
+                audit_filesystem_path(value, f"loaded module {loaded_name}.{attribute}")
+        package_path = getattr(loaded_module, "__path__", None)
+        if package_path is not None:
+            audit_path_collection(package_path, f"loaded module {loaded_name}.__path__")
+
+
+if executable != expected_executable:
+    fail(f"Python executable changed during validation: {executable}")
+if prefix.is_relative_to(root) or prefix.is_relative_to(temporary_root):
+    fail(
+        "Python environment must be outside the generation workspace and "
+        f"temporary directory: {prefix}"
+    )
+try:
+    audit_sys_path("initial runtime validation")
+except UnsafeRuntimePath as exc:
+    fail(str(exc))
+
+scripts_dir = expected_executable.parent.resolve(strict=True)
+if os.pathsep in str(scripts_dir) or "\n" in str(scripts_dir):
+    fail(f"Python bin directory cannot be represented safely in PATH: {scripts_dir}")
+expected_target = expected_executable.resolve(strict=True)
+for command_name in ("python", "python3"):
+    candidate = scripts_dir / command_name
+    try:
+        candidate_target = candidate.resolve(strict=True)
+    except OSError as exc:
+        fail(f"{command_name} is missing from the trusted Python bin directory: {exc}")
+    if not os.access(candidate, os.X_OK) or candidate_target != expected_target:
+        fail(f"{candidate} does not resolve to the selected interpreter")
+
+errors: list[str] = []
+for module_name in module_names:
+    try:
+        spec = importlib.util.find_spec(module_name)
+    except BaseException as exc:  # fail closed for broken package metadata/hooks
+        errors.append(f"{module_name}: find_spec raised {type(exc).__name__}: {exc}")
+        continue
+    if spec is None:
+        errors.append(f"{module_name}: module not found")
+        continue
+    try:
+        audit_spec(spec, f"required module {module_name}")
+    except BaseException as exc:
+        errors.append(f"{module_name}: unsafe module spec: {type(exc).__name__}: {exc}")
+        continue
+    try:
+        importlib.import_module(module_name)
+    except BaseException as exc:  # an installed package can still be unusable
+        errors.append(f"{module_name}: import raised {type(exc).__name__}: {exc}")
+        continue
+    try:
+        audit_sys_path(f"import of {module_name}")
+        audit_loaded_module_tree(module_name)
+    except BaseException as exc:
+        errors.append(f"{module_name}: unsafe imported path: {type(exc).__name__}: {exc}")
+
+if errors:
+    fail("; ".join(errors))
+PY
+then
+  echo "Install agents/generation/requirements-math-research.txt into the selected external Python environment." >&2
+  exit 1
+fi
+trusted_python_command="$TRUSTED_PYTHON_BIN"
+trusted_python_dir="$(cd "$(dirname "$trusted_python_command")" && pwd -P)"
+SAFE_SHELL_PATH="$trusted_python_dir:/usr/bin:/bin:/usr/sbin:/sbin"
+TRUSTED_SHELL_ENVIRONMENT_POLICY_TOML="$(
+  "$TRUSTED_PYTHON_BIN" -I -B -c \
+    'import json, sys; print("{inherit=\"none\",set={PATH=" + json.dumps(sys.argv[1]) + "}}")' \
+    "$SAFE_SHELL_PATH"
+)"
 
 if [[ "$PROBLEM_FILE" = /* ]]; then
   echo "PROBLEM_FILE must be relative to agents/generation: $PROBLEM_FILE" >&2
@@ -111,8 +401,6 @@ format_duration() {
     $((total / 3600)) $(((total % 3600) / 60)) $((total % 60))
 }
 
-prepare_references
-
 LOG_DIR="${LOG_DIR:-$ROOT_DIR/logs/$problem_rel/iter}"
 verified_path="$ROOT_DIR/results/$problem_rel/blueprint_verified.md"
 trusted_receipts_root="$(cd "$ROOT_DIR/.." && pwd -P)/.verification_receipts"
@@ -144,7 +432,11 @@ import sys
 from pathlib import Path
 
 root = Path(sys.argv[1]).resolve(strict=True)
-explicit = [root / "AGENTS.md", root / "tests" / "run_example.sh"]
+explicit = [
+    root / "AGENTS.md",
+    root / "requirements-math-research.txt",
+    root / "tests" / "run_example.sh",
+]
 trees = [root / ".codex", root / ".agents", root / "mcp"]
 
 def fail(message: str) -> None:
@@ -252,6 +544,8 @@ trusted_runtime_parent="$(cd "$trusted_runtime_parent" && pwd -P)"
 trusted_runtime_dir="$(mktemp -d "$trusted_runtime_parent/runtime.XXXXXX")"
 mkdir -p "$trusted_runtime_dir/tests"
 cp -p "$ROOT_DIR/AGENTS.md" "$trusted_runtime_dir/AGENTS.md"
+cp -p "$ROOT_DIR/requirements-math-research.txt" \
+  "$trusted_runtime_dir/requirements-math-research.txt"
 cp -p "$ROOT_DIR/tests/run_example.sh" "$trusted_runtime_dir/tests/run_example.sh"
 cp -pR "$ROOT_DIR/.codex" "$trusted_runtime_dir/.codex"
 cp -pR "$ROOT_DIR/.agents" "$trusted_runtime_dir/.agents"
@@ -266,36 +560,6 @@ if [[ "$SNAPSHOT_RUNTIME_MANIFEST" != "$TRUSTED_RUNTIME_MANIFEST" ]]; then
 fi
 chmod -R a-w "$trusted_runtime_dir"
 export RETHLAS_GENERATION_ROOT="$ROOT_DIR"
-trusted_python_command="$({
-  "$TRUSTED_PYTHON_BIN" -B - "$ROOT_DIR" "$TRUSTED_PYTHON_BIN" <<'PY'
-import sys
-import tempfile
-from pathlib import Path
-
-root = Path(sys.argv[1]).resolve(strict=True)
-expected_executable = Path(sys.argv[2]).absolute()
-executable = Path(sys.executable).absolute()
-prefix = Path(sys.prefix).resolve(strict=True)
-temporary_root = Path(tempfile.gettempdir()).resolve(strict=True)
-if executable != expected_executable:
-    print(
-        f"Python executable changed during validation: {executable}",
-        file=sys.stderr,
-    )
-    raise SystemExit(2)
-for label, path in (("Python environment", prefix),):
-    if path.is_relative_to(root) or path.is_relative_to(temporary_root):
-        print(
-            f"{label} must be outside the generation workspace and temporary directory: {path}",
-            file=sys.stderr,
-        )
-        raise SystemExit(2)
-print(executable)
-PY
-} )" || {
-  echo "Could not establish a model-inaccessible Python runtime for generation MCP." >&2
-  exit 1
-}
 TRUSTED_PYTHON_COMMAND_TOML="$(
   "$TRUSTED_PYTHON_BIN" -B -c 'import json, sys; print(json.dumps(sys.argv[1]))' \
     "$trusted_python_command"
@@ -481,6 +745,8 @@ if [[ -e "$verified_path" || -L "$verified_path" ]]; then
   fi
 fi
 
+prepare_references
+
 CODEX_VERSION="$(codex --version 2>/dev/null || echo 'unknown')"
 
 echo "========================================"
@@ -490,6 +756,7 @@ echo " Effort:     $REASONING_EFFORT"
 echo " Problem:    $PROBLEM_FILE"
 echo " Problem ID: $problem_rel"
 echo " References: $ref_dir"
+echo " Math Python: $trusted_python_command"
 echo " Max iters:  $MAX_ITERATIONS"
 echo " Logs:       $LOG_DIR"
 echo " Stop file:  $verified_path"
@@ -579,7 +846,7 @@ for ((iter = 0; iter < MAX_ITERATIONS; iter += 1)); do
   echo "Starting iter=$iter -> $log_file"
 
   if [[ "$iter" -eq 0 ]]; then
-    prompt="Use AGENTS.md exactly to solve the math problem in ${PROBLEM_FILE}. Use problem_id=${problem_rel}. ${ref_prompt} This is iteration 0 in a fresh session. Ignore any pre-existing blueprint_verified.md: only verify_blueprint_service and its trusted receipt can finish this run."
+    prompt="Use AGENTS.md exactly to solve the math problem in ${PROBLEM_FILE}. Use problem_id=${problem_rel}. ${ref_prompt} A trusted math-research runtime is available as both python and python3, with NumPy, SciPy, SymPy, mpmath, and gmpy2 importable. This is iteration 0 in a fresh session. Ignore any pre-existing blueprint_verified.md: only verify_blueprint_service and its trusted receipt can finish this run."
     web_mode="live"
   elif ((iter % 2 == 1)); then
     prompt="Start a fresh reasoning session and continue problem_id=${problem_rel}. Read AGENTS.md, ${PROBLEM_FILE}, the current results/${problem_rel}/blueprint.md if it exists, and retrieve only relevant persisted memory through memory_search. Ignore any pre-existing blueprint_verified.md: only verify_blueprint_service and its trusted receipt can finish this run. This is iteration ${iter}. Do not use arXiv theorem search or web search; think deeply from the persisted artifacts."
@@ -596,7 +863,7 @@ for ((iter = 0; iter < MAX_ITERATIONS; iter += 1)); do
       -m "$MODEL" \
       --config "model_reasoning_effort=\"$REASONING_EFFORT\"" \
       --config "web_search=\"$web_mode\"" \
-      --config "shell_environment_policy.inherit=none" \
+      --config "shell_environment_policy=$TRUSTED_SHELL_ENVIRONMENT_POLICY_TOML" \
       --config "mcp_servers.reasoning_agent=$TRUSTED_REASONING_AGENT_MCP_TOML" \
       --sandbox workspace-write \
       --ephemeral \
