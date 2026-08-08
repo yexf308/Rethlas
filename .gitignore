@@ -30,6 +30,9 @@ Thumbs.db
 *.pfx
 
 # Agent runtime artifacts
+/agents/.verification_receipts/
+/agents/.trusted_generation_runtime/
+/agents/.generation-venv/
 agents/generation/logs/
 agents/generation/memory/
 agents/generation/results/

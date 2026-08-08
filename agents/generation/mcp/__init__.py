@@ -8,6 +8,7 @@ from .server import (
     sanitize_problem_id,
     search_arxiv_theorems,
     verify_proof_service,
+    verify_blueprint_service,
 )
 
 __all__ = [
@@ -20,4 +21,5 @@ __all__ = [
     "sanitize_problem_id",
     "search_arxiv_theorems",
     "verify_proof_service",
+    "verify_blueprint_service",
 ]

@@ -20,17 +20,25 @@ Read:
 
 1. Read the current `results/{problem_id}/blueprint.md` draft as pure text.
 2. First check that `blueprint.md` contains a full proof draft of the entire target theorem rather than a partial proof, fragment, or exploratory notes. If it does not, do not call the verifier yet.
-3. Call MCP tool `verify_proof_service` with:
-   - `statement`: target informal statement
-   - `proof`: the raw markdown text from `blueprint.md`
-4. Read `verification_report.summary`, `critical_errors`, `gaps`, `verdict`, and `repair_hints`.
-5. Return and persist exactly what the verification service returns. Do not rename keys, add keys, or change the JSON structure.
+3. Call MCP tool `verify_blueprint_service` with:
+   - `problem_id`: the current data-relative problem id
+   Do not pass the target statement or raw blueprint text as tool arguments.
+   The tool reads the target from `data/{problem_id}.md` and checks the runner's
+   bound source digest.
+4. Read `verification_report.summary`, `critical_errors`, `gaps`, `verdict`,
+   `repair_hints`, `checked_item_ids`, both digests, and `published`.
+5. Persist the complete MCP publication envelope without renaming or dropping
+   fields. It contains the six-field HTTP verification result plus
+   `published`; successful publication also includes `published_path` and
+   `publication_receipt_path`.
 6. Treat the proof as failed if any of the following hold:
    - `verdict` is `"wrong"`
    - `verification_report.critical_errors` is non-empty
    - `verification_report.gaps` is non-empty
-7. Only treat the proof as passed when none of the failure conditions above hold.
-8. If the proof passes, rename `results/{problem_id}/blueprint.md` to `results/{problem_id}/blueprint_verified.md`.
+7. Only treat the proof as passed when none of the failure conditions above
+   hold and `published=true`.
+8. Never rename or copy the draft yourself. Atomic publication is performed
+   inside the tool after digest and coverage validation.
 
 ## Output Contract
 
@@ -48,9 +56,18 @@ Append to `verification_reports`:
     ]
   },
   "verdict": "string",
-  "repair_hints": "string"
+  "repair_hints": "string",
+  "checked_item_ids": ["pi_0123456789abcdef01234567"],
+  "proof_digest": "0000000000000000000000000000000000000000000000000000000000000000",
+  "context_digest": "1111111111111111111111111111111111111111111111111111111111111111",
+  "published": true,
+  "published_path": "results/problem/blueprint_verified.md",
+  "publication_receipt_path": "../.verification_receipts/problem.json"
 }
 ```
+
+These concrete IDs and digests illustrate the response shape; the tool returns
+the values bound to the current blueprint.
 
 Persist the verification service response exactly as returned.
 
@@ -58,7 +75,7 @@ If verification fails, revise `blueprint.md` directly and append to `failed_path
 
 ## MCP Tools
 
-- `verify_proof_service`
+- `verify_blueprint_service`
 - `memory_append`
 - `memory_search`
 - `branch_update`

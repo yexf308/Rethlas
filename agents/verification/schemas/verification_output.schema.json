@@ -6,7 +6,10 @@
   "required": [
     "verification_report",
     "verdict",
-    "repair_hints"
+    "repair_hints",
+    "checked_item_ids",
+    "proof_digest",
+    "context_digest"
   ],
   "properties": {
     "verification_report": {
@@ -19,7 +22,8 @@
       ],
       "properties": {
         "summary": {
-          "type": "string"
+          "type": "string",
+          "minLength": 1
         },
         "critical_errors": {
           "type": "array",
@@ -31,21 +35,6 @@
           "type": "array",
           "items": {
             "$ref": "#/$defs/finding"
-          }
-        },
-        "notes": {
-          "type": "string"
-        },
-        "checked_items": {
-          "type": "array",
-          "items": {
-            "type": "string"
-          }
-        },
-        "external_reference_checks": {
-          "type": "array",
-          "items": {
-            "type": "string"
           }
         }
       }
@@ -59,6 +48,22 @@
     },
     "repair_hints": {
       "type": "string"
+    },
+    "checked_item_ids": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "pattern": "^pi_[0-9a-f]{24}$"
+      }
+    },
+    "proof_digest": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "context_digest": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
     }
   },
   "$defs": {
@@ -77,14 +82,76 @@
         "issue": {
           "type": "string",
           "minLength": 1
-        },
-        "severity": {
-          "type": "string"
-        },
-        "evidence": {
-          "type": "string"
         }
       }
     }
-  }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "verdict": {
+            "const": "correct"
+          }
+        },
+        "required": [
+          "verdict"
+        ]
+      },
+      "then": {
+        "properties": {
+          "verification_report": {
+            "properties": {
+              "critical_errors": {
+                "maxItems": 0
+              },
+              "gaps": {
+                "maxItems": 0
+              }
+            }
+          },
+          "repair_hints": {
+            "const": ""
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "verdict": {
+            "const": "wrong"
+          }
+        },
+        "required": [
+          "verdict"
+        ]
+      },
+      "then": {
+        "properties": {
+          "verification_report": {
+            "anyOf": [
+              {
+                "properties": {
+                  "critical_errors": {
+                    "minItems": 1
+                  }
+                }
+              },
+              {
+                "properties": {
+                  "gaps": {
+                    "minItems": 1
+                  }
+                }
+              }
+            ]
+          },
+          "repair_hints": {
+            "pattern": "\\S"
+          }
+        }
+      }
+    }
+  ]
 }

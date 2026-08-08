@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 
 import requests
@@ -30,7 +31,11 @@ def main() -> int:
         "proof": PROOF,
     }
 
-    response = requests.post(API_URL, json=payload, timeout=3600)
+    headers = {}
+    api_token = os.getenv("VERIFY_API_TOKEN")
+    if api_token:
+        headers["Authorization"] = f"Bearer {api_token}"
+    response = requests.post(API_URL, json=payload, headers=headers, timeout=3600)
 
     print(f"POST {API_URL}")
     print(f"Status: {response.status_code}")

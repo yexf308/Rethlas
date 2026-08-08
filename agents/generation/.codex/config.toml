@@ -26,6 +26,6 @@ hide_full_access_warning = true
 
 [mcp_servers.reasoning_agent]
 command = "python3"
-args = ["./mcp/server.py"]
+args = ["-B", "./mcp/server.py"]
 cwd = "./"
 tool_timeout_sec = 3600

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from datetime import datetime, timezone
@@ -65,6 +66,14 @@ def _append_jsonl(path: Path, payload: Dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
+
+
+def _canonical_json(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def _record_id(value: Dict[str, Any]) -> str:
+    return hashlib.sha256(_canonical_json(value).encode("utf-8")).hexdigest()[:16]
 
 
 def _iter_jsonl(path: Path) -> Iterable[Dict[str, Any]]:
@@ -178,6 +187,7 @@ def memory_append(run_id: str, channel: str, record: Dict[str, Any]) -> Dict[str
         "channel": channel,
         "record": record,
     }
+    entry["record_id"] = _record_id(entry)
     target = _channel_path(resolved_run_id, channel)
     _append_jsonl(target, entry)
 
@@ -196,7 +206,8 @@ def memory_append(run_id: str, channel: str, record: Dict[str, Any]) -> Dict[str
         "run_id": resolved_run_id,
         "channel": channel,
         "path": str(target),
-        "entry": entry,
+        "record_id": entry["record_id"],
+        "timestamp_utc": entry["timestamp_utc"],
     }
 
 
@@ -207,9 +218,12 @@ def memory_query(
     contains: Optional[str] = None,
     limit: int = 100,
     reverse: bool = True,
+    max_chars: int = 50_000,
 ) -> Dict[str, Any]:
     if limit <= 0:
         raise ValueError("limit must be > 0")
+    if max_chars <= 0:
+        raise ValueError("max_chars must be > 0")
 
     resolved_run_id = sanitize_run_id(run_id)
     path = _channel_path(resolved_run_id, channel)
@@ -229,12 +243,35 @@ def memory_query(
     if reverse:
         items = list(reversed(items))
 
-    items = items[:limit]
+    corpus_count = len(items)
+    candidates = items[:limit]
+    selected: List[Dict[str, Any]] = []
+    omitted_ids: List[str] = []
+    returned_chars = 0
+    for item in candidates:
+        item_chars = len(_canonical_json(item))
+        if returned_chars + item_chars > max_chars:
+            omitted_ids.append(str(item.get("record_id") or _record_id(item)))
+            continue
+        selected.append(item)
+        returned_chars += item_chars
+
+    for item in items[limit:]:
+        omitted_ids.append(str(item.get("record_id") or _record_id(item)))
+
+    truncated = bool(omitted_ids)
     return {
         "run_id": resolved_run_id,
         "channel": channel,
-        "count": len(items),
-        "items": items,
+        "count": len(selected),
+        "corpus_count": corpus_count,
+        "items": selected,
+        "complete": not truncated,
+        "truncated": truncated,
+        "omitted_count": len(omitted_ids),
+        "omitted_ids": omitted_ids,
+        "max_chars": max_chars,
+        "returned_chars": returned_chars,
     }
 
 
@@ -354,6 +391,7 @@ def build_mcp_app() -> Optional[Any]:
         contains: Optional[str] = None,
         limit: int = 100,
         reverse: bool = True,
+        max_chars: int = 50_000,
     ) -> Dict[str, Any]:
         return memory_query(
             run_id=run_id,
@@ -362,6 +400,7 @@ def build_mcp_app() -> Optional[Any]:
             contains=contains,
             limit=limit,
             reverse=reverse,
+            max_chars=max_chars,
         )
 
     @app.tool(name="validate_verification_output")

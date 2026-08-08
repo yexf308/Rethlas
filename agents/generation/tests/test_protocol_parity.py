@@ -1,0 +1,68 @@
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+
+REPO_ROOT = Path(__file__).resolve().parents[3]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from agents.generation.mcp import proof_context as generation_context  # noqa: E402
+from agents.verification.api import proof_context as verification_context  # noqa: E402
+
+
+def test_generation_and_verification_protocol_sources_are_identical() -> None:
+    generation_source = Path(generation_context.__file__).read_text(encoding="utf-8")
+    verification_source = Path(verification_context.__file__).read_text(encoding="utf-8")
+    assert generation_source == verification_source
+
+
+def test_generation_independently_recomputes_manifest_and_context_attestation() -> None:
+    proof = """# lemma lem:a
+
+<!-- rethlas-depends-on: -->
+## statement
+A
+## proof
+Proof of A.
+
+# lemma lem:b
+
+<!-- rethlas-depends-on: -->
+## statement
+B
+## proof
+Proof of B.
+
+# theorem thm:main
+
+## statement
+S
+## proof
+Use lem:a and lem:b to prove S.
+"""
+
+    generation_manifest = generation_context.parse_blueprint(
+        proof,
+        target_statement="S",
+    )
+    verification_manifest = verification_context.parse_blueprint(
+        proof,
+        target_statement="S",
+    )
+
+    assert generation_manifest.item_ids == verification_manifest.item_ids
+    assert generation_context.aggregate_context_digest(
+        generation_manifest
+    ) == verification_context.aggregate_context_digest(verification_manifest)
+    for item_id in generation_manifest.item_ids:
+        assert generation_context.build_item_context(
+            generation_manifest,
+            item_id,
+            max_chars=200_000,
+        ) == verification_context.build_item_context(
+            verification_manifest,
+            item_id,
+            max_chars=200_000,
+        )

@@ -152,6 +152,13 @@ If an informal blueprint or candidate proof does not pass verification:
 4. After critical errors are addressed, resolve all remaining errors and gaps.
 5. Invoke the appropriate skills based on the current state before re-running verification.
 
+The preferred verification tool is `verify_blueprint_service`. It reads the
+draft from `results/{problem_id}/blueprint.md`; do not pass the full blueprint
+as a tool argument and do not rename the file yourself. A successful response
+must have `verdict="correct"`, complete `checked_item_ids`, matching proof and
+context digests, and `published=true`. The tool atomically writes
+`blueprint_verified.md` only when the verified draft bytes are unchanged.
+
 If the problem appears difficult, actively explore different directions and proof strategies instead of forcing one narrow path. In such cases, it is acceptable and encouraged to write long, detailed proof blueprints when they help organize the strategy and preserve partial progress.
 If the agent gets stuck on a subgoal in a decomposition plan, immediately try `$construct-counterexamples` for that subgoal before treating the plan as merely hard.
 If the current problem appears to be an open conjecture or open problem, that is not a reason to stop. This agent is meant to tackle hard open problems. Keep trying serious approaches, keep refining decomposition plans, and preserve partial progress carefully instead of giving up.
@@ -190,7 +197,7 @@ Use these tools when relevant:
 - `memory_append`
 - `memory_search`
 - `branch_update`
-- `verify_proof_service`
+- `verify_blueprint_service`
 
 Always call `search_arxiv_theorems` for nontrivial subgoals and key claims to ground reasoning in related literature.
 Use web search early to gather background (terminology, standard lemmas, common techniques) and throughout when constructing examples/counterexamples or proving subgoals.
@@ -199,9 +206,14 @@ If `$search-math-results` identifies a useful paper, download it inside the curr
 If `$search-math-results` identifies a useful theorem, read the proof of that theorem as well and extract any techniques or ideas that may help with the current statement.
 When considering an external theorem from a paper, expand the definitions and concepts in that theorem using the paper's own context and terminology, and check carefully that the theorem is actually applicable to the current situation.
 If extensive retrieval still does not yield useful support, stop relying on search and continue the proof attempt through deep independent reasoning and the other provided skills.
-Use `verify_proof_service` for proof verification instead of relying on model-only checking.
-Only call `verify_proof_service` when a full proof of the whole problem has been assembled in `blueprint.md`. Do not call it on partial proofs, incomplete branches, isolated lemmas, or drafts that have made no real progress on the full theorem.
-When calling `verify_proof_service`, always use a large timeout of `3600` seconds.
+Use `verify_blueprint_service(problem_id)` for proof verification
+instead of relying on model-only checking. Only call it when a full proof of
+the whole problem has been assembled in `blueprint.md`. Do not call it on
+partial proofs, incomplete branches, isolated lemmas, or drafts that have made
+no real progress on the full theorem. The MCP service uses a 3600-second HTTP
+timeout and does not echo the blueprint back into the model context. The tool
+reads the target statement directly from `data/{problem_id}.md`; the model
+cannot substitute a different target statement.
 
 ## Output Contract
 
@@ -210,6 +222,7 @@ Write the proof in markdown in `results/{problem_id}/blueprint.md`, in a paper-l
 ```markdown
 # lemma lem:xxx
 
+<!-- rethlas-depends-on: lem:earlier, prop:input -->
 ## statement
 put the statement here
 
@@ -217,7 +230,23 @@ put the statement here
 put the proof of this statement here
 ```
 
-The main theorem should be written at the end. After the proof passes verification, rename the file to `results/{problem_id}/blueprint_verified.md`.
+Every newly written proof item must include exactly one single-line
+`rethlas-depends-on` comment between its H1 heading and `## statement`.
+List the labels of its direct internal dependencies, separated by commas. Use
+an empty value for a root item:
+
+```markdown
+<!-- rethlas-depends-on: -->
+```
+
+H1 titles and their final label tokens must be unique. Omitting dependency
+metadata is supported only for old blueprints and creates a conservative
+prefix dependency frontier, which uses more context than explicit metadata.
+
+The main theorem should be written at the end. After the proof passes,
+`verify_blueprint_service` publishes it to
+`results/{problem_id}/blueprint_verified.md`; never rename, copy, or overwrite
+that target yourself.
 
 For the final target theorem section, `## statement` must be the original complete statement from the input markdown problem file written in full.
 
