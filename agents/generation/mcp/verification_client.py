@@ -16,26 +16,70 @@ from urllib.parse import urlsplit
 import requests
 
 try:
-    from .proof_context import aggregate_context_digest, parse_blueprint
+    from .proof_context import (
+        ProofManifest,
+        aggregate_adaptive_context_digest,
+        aggregate_context_digest,
+        build_item_context,
+        parse_blueprint,
+    )
 except ImportError:  # pragma: no cover - direct module execution
-    from proof_context import aggregate_context_digest, parse_blueprint
+    from proof_context import (  # type: ignore[no-redef]
+        ProofManifest,
+        aggregate_adaptive_context_digest,
+        aggregate_context_digest,
+        build_item_context,
+        parse_blueprint,
+    )
 
 
 _OUTPUT_FIELDS = {
+    "output_schema_version",
     "verification_report",
+    "verification_status",
     "verdict",
     "repair_hints",
+    "needs_expanded_proofs",
     "checked_item_ids",
     "proof_digest",
     "context_digest",
+    "adaptive_context_digest",
+    "item_context_attestations",
 }
 _REPORT_FIELDS = {"summary", "critical_errors", "gaps"}
 _FINDING_FIELDS = {"location", "issue"}
 _ITEM_ID_RE = re.compile(r"^pi_[0-9a-f]{24}$")
 _HEX_DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
+_ITEM_CONTEXT_ATTESTATION_FIELDS = {
+    "item_id",
+    "disposition",
+    "final_round",
+    "expanded_proof_ids",
+    "max_chars",
+    "context_digest",
+    "verdict",
+}
 MAX_BLUEPRINT_CHARS = int(os.getenv("VERIFY_MAX_PROOF_CHARS", "2000000"))
 MAX_BLUEPRINT_BYTES = int(os.getenv("VERIFY_MAX_PROOF_BYTES", "8000000"))
 _LOOPBACK_HTTP_HOSTS = {"127.0.0.1", "localhost", "::1"}
+
+
+def _nonnegative_limit(name: str, default: int) -> int:
+    try:
+        value = int(os.getenv(name, str(default)))
+    except ValueError as exc:
+        raise RuntimeError(f"{name} must be an integer") from exc
+    if value < 0:
+        raise RuntimeError(f"{name} must be nonnegative")
+    return value
+
+
+VERIFY_CONTEXT_MAX_CHARS = _nonnegative_limit("VERIFY_CONTEXT_MAX_CHARS", 200_000)
+MAX_EXPANSION_ROUNDS = _nonnegative_limit("VERIFY_MAX_EXPANSION_ROUNDS", 2)
+MAX_EXPANDED_PROOFS = _nonnegative_limit("VERIFY_MAX_EXPANDED_PROOFS", 8)
+MAX_EXPANDED_PROOF_CHARS = _nonnegative_limit(
+    "VERIFY_MAX_EXPANDED_PROOF_CHARS", 200_000
+)
 
 
 def _absolute_path(path: Path) -> Path:
@@ -401,9 +445,17 @@ def validate_service_response(
     expected_proof_digest: str,
     expected_checked_item_ids: list[str],
     expected_context_digest: str,
+    expected_manifest: ProofManifest,
 ) -> Dict[str, Any]:
     if not isinstance(payload, dict) or set(payload) != _OUTPUT_FIELDS:
         raise ValueError("verification service returned an invalid output shape")
+
+    if payload["output_schema_version"] != 2:
+        raise ValueError("verification service returned an unsupported output schema")
+    if payload["verification_status"] != "final":
+        raise ValueError("verification service did not return a final aggregate verdict")
+    if payload["needs_expanded_proofs"] != []:
+        raise ValueError("final aggregate verdict must not request expanded proofs")
 
     report = payload["verification_report"]
     if not isinstance(report, dict) or set(report) != _REPORT_FIELDS:
@@ -452,6 +504,105 @@ def validate_service_response(
         or payload["context_digest"] != expected_context_digest
     ):
         raise ValueError("verification service context_digest does not match the manifest")
+
+    attestations = payload["item_context_attestations"]
+    if not isinstance(attestations, list) or len(attestations) != len(
+        expected_checked_item_ids
+    ):
+        raise ValueError("item_context_attestations must cover the exact manifest")
+    rebuilt_attestations: list[dict[str, Any]] = []
+    for index, (item_id, attestation) in enumerate(
+        zip(expected_checked_item_ids, attestations, strict=True)
+    ):
+        path = f"item_context_attestations[{index}]"
+        if not isinstance(attestation, dict) or set(attestation) != _ITEM_CONTEXT_ATTESTATION_FIELDS:
+            raise ValueError(f"{path} has an invalid shape")
+        if attestation["item_id"] != item_id:
+            raise ValueError(f"{path}.item_id does not match manifest order")
+        disposition = attestation["disposition"]
+        if disposition not in {"verified", "blocked"}:
+            raise ValueError(f"{path}.disposition is invalid")
+        final_round = attestation["final_round"]
+        if (
+            isinstance(final_round, bool)
+            or not isinstance(final_round, int)
+            or final_round < 0
+            or final_round > MAX_EXPANSION_ROUNDS
+        ):
+            raise ValueError(f"{path}.final_round is invalid")
+        expanded_ids = attestation["expanded_proof_ids"]
+        if (
+            not isinstance(expanded_ids, list)
+            or any(
+                not isinstance(expanded_id, str)
+                or _ITEM_ID_RE.fullmatch(expanded_id) is None
+                for expanded_id in expanded_ids
+            )
+            or len(set(expanded_ids)) != len(expanded_ids)
+            or len(expanded_ids) > MAX_EXPANDED_PROOFS
+        ):
+            raise ValueError(f"{path}.expanded_proof_ids is invalid")
+        max_chars = attestation["max_chars"]
+        if (
+            isinstance(max_chars, bool)
+            or not isinstance(max_chars, int)
+            or max_chars <= 0
+            or max_chars > VERIFY_CONTEXT_MAX_CHARS
+        ):
+            raise ValueError(f"{path}.max_chars is invalid")
+        attested_digest = attestation["context_digest"]
+        if (
+            not isinstance(attested_digest, str)
+            or _HEX_DIGEST_RE.fullmatch(attested_digest) is None
+        ):
+            raise ValueError(f"{path}.context_digest is invalid")
+        item_verdict = attestation["verdict"]
+        if item_verdict not in {"correct", "wrong"}:
+            raise ValueError(f"{path}.verdict is invalid")
+        if disposition == "blocked" and (
+            final_round != 0 or expanded_ids or item_verdict != "wrong"
+        ):
+            raise ValueError(f"{path} has an invalid blocked disposition")
+        if (final_round == 0) != (expanded_ids == []):
+            raise ValueError(f"{path} has inconsistent round and expansion ids")
+        try:
+            rebuilt = build_item_context(
+                expected_manifest,
+                item_id,
+                max_chars=max_chars,
+                expanded_proof_ids=expanded_ids,
+                round_index=final_round,
+            )
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{path} cannot be rebuilt from the manifest") from exc
+        if (
+            rebuilt["complete"] is not True
+            or rebuilt["truncated"] is not False
+            or rebuilt["missing"]
+            or rebuilt["omitted"]
+            or rebuilt["digest"] != attested_digest
+            or rebuilt["expanded_proof_characters"]
+            > MAX_EXPANDED_PROOF_CHARS
+        ):
+            raise ValueError(f"{path} does not match the authenticated manifest context")
+        rebuilt_attestations.append(dict(attestation))
+
+    if verdict == "correct" and any(
+        attestation["disposition"] != "verified"
+        or attestation["verdict"] != "correct"
+        for attestation in rebuilt_attestations
+    ):
+        raise ValueError("correct aggregate verdict contains failed or blocked items")
+    adaptive_digest = payload["adaptive_context_digest"]
+    expected_adaptive_digest = aggregate_adaptive_context_digest(
+        expected_manifest, rebuilt_attestations
+    )
+    if (
+        not isinstance(adaptive_digest, str)
+        or _HEX_DIGEST_RE.fullmatch(adaptive_digest) is None
+        or adaptive_digest != expected_adaptive_digest
+    ):
+        raise ValueError("adaptive_context_digest does not match rebuilt item contexts")
 
     return payload
 
@@ -577,10 +728,9 @@ def verify_blueprint_file(
             raise ValueError("blueprint draft must be non-empty")
         proof_bytes = proof.encode("utf-8")
         expected_digest = proof_digest(proof)
-        expected_ids, expected_context_digest = expected_attestation(
-            proof=proof,
-            statement=statement,
-        )
+        expected_manifest = parse_blueprint(proof, target_statement=statement)
+        expected_ids = list(expected_manifest.item_ids)
+        expected_context_digest = aggregate_context_digest(expected_manifest)
 
         request_kwargs: Dict[str, Any] = {
             "json": {"statement": statement, "proof": proof},
@@ -600,6 +750,7 @@ def verify_blueprint_file(
             expected_proof_digest=expected_digest,
             expected_checked_item_ids=expected_ids,
             expected_context_digest=expected_context_digest,
+            expected_manifest=expected_manifest,
         )
         result = dict(payload)
         result["published"] = False
@@ -674,11 +825,17 @@ def verify_blueprint_file(
 
                 if receipt_path is not None:
                     receipt = {
-                        "schema_version": "rethlas-publication-v1",
+                        "schema_version": "rethlas-publication-v2",
                         "problem_id": problem_id,
                         "statement_digest": proof_digest(statement),
                         "proof_digest": expected_digest,
                         "context_digest": expected_context_digest,
+                        "adaptive_context_digest": payload[
+                            "adaptive_context_digest"
+                        ],
+                        "item_context_attestations": payload[
+                            "item_context_attestations"
+                        ],
                         "checked_item_ids": expected_ids,
                         "verified_path": str(verified_path),
                         "published_bytes": len(proof_bytes),

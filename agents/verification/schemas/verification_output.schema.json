@@ -2,14 +2,23 @@
   "type": "object",
   "additionalProperties": false,
   "required": [
+    "output_schema_version",
     "verification_report",
+    "verification_status",
     "verdict",
     "repair_hints",
+    "needs_expanded_proofs",
     "checked_item_ids",
     "proof_digest",
     "context_digest"
   ],
   "properties": {
+    "output_schema_version": {
+      "type": "integer",
+      "enum": [
+        2
+      ]
+    },
     "verification_report": {
       "type": "object",
       "additionalProperties": false,
@@ -36,6 +45,13 @@
         }
       }
     },
+    "verification_status": {
+      "type": "string",
+      "enum": [
+        "final",
+        "needs_context"
+      ]
+    },
     "verdict": {
       "type": "string",
       "enum": [
@@ -45,6 +61,12 @@
     },
     "repair_hints": {
       "type": "string"
+    },
+    "needs_expanded_proofs": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/expansion_request"
+      }
     },
     "checked_item_ids": {
       "type": "array",
@@ -72,6 +94,22 @@
           "type": "string"
         },
         "issue": {
+          "type": "string"
+        }
+      }
+    },
+    "expansion_request": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "reason"
+      ],
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "reason": {
           "type": "string"
         }
       }

@@ -57,16 +57,37 @@ proof = b"mock verified proof"
 verified.write_bytes(proof)
 if os.environ.get("MOCK_PUBLICATION") == "trusted":
     sys.path.insert(0, str(root / "mcp"))
-    from proof_context import aggregate_context_digest, parse_blueprint
+    from proof_context import (
+        aggregate_adaptive_context_digest,
+        aggregate_context_digest,
+        build_item_context,
+        parse_blueprint,
+    )
     manifest = parse_blueprint(proof.decode("utf-8"), target_statement="S")
+    attestations = []
+    for item_id in manifest.item_ids:
+        context = build_item_context(manifest, item_id, max_chars=200000)
+        attestations.append({
+            "item_id": item_id,
+            "disposition": "verified",
+            "final_round": 0,
+            "expanded_proof_ids": [],
+            "max_chars": 200000,
+            "context_digest": context["digest"],
+            "verdict": "correct",
+        })
     receipt = pathlib.Path(os.environ["RETHLAS_RECEIPTS_ROOT"]) / f"{problem_id}.json"
     receipt.parent.mkdir(parents=True, exist_ok=True)
     receipt.write_text(json.dumps({
-        "schema_version": "rethlas-publication-v1",
+        "schema_version": "rethlas-publication-v2",
         "problem_id": problem_id,
         "statement_digest": os.environ["RETHLAS_EXPECTED_STATEMENT_SHA256"],
         "proof_digest": hashlib.sha256(proof).hexdigest(),
         "context_digest": aggregate_context_digest(manifest),
+        "adaptive_context_digest": aggregate_adaptive_context_digest(
+            manifest, attestations
+        ),
+        "item_context_attestations": attestations,
         "checked_item_ids": list(manifest.item_ids),
         "verified_path": str(verified.absolute()),
         "published_bytes": len(proof),

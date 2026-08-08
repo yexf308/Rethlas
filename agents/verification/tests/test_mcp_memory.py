@@ -76,3 +76,32 @@ def test_memory_query_is_newest_first_and_reports_budget_truncation(
 def test_memory_query_rejects_non_positive_budget(isolated_memory: Path) -> None:
     with pytest.raises(ValueError, match="max_chars"):
         mcp_server.memory_query("run-1", "events", max_chars=0)
+
+
+def test_production_mcp_surface_has_no_verdict_validation_or_write_tools(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeFastMCP:
+        def __init__(self, name: str) -> None:
+            self.name = name
+            self.tool_names: list[str] = []
+
+        def tool(self, *, name: str):  # type: ignore[no-untyped-def]
+            def decorate(function):  # type: ignore[no-untyped-def]
+                self.tool_names.append(name)
+                return function
+
+            return decorate
+
+    monkeypatch.setattr(mcp_server, "FastMCP", FakeFastMCP)
+    app = mcp_server.build_mcp_app()
+
+    assert app is not None
+    assert set(app.tool_names) == {
+        "search_arxiv_theorems",
+        "memory_init",
+        "memory_append",
+        "memory_query",
+    }
+    assert "validate_verification_output" not in app.tool_names
+    assert "write_verification_output" not in app.tool_names

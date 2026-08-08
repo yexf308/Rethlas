@@ -58,13 +58,16 @@ def _unsupported_schema_keywords(schema: object) -> set[str]:
 
 def correct_payload() -> dict[str, object]:
     return {
+        "output_schema_version": 2,
         "verification_report": {
             "summary": "Every checked step is justified.",
             "critical_errors": [],
             "gaps": [],
         },
+        "verification_status": "final",
         "verdict": "correct",
         "repair_hints": "",
+        "needs_expanded_proofs": [],
         "checked_item_ids": EXPECTED_IDS.copy(),
         "proof_digest": PROOF_DIGEST,
         "context_digest": CONTEXT_DIGEST,
@@ -73,6 +76,7 @@ def correct_payload() -> dict[str, object]:
 
 def wrong_payload() -> dict[str, object]:
     return {
+        "output_schema_version": 2,
         "verification_report": {
             "summary": "The final implication is unsupported.",
             "critical_errors": [],
@@ -83,8 +87,10 @@ def wrong_payload() -> dict[str, object]:
                 }
             ],
         },
+        "verification_status": "final",
         "verdict": "wrong",
         "repair_hints": "Supply the missing implication after statement:2.",
+        "needs_expanded_proofs": [],
         "checked_item_ids": EXPECTED_IDS.copy(),
         "proof_digest": PROOF_DIGEST,
         "context_digest": CONTEXT_DIGEST,
@@ -134,9 +140,12 @@ def test_builds_happy_wrong_output() -> None:
 @pytest.mark.parametrize(
     ("field", "value", "message"),
     [
+        ("output_schema_version", "2", "output_schema_version must be 2"),
         ("verification_report", [], "verification_report must be an object"),
+        ("verification_status", 1, "verification_status must be a string"),
         ("verdict", 1, "verdict must be a string"),
         ("repair_hints", [], "repair_hints must be a string"),
+        ("needs_expanded_proofs", {}, "needs_expanded_proofs must be a list"),
         ("checked_item_ids", "statement:1", "checked_item_ids must be a list"),
         ("proof_digest", 1, "proof_digest must be a string"),
         ("proof_digest", "", "proof_digest must be non-empty"),
@@ -157,9 +166,12 @@ def test_rejects_malformed_top_level_fields(
 @pytest.mark.parametrize(
     "field",
     [
+        "output_schema_version",
         "verification_report",
+        "verification_status",
         "verdict",
         "repair_hints",
+        "needs_expanded_proofs",
         "checked_item_ids",
         "proof_digest",
         "context_digest",
@@ -284,6 +296,61 @@ def test_rejects_unknown_verdict() -> None:
     payload["verdict"] = "uncertain"
 
     with pytest.raises(ValueError, match="verdict must be 'correct' or 'wrong'"):
+        validate(payload)
+
+
+def test_needs_context_request_is_protocol_only() -> None:
+    payload = correct_payload()
+    payload["verification_status"] = "needs_context"
+    payload["verdict"] = "wrong"
+    payload["needs_expanded_proofs"] = [
+        {"id": "statement:1", "reason": "The application depends on proof details."}
+    ]
+
+    assert validate(payload) == payload
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    [
+        ({"verdict": "correct"}, "verdict must be 'wrong'"),
+        ({"needs_expanded_proofs": []}, "must be non-empty"),
+        ({"repair_hints": "repair"}, "repair_hints must be empty"),
+    ],
+)
+def test_rejects_invalid_needs_context_semantics(
+    mutation: dict[str, object], message: str
+) -> None:
+    payload = correct_payload()
+    payload.update(
+        {
+            "verification_status": "needs_context",
+            "verdict": "wrong",
+            "needs_expanded_proofs": [
+                {"id": "statement:1", "reason": "Need the exact proof."}
+            ],
+        }
+    )
+    payload.update(mutation)
+    with pytest.raises(ValueError, match=message):
+        validate(payload)
+
+
+def test_rejects_needs_context_with_findings_or_duplicate_requests() -> None:
+    payload = wrong_payload()
+    payload["verification_status"] = "needs_context"
+    payload["repair_hints"] = ""
+    payload["needs_expanded_proofs"] = [
+        {"id": "statement:1", "reason": "first"},
+        {"id": "statement:1", "reason": "second"},
+    ]
+    with pytest.raises(ValueError, match="duplicate id"):
+        validate(payload)
+
+    payload["needs_expanded_proofs"] = [
+        {"id": "statement:1", "reason": "Need exact proof."}
+    ]
+    with pytest.raises(ValueError, match="must not contain findings"):
         validate(payload)
 
 

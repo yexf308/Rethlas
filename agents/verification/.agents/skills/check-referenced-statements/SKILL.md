@@ -59,5 +59,7 @@ Keep records in the finding ledger like:
 
 ## Tool Policy
 
-- Codex's built-in web search is allowed for external citations.
-- Do not use MCP search, memory, validation, or output tools.
+- Codex's built-in web search and the injected `search_arxiv_theorems` MCP tool
+  are allowed only for external citations.
+- Do not use search for internal proof discovery or expansion. Do not use MCP
+  validation or output tools; direct schema-constrained output is authoritative.

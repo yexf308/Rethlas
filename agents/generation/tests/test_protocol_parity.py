@@ -66,3 +66,45 @@ Use lem:a and lem:b to prove S.
             item_id,
             max_chars=200_000,
         )
+
+    generation_attestations = []
+    verification_attestations = []
+    root_id = generation_manifest.item_ids[0]
+    for index, item_id in enumerate(generation_manifest.item_ids):
+        expanded_ids = [root_id] if index == len(generation_manifest.item_ids) - 1 else []
+        round_index = 1 if expanded_ids else 0
+        generation_item_context = generation_context.build_item_context(
+            generation_manifest,
+            item_id,
+            max_chars=200_000,
+            expanded_proof_ids=expanded_ids,
+            round_index=round_index,
+        )
+        verification_item_context = verification_context.build_item_context(
+            verification_manifest,
+            item_id,
+            max_chars=200_000,
+            expanded_proof_ids=expanded_ids,
+            round_index=round_index,
+        )
+        for records, context in (
+            (generation_attestations, generation_item_context),
+            (verification_attestations, verification_item_context),
+        ):
+            records.append(
+                {
+                    "item_id": item_id,
+                    "disposition": "verified",
+                    "final_round": round_index,
+                    "expanded_proof_ids": expanded_ids,
+                    "max_chars": 200_000,
+                    "context_digest": context["digest"],
+                    "verdict": "correct",
+                }
+            )
+
+    assert generation_context.aggregate_adaptive_context_digest(
+        generation_manifest, generation_attestations
+    ) == verification_context.aggregate_adaptive_context_digest(
+        verification_manifest, verification_attestations
+    )

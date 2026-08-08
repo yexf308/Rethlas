@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import hashlib
+import json
 
 import pytest
 
 from agents.verification.api.proof_context import (
     ProofDependencyError,
     ProofParseError,
+    aggregate_context_digest,
     build_item_context,
     parse_blueprint,
     proof_digest,
@@ -20,6 +22,16 @@ def _item(title: str, statement: str, proof: str, metadata: str | None = None) -
         f"{metadata_block}"
         f"## statement\n{statement}\n\n"
         f"## proof\n{proof}\n"
+    )
+
+
+def test_legacy_aggregate_manifest_digest_is_byte_stable() -> None:
+    proof = "# theorem main\n\n## statement\nS\n\n## proof\nP\n"
+    manifest = parse_blueprint(proof, target_statement="S")
+
+    assert manifest.item_ids == ("pi_0652364c1f23f18757f6da94",)
+    assert aggregate_context_digest(manifest) == (
+        "d3bb02f4b90d0c09da1b0fbb10fa2f3dcd3a8df8210598b8c3fa09fb6affcf15"
     )
 
 
@@ -505,6 +517,147 @@ def test_context_digest_is_deterministic_and_attests_budget_status() -> None:
     assert first["digest"] != truncated["digest"]
 
 
+def test_adaptive_context_hydrates_only_requested_complete_proof_records() -> None:
+    source = "\n".join(
+        [
+            _item(
+                "lemma lem:root",
+                "Root statement.",
+                "ROOT PROOF BYTES",
+                "<!-- rethlas-depends-on: -->",
+            ),
+            _item(
+                "lemma lem:middle",
+                "Middle statement.",
+                "MIDDLE PROOF BYTES",
+                "<!-- rethlas-depends-on: lem:root -->",
+            ),
+            _item(
+                "theorem thm:main",
+                "Main statement.",
+                "CURRENT PROOF BYTES",
+                "<!-- rethlas-depends-on: lem:middle -->",
+            ),
+        ]
+    )
+    manifest = parse_blueprint(source)
+    current = manifest.items[-1]
+    root = manifest.items[0]
+
+    first = build_item_context(manifest, current.item_id, round_index=0)
+    second = build_item_context(
+        manifest,
+        current.item_id,
+        expanded_proof_ids=[root.item_id],
+        round_index=1,
+    )
+
+    assert first["expanded_proofs"] == []
+    assert all("proof" not in premise for premise in first["premises"])
+    assert all("proof" not in premise for premise in second["premises"])
+    assert [record["item_id"] for record in second["expanded_proofs"]] == [
+        root.item_id
+    ]
+    assert second["expanded_proofs"][0]["proof"] == "ROOT PROOF BYTES"
+    assert "MIDDLE PROOF BYTES" not in json.dumps(second, sort_keys=True)
+    assert second["round"] == 1
+    assert second["digest"] != first["digest"]
+
+
+@pytest.mark.parametrize("kind", ["duplicate", "current", "unknown", "nonancestor"])
+def test_adaptive_context_rejects_out_of_scope_expansions(kind: str) -> None:
+    source = "\n".join(
+        [
+            _item(
+                "lemma lem:a",
+                "A.",
+                "Proof A.",
+                "<!-- rethlas-depends-on: -->",
+            ),
+            _item(
+                "lemma lem:unrelated",
+                "U.",
+                "Proof U.",
+                "<!-- rethlas-depends-on: -->",
+            ),
+            _item(
+                "theorem thm:main",
+                "M.",
+                "Proof M.",
+                "<!-- rethlas-depends-on: lem:a -->",
+            ),
+        ]
+    )
+    manifest = parse_blueprint(source)
+    ancestor, unrelated, current = manifest.items
+    if kind == "duplicate":
+        expanded = [ancestor.item_id, ancestor.item_id]
+    elif kind == "current":
+        expanded = [current.item_id]
+    elif kind == "unknown":
+        expanded = ["pi_" + "0" * 24]
+    else:
+        expanded = [unrelated.item_id]
+
+    with pytest.raises(ValueError):
+        build_item_context(
+            manifest,
+            current.item_id,
+            expanded_proof_ids=expanded,
+            round_index=1,
+        )
+
+
+def test_adaptive_context_rejects_inconsistent_round_and_expansion_state() -> None:
+    manifest = parse_blueprint(
+        "\n".join(
+            [
+                _item("lemma lem:a", "A.", "Proof A."),
+                _item("theorem thm:m", "M.", "Proof M."),
+            ]
+        )
+    )
+    ancestor, current = manifest.items
+    with pytest.raises(ValueError, match="round zero"):
+        build_item_context(
+            manifest,
+            current.item_id,
+            expanded_proof_ids=[ancestor.item_id],
+            round_index=0,
+        )
+    with pytest.raises(ValueError, match="positive adaptive rounds"):
+        build_item_context(manifest, current.item_id, round_index=1)
+
+
+def test_expanded_proof_byte_change_changes_context_attestation() -> None:
+    first_source = "\n".join(
+        [
+            _item("lemma lem:a", "A.", "Proof byte A."),
+            _item("theorem thm:m", "M.", "Proof M."),
+        ]
+    )
+    second_source = first_source.replace("Proof byte A.", "Proof byte B.")
+    first_manifest = parse_blueprint(first_source)
+    second_manifest = parse_blueprint(second_source)
+    first_context = build_item_context(
+        first_manifest,
+        first_manifest.items[-1].item_id,
+        expanded_proof_ids=[first_manifest.items[0].item_id],
+        round_index=1,
+    )
+    second_context = build_item_context(
+        second_manifest,
+        second_manifest.items[-1].item_id,
+        expanded_proof_ids=[second_manifest.items[0].item_id],
+        round_index=1,
+    )
+
+    assert first_context["digest"] != second_context["digest"]
+    assert first_context["expanded_proof_characters"] == second_context[
+        "expanded_proof_characters"
+    ]
+
+
 @pytest.mark.parametrize("bad_budget", [-1, -100])
 def test_negative_context_budget_is_rejected(bad_budget: int) -> None:
     manifest = parse_blueprint(_item("theorem thm:main", "Main.", "Proof."))
@@ -549,3 +702,41 @@ def test_large_legacy_blueprint_uses_linear_edges_with_complete_prefix_closure()
     assert sum(len(item.depends_on) for item in manifest.items) == item_count - 1
     assert len(context["premises"]) == item_count - 1
     assert context["complete"] is True
+
+
+def test_large_diamond_dag_deduplicates_shared_ancestors() -> None:
+    branch_count = 600
+    parts = [
+        _item(
+            "lemma lem:root",
+            "Root.",
+            "Proof root.",
+            "<!-- rethlas-depends-on: -->",
+        )
+    ]
+    for index in range(branch_count):
+        parts.append(
+            _item(
+                f"lemma lem:b{index}",
+                f"Branch {index}.",
+                f"Proof branch {index}.",
+                "<!-- rethlas-depends-on: lem:root -->",
+            )
+        )
+    dependencies = ", ".join(f"lem:b{index}" for index in range(branch_count))
+    parts.append(
+        _item(
+            "theorem thm:main",
+            "Main.",
+            "Proof main.",
+            f"<!-- rethlas-depends-on: {dependencies} -->",
+        )
+    )
+
+    manifest = parse_blueprint("\n".join(parts))
+    context = build_item_context(manifest, manifest.items[-1].item_id)
+    premise_ids = [record["item_id"] for record in context["premises"]]
+
+    assert len(premise_ids) == branch_count + 1
+    assert len(set(premise_ids)) == len(premise_ids)
+    assert premise_ids.count(manifest.items[0].item_id) == 1

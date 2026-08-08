@@ -68,23 +68,28 @@ under a read-only Codex sandbox; user-level Codex configuration is ignored and
 only a validated JSON result is copied back. This reduces prompt-injection
 impact; it is not a host-read confidentiality boundary.
 
-The production verifier does not configure or call an MCP server. Codex returns
-one schema-constrained JSON object, and the CLI writes that last message to the
-isolated run directory with `--output-last-message`. The service then applies a
-stricter production validator: checked item ids must match exactly and in
-order, proof and context digests must match, findings must be well formed, and
-the verdict/repair hints must be consistent. Only validated JSON is copied into
-the persistent results directory. Persistent logs contain only service-authored
-metadata, status, and the Codex exit code; the raw Codex stdout/stderr stream is
-discarded because it may contain the full proof or unvalidated model output.
-This avoids non-interactive MCP approval failures and removes `fastmcp` from
-the live verification dependency path.
+The production verifier returns one schema-constrained JSON object, and the CLI
+writes that last message to the isolated output directory with
+`--output-last-message`. Direct output is the only verdict authority. For every
+fresh adaptive round, the service also injects one complete MCP object through
+CLI `-c`: `command` is the absolute, non-realpath `sys.executable` of the
+running service, and `args`, isolated `cwd`, and `tool_timeout_sec` are supplied
+in the same object. It never relies on an isolated workspace's
+`.codex/config.toml` being auto-loaded. The MCP exposes optional reference
+search/bounded memory but no verdict-validation or verdict-write tool.
 
-The old `agents/verification/mcp` implementation and its tests remain for
-standalone compatibility. Install `mcp/requirements.txt` only when explicitly
-running that legacy MCP, or install the combined `requirements.txt` for local
-development of both paths. It is not copied into the isolated production
-workspace and is not required by the verification API.
+Before allocating a persistent run or starting Codex, the service performs an
+actual import check for the complete injected MCP runtime (`fastmcp`,
+`requests`, and `jsonschema`) in the bound service interpreter. A missing or
+broken dependency therefore starts zero paid subprocesses and leaves no run
+record. `api/requirements.txt` includes the single authoritative
+`mcp/requirements.txt`, preventing the API and injected MCP dependency sets
+from drifting. The service
+then applies a stricter production validator: schema version/status/request
+semantics, checked item ids, proof/context digests, findings, verdict, and
+repair hints must all be consistent. Raw Codex stdout/stderr is held only in an
+unlinked temporary file; persistent logs retain numeric elapsed time and token
+usage (or `unavailable`), never proof/model stream content.
 
 The verifier is resource-bounded by default. The main controls are:
 
@@ -97,6 +102,9 @@ The verifier is resource-bounded by default. The main controls are:
 - `VERIFY_MAX_PROMPT_BYTES=500000` per serialized model prompt
 - `VERIFY_MAX_TOTAL_PROMPT_BYTES=5000000` per request
 - `VERIFY_MAX_OUTPUT_BYTES=1000000` for each direct verifier JSON result
+- `VERIFY_MAX_EXPANSION_ROUNDS=2` after statement-only round zero
+- `VERIFY_MAX_EXPANDED_PROOFS=8` per proof item
+- `VERIFY_MAX_EXPANDED_PROOF_CHARS=200000` using complete canonical records
 - `VERIFY_MAX_CONCURRENT_REQUESTS=1`
 - `CODEX_TIMEOUT_SECONDS=3600` per item
 - `VERIFY_REQUEST_TIMEOUT_SECONDS=3500` for the complete HTTP request
@@ -157,7 +165,38 @@ This script:
 
 Rethlas parses a paper-style blueprint into content-addressed proof items. Each
 item is verified with its complete local proof plus the statements and edges of
-its dependency closure. Ancestor proof bodies are intentionally omitted.
+its complete transitive dependency closure. Round zero contains every ancestor
+statement and direct edge, deduplicating shared ancestors in `O(V+E)`, but no
+ancestor proof body. The current item's proof is always complete. If exact
+premise reasoning is essential, the verifier returns
+`verification_status="needs_context"` with specific strict-ancestor
+`proof_item_id` requests. The API alone validates scope and hydrates those
+complete records from the authenticated blueprint manifest; it performs no
+semantic search and starts a fresh Codex session for the next round.
+Graphify, when deployed separately, may rank discovery results or flag
+high-centrality items for review. It is never an input to closure completeness,
+context digests, proof hydration, or mathematical verdicts.
+
+An intermediate model response has this v2 shape (the service validates the
+concrete ids and digests):
+
+```json
+{
+  "output_schema_version": 2,
+  "verification_report": {"summary": "Need one exact premise proof.", "critical_errors": [], "gaps": []},
+  "verification_status": "needs_context",
+  "verdict": "wrong",
+  "repair_hints": "",
+  "needs_expanded_proofs": [{"id": "pi_0123456789abcdef01234567", "reason": "The current proof uses a construction not stated in the lemma."}],
+  "checked_item_ids": ["pi_89abcdef0123456789abcdef"],
+  "proof_digest": "0000000000000000000000000000000000000000000000000000000000000000",
+  "context_digest": "1111111111111111111111111111111111111111111111111111111111111111"
+}
+```
+
+This response is never counted as a final mathematical verdict and never
+publishes. A final response uses `verification_status="final"` and an empty
+`needs_expanded_proofs` list.
 
 Declare direct internal dependencies between the H1 item heading and
 `## statement`:
@@ -189,17 +228,26 @@ declare explicit dependencies.
 
 Before any model starts, the service rejects malformed graphs, target-statement
 mismatches, missing dependencies, cycles, incomplete contexts, and budget
-truncation. Each item response is bound to its proof/context digests and exact
-item id. The API accepts the final proof only when `checked_item_ids` exactly
-equals the complete manifest. The generation MCP independently recomputes the
-same manifest attestation and atomically publishes the verified bytes only if
-the draft has not changed during verification. The production MCP tool accepts
+truncation. Unknown/current/non-ancestor/duplicate requests, repeated requests
+with no progress, missing full records, and round/proof/character budget
+overflow fail closed as protocol errors, never as final mathematical verdicts.
+Every round digest binds the complete statement/edge scope, round, expanded
+ids, and exact expanded proof bytes. Only a final/correct response with an
+empty request list can succeed. Topological failures still block descendants.
+
+Each item response is bound to its proof/context digests and exact item id. The
+API accepts the final proof only when `checked_item_ids` exactly equals the
+complete manifest. It returns server-owned per-item final context attestations;
+the generation MCP rebuilds each one from the locked draft, recomputes both the
+stable manifest digest and adaptive aggregate digest, and atomically publishes
+the verified bytes only if the draft has not changed during verification. The
+production MCP tool accepts
 only `problem_id`; it reads `data/{problem_id}.md` itself and checks the
 runner-bound source digest, so the model cannot swap in an easier target.
 Publication also writes a receipt under `agents/.verification_receipts/`, which
 is outside the generation Codex workspace. The example runner validates that
 receipt, the target digest, exact verified bytes, independently recomputed item
-coverage/context digest, regular-file type, and bounded size instead of treating
+coverage/manifest/adaptive context digests, regular-file type, and bounded size instead of treating
 mere file existence as success. A stale or untrusted pre-existing verified file
 is ignored and never renamed by the unsandboxed runner. The receipt root is a
 fixed sibling of the generation workspace and cannot be redirected with an

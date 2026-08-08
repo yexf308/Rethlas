@@ -5,7 +5,7 @@ description: Aggregate all detected errors and gaps into the final verification 
 
 # Synthesize Verification Report
 
-Produce the final verification output JSON and verdict.
+Produce either a bounded adaptive proof request or the final verification JSON.
 
 ## Input Contract
 
@@ -19,21 +19,26 @@ Also read the exact `Expected_checked_item_ids`, `Proof_digest`, and
 
 ## Procedure
 
-1. Review the complete in-response finding ledger. Account for every deduction
+1. If checking an internal deduction genuinely requires one or more exact
+   strict-ancestor proofs not yet supplied, return a protocol request with
+   `verification_status="needs_context"`, `verdict="wrong"`, empty findings,
+   empty repair hints, and unique `{id, reason}` requests. This is never a
+   mathematical verdict or acceptance.
+2. Otherwise review the complete in-response finding ledger. Account for every deduction
    and citation before aggregation rather than silently dropping records.
-2. Collect all critical errors and all gaps from previous checks.
-3. Build a complete `verification_report` object with:
+3. Collect all critical errors and all gaps from previous checks.
+4. Build a complete `verification_report` object with:
    - `summary`
    - `critical_errors`
    - `gaps`
-4. Apply strict verdict rule:
+5. Apply strict final verdict rule:
    - `correct` iff `critical_errors=[]` and `gaps=[]`.
    - otherwise `wrong`.
-5. If verdict is `wrong`, produce concrete non-empty `repair_hints`.
-6. Copy the expected item id list and both supplied digests exactly into the
+6. If final verdict is `wrong`, produce concrete non-empty `repair_hints`.
+7. Copy the expected item id list and both supplied digests exactly into the
    output; never invent, normalize, or recompute them.
-7. Check the output locally against the contract described below.
-8. Return only the final JSON. Do not call an MCP tool or write a file; the CLI
+8. Check the output locally against the contract described below.
+9. Return only the JSON. Do not call an MCP tool or write a file; the CLI
    captures the schema-constrained last message and the API validates it.
 
 ## Output Contract
@@ -42,13 +47,16 @@ Final output JSON:
 
 ```json
 {
+  "output_schema_version": 2,
   "verification_report": {
     "summary": "string",
     "critical_errors": [],
     "gaps": []
   },
+  "verification_status": "final",
   "verdict": "correct",
   "repair_hints": "",
+  "needs_expanded_proofs": [],
   "checked_item_ids": ["pi_0123456789abcdef01234567"],
   "proof_digest": "0000000000000000000000000000000000000000000000000000000000000000",
   "context_digest": "1111111111111111111111111111111111111111111111111111111111111111"
@@ -62,4 +70,5 @@ If there is any error or gap, verdict must be `"wrong"` and `repair_hints` must 
 
 ## Tool Policy
 
-Do not use MCP memory, validation, or output tools. Return the JSON directly.
+Do not use MCP validation or output tools. Never use search, memory, or Graphify
+to hydrate internal proofs. Return the JSON directly.

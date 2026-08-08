@@ -156,7 +156,10 @@ The preferred verification tool is `verify_blueprint_service`. It reads the
 draft from `results/{problem_id}/blueprint.md`; do not pass the full blueprint
 as a tool argument and do not rename the file yourself. A successful response
 must have `verdict="correct"`, complete `checked_item_ids`, matching proof and
-context digests, and `published=true`. The tool atomically writes
+stable manifest digest, independently rebuilt adaptive item-context
+attestations/digest, `verification_status="final"`, an empty expansion request
+list, and `published=true`. A `needs_context` response is handled only inside
+the verifier API and is never publishable. The tool atomically writes
 `blueprint_verified.md` only when the verified draft bytes are unchanged.
 
 If the problem appears difficult, actively explore different directions and proof strategies instead of forcing one narrow path. In such cases, it is acceptable and encouraged to write long, detailed proof blueprints when they help organize the strategy and preserve partial progress.

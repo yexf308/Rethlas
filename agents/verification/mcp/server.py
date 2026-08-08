@@ -403,14 +403,6 @@ def build_mcp_app() -> Optional[Any]:
             max_chars=max_chars,
         )
 
-    @app.tool(name="validate_verification_output")
-    def _tool_validate_verification_output(payload: Dict[str, Any]) -> Dict[str, Any]:
-        return validate_verification_output(payload=payload)
-
-    @app.tool(name="write_verification_output")
-    def _tool_write_verification_output(run_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
-        return write_verification_output(run_id=run_id, payload=payload)
-
     return app
 
 

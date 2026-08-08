@@ -15,6 +15,11 @@ from typing import Any, Dict, Iterable, List, Optional
 import requests
 
 try:
+    from .proof_context import parse_blueprint
+except ImportError:  # pragma: no cover - direct module execution
+    from proof_context import parse_blueprint
+
+try:
     from .verification_client import (
         expected_attestation,
         proof_digest,
@@ -446,11 +451,13 @@ def verify_proof_service(
         proof=proof,
         statement=statement,
     )
+    expected_manifest = parse_blueprint(proof, target_statement=statement)
     return validate_service_response(
         body,
         expected_proof_digest=proof_digest(proof),
         expected_checked_item_ids=expected_ids,
         expected_context_digest=expected_context_digest,
+        expected_manifest=expected_manifest,
     )
 
 

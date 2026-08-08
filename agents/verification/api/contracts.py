@@ -7,9 +7,12 @@ from typing import Any, Mapping, Sequence
 
 
 _OUTPUT_FIELDS = (
+    "output_schema_version",
     "verification_report",
+    "verification_status",
     "verdict",
     "repair_hints",
+    "needs_expanded_proofs",
     "checked_item_ids",
     "proof_digest",
     "context_digest",
@@ -17,6 +20,9 @@ _OUTPUT_FIELDS = (
 _REPORT_FIELDS = ("summary", "critical_errors", "gaps")
 _FINDING_FIELDS = ("location", "issue")
 _VERDICTS = ("correct", "wrong")
+_VERIFICATION_STATUSES = ("final", "needs_context")
+_EXPANSION_REQUEST_FIELDS = ("id", "reason")
+OUTPUT_SCHEMA_VERSION = 2
 
 
 def _format_keys(keys: Sequence[object]) -> str:
@@ -76,6 +82,29 @@ def _validate_checked_item_ids(value: object, path: str) -> list[str]:
     return value
 
 
+def _validate_expansion_requests(value: object) -> list[Mapping[str, str]]:
+    if not isinstance(value, list):
+        raise ValueError("needs_expanded_proofs must be a list")
+    seen: set[str] = set()
+    for index, request in enumerate(value):
+        path = f"needs_expanded_proofs[{index}]"
+        if not isinstance(request, dict):
+            raise ValueError(f"{path} must be an object")
+        _validate_exact_keys(request, _EXPANSION_REQUEST_FIELDS, path)
+        request_id = request["id"]
+        reason = request["reason"]
+        if not isinstance(request_id, str) or not request_id:
+            raise ValueError(f"{path}.id must be a non-empty string")
+        if request_id in seen:
+            raise ValueError(
+                f"needs_expanded_proofs contains duplicate id {request_id!r}"
+            )
+        seen.add(request_id)
+        if not isinstance(reason, str) or not reason.strip():
+            raise ValueError(f"{path}.reason must contain non-whitespace text")
+    return value
+
+
 def _normalize_expected_checked_item_ids(value: object) -> list[str]:
     if isinstance(value, (str, bytes)) or not isinstance(value, Sequence):
         raise ValueError("expected_checked_item_ids must be a sequence of strings")
@@ -123,6 +152,11 @@ def validate_verification_output(
         raise ValueError("verification output must be an object")
     _validate_exact_keys(payload, _OUTPUT_FIELDS, "verification output")
 
+    if payload["output_schema_version"] != OUTPUT_SCHEMA_VERSION:
+        raise ValueError(
+            f"output_schema_version must be {OUTPUT_SCHEMA_VERSION}"
+        )
+
     report = payload["verification_report"]
     if not isinstance(report, dict):
         raise ValueError("verification_report must be an object")
@@ -137,6 +171,14 @@ def validate_verification_output(
     )
     gaps = _validate_findings(report["gaps"], "verification_report.gaps")
 
+    verification_status = payload["verification_status"]
+    if not isinstance(verification_status, str):
+        raise ValueError("verification_status must be a string")
+    if verification_status not in _VERIFICATION_STATUSES:
+        raise ValueError(
+            "verification_status must be 'final' or 'needs_context'"
+        )
+
     verdict = payload["verdict"]
     if not isinstance(verdict, str):
         raise ValueError("verdict must be a string")
@@ -146,6 +188,10 @@ def validate_verification_output(
     repair_hints = payload["repair_hints"]
     if not isinstance(repair_hints, str):
         raise ValueError("repair_hints must be a string")
+
+    expansion_requests = _validate_expansion_requests(
+        payload["needs_expanded_proofs"]
+    )
 
     checked_item_ids = _validate_checked_item_ids(
         payload["checked_item_ids"], "checked_item_ids"
@@ -181,6 +227,30 @@ def validate_verification_output(
         raise ValueError("context_digest does not match expected_context_digest")
 
     has_findings = bool(critical_errors or gaps)
+    if verification_status == "needs_context":
+        if verdict != "wrong":
+            raise ValueError(
+                "verdict must be 'wrong' when verification_status is 'needs_context'"
+            )
+        if not expansion_requests:
+            raise ValueError(
+                "needs_expanded_proofs must be non-empty when "
+                "verification_status is 'needs_context'"
+            )
+        if has_findings:
+            raise ValueError(
+                "needs_context is a protocol request and must not contain findings"
+            )
+        if repair_hints != "":
+            raise ValueError(
+                "repair_hints must be empty when verification_status is 'needs_context'"
+            )
+        return deepcopy(payload)
+
+    if expansion_requests:
+        raise ValueError(
+            "needs_expanded_proofs must be empty when verification_status is 'final'"
+        )
     if verdict == "correct":
         if has_findings:
             raise ValueError(
@@ -208,6 +278,8 @@ def build_verification_output(
     checked_item_ids: Sequence[str],
     proof_digest: str,
     context_digest: str,
+    verification_status: str = "final",
+    needs_expanded_proofs: Sequence[Mapping[str, str]] = (),
 ) -> dict[str, Any]:
     """Build validated output, deriving the verdict solely from the report."""
 
@@ -218,9 +290,16 @@ def build_verification_output(
         and (report.get("critical_errors") or report.get("gaps"))
     )
     payload = {
+        "output_schema_version": OUTPUT_SCHEMA_VERSION,
         "verification_report": report,
-        "verdict": "wrong" if has_findings else "correct",
+        "verification_status": verification_status,
+        "verdict": (
+            "wrong"
+            if verification_status == "needs_context" or has_findings
+            else "correct"
+        ),
         "repair_hints": repair_hints,
+        "needs_expanded_proofs": deepcopy(list(needs_expanded_proofs)),
         "checked_item_ids": deepcopy(normalized_ids),
         "proof_digest": proof_digest,
         "context_digest": context_digest,
@@ -233,4 +312,8 @@ def build_verification_output(
     )
 
 
-__all__ = ["build_verification_output", "validate_verification_output"]
+__all__ = [
+    "OUTPUT_SCHEMA_VERSION",
+    "build_verification_output",
+    "validate_verification_output",
+]

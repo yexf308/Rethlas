@@ -38,7 +38,29 @@ def valid_payload(
         proof=proof,
         statement=statement,
     )
-    return {
+    manifest = client.parse_blueprint(proof, target_statement=statement)
+    attestations = []
+    for index, item_id in enumerate(item_ids):
+        context = client.build_item_context(
+            manifest,
+            item_id,
+            max_chars=client.VERIFY_CONTEXT_MAX_CHARS,
+        )
+        attestations.append(
+            {
+                "item_id": item_id,
+                "disposition": (
+                    "verified" if not wrong or index == 0 else "blocked"
+                ),
+                "final_round": 0,
+                "expanded_proof_ids": [],
+                "max_chars": client.VERIFY_CONTEXT_MAX_CHARS,
+                "context_digest": context["digest"],
+                "verdict": verdict,
+            }
+        )
+    payload = {
+        "output_schema_version": 2,
         "verification_report": {
             "summary": "checked",
             "critical_errors": [],
@@ -48,12 +70,19 @@ def valid_payload(
                 else []
             ),
         },
+        "verification_status": "final",
         "verdict": verdict,
         "repair_hints": "add the missing justification" if wrong else "",
+        "needs_expanded_proofs": [],
         "checked_item_ids": item_ids,
         "proof_digest": client.proof_digest(proof),
         "context_digest": context_digest,
+        "item_context_attestations": attestations,
     }
+    payload["adaptive_context_digest"] = client.aggregate_adaptive_context_digest(
+        manifest, attestations
+    )
+    return payload
 
 
 def install_post(
@@ -320,6 +349,34 @@ def test_spoofed_same_count_ids_and_context_digest_are_rejected(
             verified_path=tmp_path / "blueprint_verified.md",
             endpoint="https://verifier/verify",
         )
+
+
+@pytest.mark.parametrize("field", ["item_context", "adaptive_digest"])
+def test_spoofed_adaptive_context_attestation_is_rejected_before_publish(
+    field: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    proof = "# theorem main\n\n## statement\nS\n\n## proof\nP\n"
+    draft = tmp_path / "blueprint.md"
+    verified = tmp_path / "blueprint_verified.md"
+    draft.write_text(proof, encoding="utf-8")
+    payload = valid_payload(proof)
+    if field == "item_context":
+        payload["item_context_attestations"][0]["context_digest"] = "0" * 64
+    else:
+        payload["adaptive_context_digest"] = "0" * 64
+    install_post(monkeypatch, lambda endpoint, request: payload)
+
+    with pytest.raises(ValueError, match="context"):
+        client.verify_blueprint_file(
+            statement="S",
+            draft_path=draft,
+            verified_path=verified,
+            endpoint="https://verifier/verify",
+        )
+
+    assert not verified.exists()
 
 
 def test_non_cooperating_draft_write_cannot_change_published_bytes(

@@ -401,11 +401,12 @@ try:
     receipt = json.loads(receipt_raw.decode("utf-8"))
     expected_keys = {
         "schema_version", "problem_id", "statement_digest", "proof_digest",
-        "context_digest", "checked_item_ids", "verified_path", "published_bytes",
+        "context_digest", "adaptive_context_digest", "item_context_attestations",
+        "checked_item_ids", "verified_path", "published_bytes",
     }
     if not isinstance(receipt, dict) or set(receipt) != expected_keys:
         raise ValueError("invalid receipt shape")
-    if receipt["schema_version"] != "rethlas-publication-v1":
+    if receipt["schema_version"] != "rethlas-publication-v2":
         raise ValueError("invalid receipt version")
     if receipt["problem_id"] != problem_id:
         raise ValueError("wrong problem")
@@ -427,7 +428,12 @@ try:
     if re.fullmatch(r"[0-9a-f]{64}", receipt["context_digest"]) is None:
         raise ValueError("invalid context digest")
     sys.path.insert(0, str(root / "mcp"))
-    from proof_context import aggregate_context_digest, parse_blueprint
+    from proof_context import (
+        aggregate_adaptive_context_digest,
+        aggregate_context_digest,
+        build_item_context,
+        parse_blueprint,
+    )
     proof_text = verified_raw.decode("utf-8")
     statement_text = problem_raw.decode("utf-8")
     manifest = parse_blueprint(proof_text, target_statement=statement_text)
@@ -435,6 +441,31 @@ try:
         raise ValueError("receipt item coverage does not match verified blueprint")
     if receipt["context_digest"] != aggregate_context_digest(manifest):
         raise ValueError("receipt context digest does not match verified blueprint")
+    attestations = receipt["item_context_attestations"]
+    if not isinstance(attestations, list) or len(attestations) != len(ids):
+        raise ValueError("invalid adaptive context coverage")
+    fields = {
+        "item_id", "disposition", "final_round", "expanded_proof_ids",
+        "max_chars", "context_digest", "verdict",
+    }
+    for item_id, record in zip(ids, attestations, strict=True):
+        if not isinstance(record, dict) or set(record) != fields:
+            raise ValueError("invalid item context attestation shape")
+        if record["item_id"] != item_id:
+            raise ValueError("item context attestation order mismatch")
+        rebuilt = build_item_context(
+            manifest,
+            item_id,
+            max_chars=record["max_chars"],
+            expanded_proof_ids=record["expanded_proof_ids"],
+            round_index=record["final_round"],
+        )
+        if not rebuilt["complete"] or rebuilt["digest"] != record["context_digest"]:
+            raise ValueError("item context attestation mismatch")
+    if receipt["adaptive_context_digest"] != aggregate_adaptive_context_digest(
+        manifest, attestations
+    ):
+        raise ValueError("adaptive context digest mismatch")
 except (OSError, ValueError, TypeError, UnicodeError, json.JSONDecodeError, ImportError) as exc:
     if os.environ.get("RETHLAS_RECEIPT_DEBUG") == "1":
         print(f"invalid publication receipt: {exc}", file=sys.stderr)

@@ -31,11 +31,13 @@ import heapq
 import json
 import re
 from dataclasses import dataclass
-from typing import Any, Iterable, Literal
+from typing import Any, Iterable, Literal, Sequence
 
 
-PROOF_CONTEXT_SCHEMA_VERSION = 1
+PROOF_ITEM_SCHEMA_VERSION = 1
+PROOF_CONTEXT_SCHEMA_VERSION = 2
 AGGREGATE_CONTEXT_SCHEMA_VERSION = 1
+ADAPTIVE_AGGREGATE_CONTEXT_SCHEMA_VERSION = 2
 
 _ATX_HEADING_RE = re.compile(
     r"^[ \t]{0,3}(#{1,6})[ \t]+(.+?)(?:[ \t]+#+[ \t]*)?$"
@@ -113,6 +115,7 @@ class _RawItem:
 def _canonical_json(value: Any) -> str:
     return json.dumps(
         value,
+        allow_nan=False,
         ensure_ascii=False,
         sort_keys=True,
         separators=(",", ":"),
@@ -149,6 +152,50 @@ def aggregate_context_digest(manifest: ProofManifest) -> str:
                 }
                 for item in manifest.items
             ],
+        }
+    )
+
+
+def aggregate_adaptive_context_digest(
+    manifest: ProofManifest,
+    item_context_attestations: Sequence[dict[str, Any]],
+) -> str:
+    """Attest the manifest and every item's final adaptive context.
+
+    The caller must first rebuild and validate each item context.  This helper
+    deliberately hashes only canonical, transportable attestation fields so a
+    generation client can recompute the value independently before publishing.
+    """
+
+    if not isinstance(manifest, ProofManifest):
+        raise TypeError("manifest must be a ProofManifest")
+    if isinstance(item_context_attestations, (str, bytes)) or not isinstance(
+        item_context_attestations, Sequence
+    ):
+        raise TypeError("item_context_attestations must be a sequence")
+    normalized: list[dict[str, Any]] = []
+    for index, record in enumerate(item_context_attestations):
+        if not isinstance(record, dict):
+            raise TypeError(
+                f"item_context_attestations[{index}] must be an object"
+            )
+        normalized.append(
+            {
+                "item_id": record.get("item_id"),
+                "disposition": record.get("disposition"),
+                "final_round": record.get("final_round"),
+                "expanded_proof_ids": record.get("expanded_proof_ids"),
+                "max_chars": record.get("max_chars"),
+                "context_digest": record.get("context_digest"),
+                "verdict": record.get("verdict"),
+            }
+        )
+    return _sha256_json(
+        {
+            "schema_version": ADAPTIVE_AGGREGATE_CONTEXT_SCHEMA_VERSION,
+            "domain": "rethlas-adaptive-aggregate",
+            "manifest_digest": aggregate_context_digest(manifest),
+            "item_context_attestations": normalized,
         }
     )
 
@@ -478,7 +525,7 @@ def _build_manifest(
         assert all(digest is not None for digest in dependency_digests)
         digest = _sha256_json(
             {
-                "schema_version": PROOF_CONTEXT_SCHEMA_VERSION,
+                "schema_version": PROOF_ITEM_SCHEMA_VERSION,
                 "title": item.title,
                 "label": item.label,
                 "statement": item.statement,
@@ -635,18 +682,30 @@ def _premise_record(item: ProofItem) -> dict[str, Any]:
     }
 
 
+def _expanded_proof_record(item: ProofItem) -> dict[str, Any]:
+    return {
+        **_premise_record(item),
+        "proof": item.proof,
+    }
+
+
 def _context_envelope(
     *,
     manifest: ProofManifest,
     requested_item_id: str,
     current_item: dict[str, Any] | None,
     premises: list[dict[str, Any]],
+    expanded_proofs: list[dict[str, Any]],
     complete: bool,
     truncated: bool,
     missing: list[str],
     omitted: list[str],
     characters_used: int,
+    expanded_proof_characters: int,
     max_chars: int | None,
+    round_index: int,
+    strict_ancestor_item_ids: list[str],
+    expanded_proof_ids: list[str],
 ) -> dict[str, Any]:
     envelope: dict[str, Any] = {
         "schema_version": PROOF_CONTEXT_SCHEMA_VERSION,
@@ -654,13 +713,24 @@ def _context_envelope(
         "requested_item_id": requested_item_id,
         "current_item": current_item,
         "premises": premises,
+        "expanded_proofs": expanded_proofs,
+        "scope": {
+            "current_item_id": requested_item_id,
+            "strict_ancestor_item_ids": strict_ancestor_item_ids,
+        },
+        "round": round_index,
+        "expanded_proof_ids": expanded_proof_ids,
         "complete": complete,
         "truncated": truncated,
         "missing": missing,
         "omitted": omitted,
         "characters_used": characters_used,
+        "expanded_proof_characters": expanded_proof_characters,
         "max_chars": max_chars,
-        "character_accounting": "sum of canonical JSON proof-item record characters",
+        "character_accounting": (
+            "sum of complete canonical JSON proof-item record characters; "
+            "expanded_proof_characters counts each complete expanded proof record"
+        ),
     }
     envelope["digest"] = _sha256_json(envelope)
     return envelope
@@ -671,12 +741,16 @@ def build_item_context(
     item_id: str,
     *,
     max_chars: int | None = None,
+    expanded_proof_ids: Sequence[str] = (),
+    round_index: int = 0,
 ) -> dict[str, Any]:
     """Build a deterministic, proof-body-lazy context for one proof item.
 
     The current item record is attempted first and contains its complete proof.
-    Ancestor records follow in stable topological order and never contain proof
-    bodies.  ``max_chars`` counts complete canonical JSON item records only.
+    Ancestor statement/edge records follow in stable topological order and
+    never contain proof bodies. ``expanded_proofs`` is a separate list of
+    complete records whose exact ids appear in ``expanded_proof_ids``; it is
+    empty in round zero. ``max_chars`` counts complete canonical JSON records.
     No record is sliced: a record that does not fit, and every later record, is
     listed in ``omitted`` and makes the envelope explicitly incomplete.
 
@@ -694,6 +768,27 @@ def build_item_context(
             raise TypeError("max_chars must be an integer or None")
         if max_chars < 0:
             raise ValueError("max_chars must be >= 0")
+    if isinstance(round_index, bool) or not isinstance(round_index, int):
+        raise TypeError("round_index must be an integer")
+    if round_index < 0:
+        raise ValueError("round_index must be >= 0")
+    if isinstance(expanded_proof_ids, (str, bytes)) or not isinstance(
+        expanded_proof_ids, Sequence
+    ):
+        raise TypeError("expanded_proof_ids must be a sequence of strings")
+    requested_expansions = list(expanded_proof_ids)
+    if any(not isinstance(value, str) or not value for value in requested_expansions):
+        raise TypeError("expanded_proof_ids must contain non-empty strings")
+    if len(set(requested_expansions)) != len(requested_expansions):
+        raise ProofContextError("expanded_proof_ids contains duplicate ids")
+    if round_index == 0 and requested_expansions:
+        raise ProofContextError("round zero must not contain expanded proofs")
+    if round_index > 0 and not requested_expansions:
+        raise ProofContextError("positive adaptive rounds require expanded proofs")
+    if round_index > len(requested_expansions):
+        raise ProofContextError(
+            "adaptive round count cannot exceed the number of expanded proofs"
+        )
 
     items_by_id = {item.item_id: item for item in manifest.items}
     requested = items_by_id.get(item_id)
@@ -703,12 +798,17 @@ def build_item_context(
             requested_item_id=item_id,
             current_item=None,
             premises=[],
+            expanded_proofs=[],
             complete=False,
             truncated=False,
             missing=[item_id],
             omitted=[],
             characters_used=0,
+            expanded_proof_characters=0,
             max_chars=max_chars,
+            round_index=round_index,
+            strict_ancestor_item_ids=[],
+            expanded_proof_ids=[],
         )
 
     required_ids = {item_id}
@@ -730,18 +830,49 @@ def build_item_context(
         for ancestor_id in manifest.topological_item_ids
         if ancestor_id in required_ids and ancestor_id != item_id
     ]
-    ordered_records: list[tuple[str, Literal["current", "premise"], dict[str, Any]]] = [
+    ancestor_id_set = set(ancestor_ids)
+    invalid_expansions = [
+        expanded_id
+        for expanded_id in requested_expansions
+        if expanded_id not in ancestor_id_set
+    ]
+    if invalid_expansions:
+        invalid_id = invalid_expansions[0]
+        if invalid_id == item_id:
+            raise ProofContextError("cannot expand the current proof item")
+        if invalid_id not in items_by_id:
+            raise ProofContextError(f"unknown expanded proof item {invalid_id!r}")
+        raise ProofContextError(
+            f"expanded proof item {invalid_id!r} is not a strict ancestor"
+        )
+    expanded_id_set = set(requested_expansions)
+    ordered_expanded_ids = [
+        ancestor_id for ancestor_id in ancestor_ids if ancestor_id in expanded_id_set
+    ]
+    ordered_records: list[
+        tuple[str, Literal["current", "premise", "expanded"], dict[str, Any]]
+    ] = [
         (item_id, "current", _current_record(requested))
     ]
     ordered_records.extend(
         (ancestor_id, "premise", _premise_record(items_by_id[ancestor_id]))
         for ancestor_id in ancestor_ids
     )
+    ordered_records.extend(
+        (
+            f"expanded_proof:{ancestor_id}",
+            "expanded",
+            _expanded_proof_record(items_by_id[ancestor_id]),
+        )
+        for ancestor_id in ordered_expanded_ids
+    )
 
     current_item: dict[str, Any] | None = None
     premises: list[dict[str, Any]] = []
+    expanded_proofs: list[dict[str, Any]] = []
     omitted: list[str] = []
     characters_used = 0
+    expanded_proof_characters = 0
     exhausted = False
     for record_id, record_kind, record in ordered_records:
         record_characters = len(_canonical_json(record))
@@ -754,8 +885,11 @@ def build_item_context(
         characters_used += record_characters
         if record_kind == "current":
             current_item = record
-        else:
+        elif record_kind == "premise":
             premises.append(record)
+        else:
+            expanded_proofs.append(record)
+            expanded_proof_characters += record_characters
 
     missing_list = sorted(missing)
     complete = current_item is not None and not missing_list and not omitted
@@ -764,23 +898,31 @@ def build_item_context(
         requested_item_id=item_id,
         current_item=current_item,
         premises=premises,
+        expanded_proofs=expanded_proofs,
         complete=complete,
         truncated=bool(omitted),
         missing=missing_list,
         omitted=omitted,
         characters_used=characters_used,
+        expanded_proof_characters=expanded_proof_characters,
         max_chars=max_chars,
+        round_index=round_index,
+        strict_ancestor_item_ids=ancestor_ids,
+        expanded_proof_ids=ordered_expanded_ids,
     )
 
 
 __all__ = [
+    "ADAPTIVE_AGGREGATE_CONTEXT_SCHEMA_VERSION",
     "AGGREGATE_CONTEXT_SCHEMA_VERSION",
+    "PROOF_ITEM_SCHEMA_VERSION",
     "PROOF_CONTEXT_SCHEMA_VERSION",
     "ProofContextError",
     "ProofDependencyError",
     "ProofItem",
     "ProofManifest",
     "ProofParseError",
+    "aggregate_adaptive_context_digest",
     "aggregate_context_digest",
     "build_item_context",
     "parse_blueprint",

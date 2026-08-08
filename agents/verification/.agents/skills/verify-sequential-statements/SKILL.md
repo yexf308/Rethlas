@@ -9,10 +9,12 @@ Check every deduction in the current proof item and log all local issues.
 
 ## Input Contract
 
-Read the current item and premise cards from `Fact_context`. The current item
-contains the only proof body to verify. Premise cards contain already verified
-statements and dependency edges, but intentionally do not contain their proof
-bodies. `Target_statement` contains the overall theorem and hypotheses.
+Read the current item, premise cards, and `expanded_proofs` from `Fact_context`.
+The current item always contains its complete proof. Premise cards contain the
+complete strict-ancestor statement/edge closure and never contain proofs.
+`expanded_proofs` is empty in round zero and contains only exact, complete
+strict-ancestor records requested in earlier rounds. `Target_statement`
+contains the overall theorem and hypotheses.
 
 ## Procedure
 
@@ -34,15 +36,22 @@ bodies. `Target_statement` contains the overall theorem and hypotheses.
 6. For each use of an earlier lemma, ensure that its exact premise statement
    is present in the supplied dependency context and actually applies. Do not
    recover undeclared lemmas from memory.
-7. Pay special attention to assumptions that an object exists or satisfies a property. Sometimes such an object has not been constructed, or it exists but has not been proved to satisfy the claimed property.
-8. Audit whether the assumptions from the current item statement are actually used in the proof.
-9. If some assumptions seem unused, do not assume they are harmless. Reason carefully about whether:
+7. If a deduction genuinely cannot be checked from the exact ancestor
+   statement, request the smallest set of strict-ancestor proof ids needed.
+   Do not search for internal proofs, infer project paths, or request the
+   current/unknown/non-ancestor/already-expanded ids.
+8. When a requested ancestor proof is present in `expanded_proofs`, check its
+   relevant reasoning as well. An error exposed there makes the current item
+   finally wrong and therefore blocks publication.
+9. Pay special attention to assumptions that an object exists or satisfies a property. Sometimes such an object has not been constructed, or it exists but has not been proved to satisfy the claimed property.
+10. Audit whether the assumptions from the current item statement are actually used in the proof.
+11. If some assumptions seem unused, do not assume they are harmless. Reason carefully about whether:
    - the assumption is truly redundant, or
    - the proof is silently omitting a necessary use of it and therefore has a gap or error.
-10. Classify findings:
+12. Classify findings:
    - `critical_error`: logical contradiction, invalid theorem use, false implication.
    - `gap`: missing derivation, vague justification, unsupported step, unjustified existence or property assumptions about objects, suspiciously unused assumptions whose role is not justified, failure to distinguish between similar-looking definitions or formulas, or a hand-wavy deduction from one property to another.
-11. Keep a structured check for the supplied current item in the current
+13. Keep a structured check for the supplied current item in the current
     response's finding ledger. Do not call memory tools and do not claim
     coverage of any other item.
 
@@ -65,5 +74,5 @@ Keep records in the finding ledger with structure like:
 
 ## Tool Policy
 
-Do not use MCP memory or output tools. The current item is deliberately bounded
-so its complete finding ledger must stay in the current response context.
+Never use MCP or Graphify for internal proof discovery/hydration, completeness,
+digests, or output. External-reference search is allowed by the reference skill.

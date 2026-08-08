@@ -5,6 +5,7 @@ import json
 import os
 import sys
 import threading
+import tomllib
 from types import SimpleNamespace
 from pathlib import Path
 from typing import Any
@@ -24,6 +25,14 @@ for path in (REPOSITORY_ROOT, VERIFICATION_ROOT):
 from api import server  # noqa: E402
 from api.contracts import build_verification_output  # noqa: E402
 from api.proof_context import aggregate_context_digest, parse_blueprint  # noqa: E402
+
+
+_REAL_REQUIRE_MCP_RUNTIME = server._require_mcp_runtime
+
+
+@pytest.fixture(autouse=True)
+def _mock_mcp_runtime_preflight(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(server, "_require_mcp_runtime", lambda: None)
 
 
 def item(
@@ -70,6 +79,27 @@ def model_output(
         checked_item_ids=[item_id],
         proof_digest=proof_digest,
         context_digest=context["digest"],
+    )
+
+
+def needs_context_output(
+    *,
+    proof_digest: str,
+    context: dict[str, Any],
+    requests: list[dict[str, str]],
+) -> dict[str, Any]:
+    return build_verification_output(
+        verification_report={
+            "summary": "More premise detail is required.",
+            "critical_errors": [],
+            "gaps": [],
+        },
+        repair_hints="",
+        checked_item_ids=[context["requested_item_id"]],
+        proof_digest=proof_digest,
+        context_digest=context["digest"],
+        verification_status="needs_context",
+        needs_expanded_proofs=requests,
     )
 
 
@@ -131,6 +161,200 @@ def test_failed_dependency_blocks_descendant_without_second_model_call(
     assert len(result["checked_item_ids"]) == 2
     assert len(result["verification_report"]["gaps"]) == 2
     assert "dependencies failed" in result["verification_report"]["gaps"][1]["issue"]
+
+
+def test_valid_expansion_hydrates_only_requested_ancestor_in_fresh_round(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(server, "RESULTS_ROOT", tmp_path / "results")
+    proof = two_item_proof()
+    manifest = parse_blueprint(proof, target_statement="S")
+    ancestor_id, current_id = manifest.item_ids
+    received: list[dict[str, Any]] = []
+
+    def fake_run(**kwargs: Any) -> dict[str, Any]:
+        context = kwargs["context"]
+        received.append(context)
+        if context["requested_item_id"] == ancestor_id:
+            return model_output(proof_digest=kwargs["proof_digest"], context=context)
+        if context["round"] == 0:
+            assert context["expanded_proofs"] == []
+            return needs_context_output(
+                proof_digest=kwargs["proof_digest"],
+                context=context,
+                requests=[
+                    {
+                        "id": ancestor_id,
+                        "reason": "The exact lemma proof is essential here.",
+                    }
+                ],
+            )
+        assert context["round"] == 1
+        assert context["expanded_proof_ids"] == [ancestor_id]
+        assert [record["item_id"] for record in context["expanded_proofs"]] == [
+            ancestor_id
+        ]
+        assert context["expanded_proofs"][0]["proof"] == "Proof A."
+        return model_output(proof_digest=kwargs["proof_digest"], context=context)
+
+    monkeypatch.setattr(server, "run_codex_item_verification", fake_run)
+    result = server.verify_blueprint("S", proof)
+
+    assert result["verdict"] == "correct"
+    assert len(received) == 3
+    current_attestation = result["item_context_attestations"][1]
+    assert current_attestation["item_id"] == current_id
+    assert current_attestation["final_round"] == 1
+    assert current_attestation["expanded_proof_ids"] == [ancestor_id]
+    assert result["adaptive_context_digest"]
+
+
+@pytest.mark.parametrize("request_kind", ["unknown", "current", "nonancestor"])
+def test_invalid_adaptive_request_scope_fails_closed(
+    request_kind: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(server, "RESULTS_ROOT", tmp_path / "results")
+    proof = "\n".join(
+        [
+            item("lemma lem:a", "A", "Proof A.", ""),
+            item("lemma lem:u", "U", "Proof U.", ""),
+            item("theorem thm:main", "S", "By A, S.", "lem:a"),
+        ]
+    )
+    manifest = parse_blueprint(proof, target_statement="S")
+    ancestor_id, unrelated_id, current_id = manifest.item_ids
+    requested_id = {
+        "unknown": "pi_" + "0" * 24,
+        "current": current_id,
+        "nonancestor": unrelated_id,
+    }[request_kind]
+
+    def fake_run(**kwargs: Any) -> dict[str, Any]:
+        context = kwargs["context"]
+        if context["requested_item_id"] != current_id:
+            return model_output(proof_digest=kwargs["proof_digest"], context=context)
+        assert context["scope"]["strict_ancestor_item_ids"] == [ancestor_id]
+        return needs_context_output(
+            proof_digest=kwargs["proof_digest"],
+            context=context,
+            requests=[{"id": requested_id, "reason": "Need this proof."}],
+        )
+
+    monkeypatch.setattr(server, "run_codex_item_verification", fake_run)
+    with pytest.raises(HTTPException) as exc_info:
+        server.verify_blueprint("S", proof)
+    assert exc_info.value.status_code == 422
+    expected_message = {
+        "unknown": "unknown proof item",
+        "current": "current proof item",
+        "nonancestor": "non-ancestor proof item",
+    }[request_kind]
+    assert expected_message in str(exc_info.value.detail)
+    assert not (tmp_path / "results" / "blueprint_verified.md").exists()
+
+
+def test_duplicate_adaptive_request_is_rejected_by_production_contract(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(server, "RESULTS_ROOT", tmp_path / "results")
+    proof = two_item_proof()
+    manifest = parse_blueprint(proof, target_statement="S")
+    ancestor_id, current_id = manifest.item_ids
+
+    def fake_run(**kwargs: Any) -> dict[str, Any]:
+        context = kwargs["context"]
+        if context["requested_item_id"] == ancestor_id:
+            return model_output(proof_digest=kwargs["proof_digest"], context=context)
+        output = needs_context_output(
+            proof_digest=kwargs["proof_digest"],
+            context=context,
+            requests=[{"id": ancestor_id, "reason": "Need proof."}],
+        )
+        output["needs_expanded_proofs"].append(
+            {"id": ancestor_id, "reason": "Duplicate request."}
+        )
+        assert context["requested_item_id"] == current_id
+        return output
+
+    monkeypatch.setattr(server, "run_codex_item_verification", fake_run)
+    with pytest.raises(HTTPException) as exc_info:
+        server.verify_blueprint("S", proof)
+    assert exc_info.value.status_code == 422
+    assert "duplicate id" in str(exc_info.value.detail)
+
+
+@pytest.mark.parametrize(
+    ("limit_name", "limit_value", "message"),
+    [
+        ("VERIFY_MAX_EXPANSION_ROUNDS", 0, "EXPANSION_ROUNDS"),
+        ("VERIFY_MAX_EXPANDED_PROOFS", 0, "EXPANDED_PROOFS"),
+        ("VERIFY_MAX_EXPANDED_PROOF_CHARS", 1, "EXPANDED_PROOF_CHARS"),
+    ],
+)
+def test_adaptive_expansion_limits_fail_closed_before_second_round(
+    limit_name: str,
+    limit_value: int,
+    message: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(server, "RESULTS_ROOT", tmp_path / "results")
+    monkeypatch.setattr(server, limit_name, limit_value)
+    proof = two_item_proof()
+    manifest = parse_blueprint(proof, target_statement="S")
+    ancestor_id, current_id = manifest.item_ids
+    current_calls = 0
+
+    def fake_run(**kwargs: Any) -> dict[str, Any]:
+        nonlocal current_calls
+        context = kwargs["context"]
+        if context["requested_item_id"] == ancestor_id:
+            return model_output(proof_digest=kwargs["proof_digest"], context=context)
+        current_calls += 1
+        assert context["requested_item_id"] == current_id
+        return needs_context_output(
+            proof_digest=kwargs["proof_digest"],
+            context=context,
+            requests=[{"id": ancestor_id, "reason": "Need exact proof."}],
+        )
+
+    monkeypatch.setattr(server, "run_codex_item_verification", fake_run)
+    with pytest.raises(HTTPException) as exc_info:
+        server.verify_blueprint("S", proof)
+    assert exc_info.value.status_code == 422
+    assert message in str(exc_info.value.detail)
+    assert current_calls == 1
+
+
+def test_repeated_expansion_request_is_no_progress_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(server, "RESULTS_ROOT", tmp_path / "results")
+    proof = two_item_proof()
+    manifest = parse_blueprint(proof, target_statement="S")
+    ancestor_id, current_id = manifest.item_ids
+
+    def fake_run(**kwargs: Any) -> dict[str, Any]:
+        context = kwargs["context"]
+        if context["requested_item_id"] == ancestor_id:
+            return model_output(proof_digest=kwargs["proof_digest"], context=context)
+        assert context["requested_item_id"] == current_id
+        return needs_context_output(
+            proof_digest=kwargs["proof_digest"],
+            context=context,
+            requests=[{"id": ancestor_id, "reason": "Still need the proof."}],
+        )
+
+    monkeypatch.setattr(server, "run_codex_item_verification", fake_run)
+    with pytest.raises(HTTPException) as exc_info:
+        server.verify_blueprint("S", proof)
+    assert exc_info.value.status_code == 422
+    assert "no new ancestor proofs" in str(exc_info.value.detail)
 
 
 @pytest.mark.parametrize(
@@ -205,7 +429,7 @@ def test_prompt_delimiter_cannot_be_closed_by_proof_text() -> None:
     assert prompt.endswith(
         "Do not write files or invoke a tool to persist the verdict."
     )
-    assert "do not call MCP memory or output tools" in prompt
+    assert "return needs_context" in prompt
 
 
 def test_codex_command_uses_read_only_ephemeral_sandbox() -> None:
@@ -222,7 +446,136 @@ def test_codex_command_uses_read_only_ephemeral_sandbox() -> None:
     assert "--ignore-user-config" in command
     assert "--output-schema" in command
     assert command[command.index("--output-last-message") + 1] == str(output_path)
-    assert not any("mcp_servers.verification_agent" in part for part in command)
+    mcp_config = next(
+        part
+        for part in command
+        if part.startswith("mcp_servers.verification_agent=")
+    )
+    assert "command=" in mcp_config
+    assert "args=[\"./mcp/server.py\"]" in mcp_config
+    assert f"cwd={json.dumps(str(work_dir.resolve()))}" in mcp_config
+    assert "tool_timeout_sec=" in mcp_config
+    assert "approval_policy=\"never\"" in command
+
+
+def test_codex_command_injects_one_complete_mcp_object_and_preserves_venv_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    venv_bin = tmp_path / "venv" / "bin"
+    venv_bin.mkdir(parents=True)
+    venv_path = venv_bin / "python"
+    venv_path.symlink_to(sys.executable)
+    venv_python = str(venv_path)
+    monkeypatch.setattr(server.sys, "executable", venv_python)
+    work_dir = Path("/isolated/workspace")
+    command = server.build_codex_command("prompt", work_dir=work_dir)
+    configs = [
+        part
+        for part in command
+        if part.startswith("mcp_servers.verification_agent=")
+    ]
+
+    assert len(configs) == 1
+    assert command[command.index(configs[0]) - 1] == "-c"
+    assert "--config" not in command
+    inline = configs[0].split("=", 1)[1]
+    parsed = tomllib.loads(f"value={inline}")["value"]
+    assert parsed == {
+        "command": venv_python,
+        "args": ["./mcp/server.py"],
+        "cwd": str(work_dir.resolve()),
+        "tool_timeout_sec": server.CODEX_TIMEOUT_SECONDS,
+    }
+    assert parsed["command"] != str(Path(venv_python).resolve())
+
+
+@pytest.mark.parametrize("missing_module", ["fastmcp", "requests", "jsonschema"])
+def test_missing_mcp_runtime_dependency_creates_no_run_and_starts_no_codex(
+    missing_module: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    results_root = tmp_path / "results"
+    subprocess_calls = 0
+
+    def forbidden_subprocess(*args: Any, **kwargs: Any) -> None:
+        nonlocal subprocess_calls
+        subprocess_calls += 1
+        pytest.fail("Codex must not start with an incomplete MCP runtime")
+
+    monkeypatch.setattr(server, "RESULTS_ROOT", results_root)
+    monkeypatch.setattr(server, "_require_mcp_runtime", _REAL_REQUIRE_MCP_RUNTIME)
+    monkeypatch.setattr(
+        server.importlib.util,
+        "find_spec",
+        lambda name: None if name == missing_module else SimpleNamespace(),
+    )
+    monkeypatch.setattr(
+        server.importlib,
+        "import_module",
+        lambda name: SimpleNamespace(),
+    )
+    monkeypatch.setattr(server.subprocess, "run", forbidden_subprocess)
+
+    with pytest.raises(HTTPException) as exc_info:
+        server.verify_blueprint("S", "candidate proof")
+
+    assert exc_info.value.status_code == 500
+    assert missing_module in str(exc_info.value.detail)
+    assert "Codex was not started" in str(exc_info.value.detail)
+    assert subprocess_calls == 0
+    assert not results_root.exists()
+
+
+def test_api_requirements_include_authoritative_mcp_runtime_requirements() -> None:
+    api_requirements = (
+        VERIFICATION_ROOT / "api" / "requirements.txt"
+    ).read_text(encoding="utf-8")
+    assert "-r ../mcp/requirements.txt" in api_requirements.splitlines()
+
+    mcp_requirements = (
+        VERIFICATION_ROOT / "mcp" / "requirements.txt"
+    ).read_text(encoding="utf-8")
+    for package in server._MCP_RUNTIME_MODULES:
+        assert any(
+            line.strip().casefold().startswith(package.casefold())
+            for line in mcp_requirements.splitlines()
+        )
+
+
+def test_broken_mcp_runtime_import_creates_no_run_and_starts_no_codex(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    results_root = tmp_path / "results"
+    subprocess_calls = 0
+
+    def import_module(name: str) -> Any:
+        if name == "requests":
+            raise ImportError("simulated broken dependency")
+        return SimpleNamespace()
+
+    def forbidden_subprocess(*args: Any, **kwargs: Any) -> None:
+        nonlocal subprocess_calls
+        subprocess_calls += 1
+        pytest.fail("Codex must not start with a broken MCP runtime")
+
+    monkeypatch.setattr(server, "RESULTS_ROOT", results_root)
+    monkeypatch.setattr(server, "_require_mcp_runtime", _REAL_REQUIRE_MCP_RUNTIME)
+    monkeypatch.setattr(
+        server.importlib.util, "find_spec", lambda name: SimpleNamespace()
+    )
+    monkeypatch.setattr(server.importlib, "import_module", import_module)
+    monkeypatch.setattr(server.subprocess, "run", forbidden_subprocess)
+
+    with pytest.raises(HTTPException) as exc_info:
+        server.verify_blueprint("S", "candidate proof")
+
+    assert exc_info.value.status_code == 500
+    assert "requests (ImportError)" in str(exc_info.value.detail)
+    assert subprocess_calls == 0
+    assert not results_root.exists()
 
 
 def test_endpoint_token_and_busy_slot_fail_closed(
@@ -381,12 +734,20 @@ def test_codex_item_output_is_bound_to_expected_context(
         assert command[-1] == "-"
         assert context["current_item"]["proof"] in kwargs["input"]
         assert context["current_item"]["proof"] not in " ".join(command)
-        assert kwargs["stdout"] == server.subprocess.DEVNULL
+        assert hasattr(kwargs["stdout"], "write")
         assert kwargs["stderr"] == server.subprocess.STDOUT
+        kwargs["stdout"].write(
+            b"ephemeral secret model stream\ntokens used\n1,234\n"
+        )
         workspace = Path(kwargs["cwd"])
-        assert not (workspace / "mcp").exists()
+        assert (workspace / "mcp" / "server.py").is_file()
         assert not (workspace / ".codex").exists()
-        assert not any("mcp_servers.verification_agent" in part for part in command)
+        mcp_config = next(
+            part
+            for part in command
+            if part.startswith("mcp_servers.verification_agent=")
+        )
+        assert f"cwd={json.dumps(str(workspace.resolve()))}" in mcp_config
         output_path = Path(command[command.index("--output-last-message") + 1])
         assert output_path == workspace.parent / "output" / "verification.json"
         assert output_path.is_absolute()
@@ -420,6 +781,9 @@ def test_codex_item_output_is_bound_to_expected_context(
     assert secret_proof not in log_text
     assert secret_model_output not in log_text
     assert "codex_returncode: 0" in log_text
+    assert "tokens_used: 1234" in log_text
+    assert "elapsed_seconds:" in log_text
+    assert "ephemeral secret model stream" not in log_text
     assert "codex_status: completed" in log_text
     assert (
         "output_status: contract_rejected" if corrupt_digest
@@ -521,7 +885,7 @@ def test_nonzero_codex_exit_is_rejected_even_with_valid_output(
     def fake_subprocess_run(*args: Any, **kwargs: Any) -> SimpleNamespace:
         command = args[0]
         output_path = Path(command[command.index("--output-last-message") + 1])
-        assert kwargs["stdout"] == server.subprocess.DEVNULL
+        assert hasattr(kwargs["stdout"], "write")
         output_path.write_text(json.dumps(payload), encoding="utf-8")
         return SimpleNamespace(returncode=7)
 
