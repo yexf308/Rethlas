@@ -161,6 +161,12 @@ This script:
   generation workspace, so an MCP restart cannot load temporarily modified code;
   these per-run snapshots live under `agents/.trusted_generation_runtime/`
   and are ignored by Git
+- injects the trusted `reasoning_agent` MCP as one complete CLI object
+  (`command`, `args`, `cwd`, `env`, `tool_timeout_sec`, and
+  `default_tools_approval_mode="approve"`), rather than relying on workspace
+  MCP configuration merging; all tools on this narrowly scoped trusted server,
+  including the memory write tools, therefore run noninteractively even when
+  the outer Codex approval policy is `never`
 - writes iteration logs to `agents/generation/logs/example/iter/`
 - writes memory artifacts to `agents/generation/memory/example/`
 - writes the draft proof to `agents/generation/results/example/blueprint.md`

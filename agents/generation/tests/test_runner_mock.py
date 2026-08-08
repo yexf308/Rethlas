@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import py_compile
 import shutil
@@ -39,12 +40,46 @@ import json
 import os
 import pathlib
 import sys
+import tomllib
 
 if "--version" in sys.argv:
     print("codex-mock 1.0")
     raise SystemExit(0)
 assert "--dangerously-bypass-approvals-and-sandbox" not in sys.argv
 assert sys.argv[sys.argv.index("--sandbox") + 1] == "workspace-write"
+reasoning_mcp_configs = [
+    value
+    for index, value in enumerate(sys.argv)
+    if index > 0
+    and sys.argv[index - 1] == "--config"
+    and value.startswith("mcp_servers.reasoning_agent")
+]
+assert len(reasoning_mcp_configs) == 1
+assert reasoning_mcp_configs[0].startswith("mcp_servers.reasoning_agent=")
+reasoning_mcp = tomllib.loads(
+    "value=" + reasoning_mcp_configs[0].split("=", 1)[1]
+)["value"]
+assert set(reasoning_mcp) == {
+    "command",
+    "args",
+    "cwd",
+    "env",
+    "tool_timeout_sec",
+    "default_tools_approval_mode",
+}
+assert pathlib.Path(reasoning_mcp["command"]).is_absolute()
+assert reasoning_mcp["args"][0] == "-B"
+assert pathlib.Path(reasoning_mcp["args"][1]).is_absolute()
+assert pathlib.Path(reasoning_mcp["args"][1]).name == "server.py"
+assert pathlib.Path(reasoning_mcp["cwd"]).resolve() == pathlib.Path.cwd().resolve()
+assert reasoning_mcp["tool_timeout_sec"] == 3600
+# The trusted MCP's memory_init/memory_append tools are writes. "approve" makes
+# every tool on this server noninteractive; approval_policy=never cannot cancel
+# the call while waiting for an unavailable prompt.
+assert reasoning_mcp["default_tools_approval_mode"] == "approve"
+(pathlib.Path.cwd() / "reasoning_mcp_config_seen.json").write_text(
+    json.dumps(reasoning_mcp), encoding="utf-8"
+)
 if os.environ.get("MOCK_EXPECT_VERIFY_PROOF_URL"):
     assert os.environ["VERIFY_PROOF_URL"] == os.environ["MOCK_EXPECT_VERIFY_PROOF_URL"]
 if os.environ.get("MOCK_EXPECT_VERIFY_API_TOKEN"):
@@ -99,15 +134,7 @@ elif os.environ.get("MOCK_PUBLICATION") == "transient_tamper":
     original = source_server.read_bytes()
     source_server.write_text("# transient malicious publisher\\n", encoding="utf-8")
     try:
-        overrides = [
-            value.split("=", 1)[1]
-            for index, value in enumerate(sys.argv)
-            if index > 0
-            and sys.argv[index - 1] == "--config"
-            and value.startswith("mcp_servers.reasoning_agent.args=")
-        ]
-        assert len(overrides) == 1
-        snapshot_args = json.loads(overrides[0])
+        snapshot_args = reasoning_mcp["args"]
         assert snapshot_args[0] == "-B"
         snapshot_server = pathlib.Path(snapshot_args[1]).resolve()
         assert not snapshot_server.is_relative_to(root.resolve())
@@ -160,6 +187,31 @@ def test_runner_accepts_mock_atomic_publication_receipt(tmp_path: Path) -> None:
     completed = _run_mock(tmp_path, mode="trusted")
     assert completed.returncode == 0, completed.stdout + completed.stderr
     assert "Solved problem_id=example" in completed.stdout
+
+
+def test_runner_injects_complete_mcp_and_auto_approves_memory_tools(
+    tmp_path: Path,
+) -> None:
+    completed = _run_mock(tmp_path, mode="trusted")
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    generation_root = tmp_path / "agents" / "generation"
+    config = json.loads(
+        (generation_root / "reasoning_mcp_config_seen.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert set(config) == {
+        "command",
+        "args",
+        "cwd",
+        "env",
+        "tool_timeout_sec",
+        "default_tools_approval_mode",
+    }
+    assert config["default_tools_approval_mode"] == "approve"
+    assert config["tool_timeout_sec"] == 3600
+    assert Path(config["args"][1]).is_absolute()
+    assert not Path(config["args"][1]).is_relative_to(generation_root.resolve())
 
 
 def test_runner_rejects_model_written_verified_file_without_receipt(

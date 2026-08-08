@@ -540,6 +540,7 @@ entries = [
 print("{" + ", ".join(entries) + "}")
 PY
 )"
+TRUSTED_REASONING_AGENT_MCP_TOML="{command=$TRUSTED_PYTHON_COMMAND_TOML,args=$TRUSTED_MCP_ARGS_TOML,cwd=$TRUSTED_MCP_CWD_TOML,env=$TRUSTED_MCP_ENV_TOML,tool_timeout_sec=3600,default_tools_approval_mode=\"approve\"}"
 
 START_EPOCH=$(date +%s)
 
@@ -596,10 +597,7 @@ for ((iter = 0; iter < MAX_ITERATIONS; iter += 1)); do
       --config "model_reasoning_effort=\"$REASONING_EFFORT\"" \
       --config "web_search=\"$web_mode\"" \
       --config "shell_environment_policy.inherit=none" \
-      --config "mcp_servers.reasoning_agent.command=$TRUSTED_PYTHON_COMMAND_TOML" \
-      --config "mcp_servers.reasoning_agent.args=$TRUSTED_MCP_ARGS_TOML" \
-      --config "mcp_servers.reasoning_agent.cwd=$TRUSTED_MCP_CWD_TOML" \
-      --config "mcp_servers.reasoning_agent.env=$TRUSTED_MCP_ENV_TOML" \
+      --config "mcp_servers.reasoning_agent=$TRUSTED_REASONING_AGENT_MCP_TOML" \
       --sandbox workspace-write \
       --ephemeral \
       "$prompt"
