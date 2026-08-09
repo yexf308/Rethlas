@@ -177,8 +177,8 @@ evidence.
 This script:
 
 - reads `agents/generation/data/example.md`
-- runs `codex exec` inside `agents/generation`
-- starts a fresh Codex session for each iteration, alternating search-disabled
+- runs `codex exec` inside `agents/generation` by default
+- starts a fresh Codex session for each default iteration, alternating search-disabled
   and search-enabled turns, and resumes only from the current blueprint plus
   budgeted persisted memory
 - stops only when the verified file matches a publication receipt written
@@ -192,7 +192,7 @@ This script:
   these per-run snapshots live under `agents/.trusted_generation_runtime/`
   and are ignored by Git
 - injects the trusted `reasoning_agent` MCP as one complete CLI object
-  (`command`, `args`, `cwd`, `env`, `tool_timeout_sec`, and
+  (`command`, `args`, `cwd`, `env`, `required=true`, `tool_timeout_sec`, and
   `default_tools_approval_mode="approve"`), rather than relying on workspace
   MCP configuration merging; all tools on this narrowly scoped trusted server,
   including the memory write tools, therefore run noninteractively even when
@@ -202,6 +202,150 @@ This script:
 - writes the draft proof to `agents/generation/results/example/blueprint.md`
 - binds the target to the startup SHA-256 of `data/example.md`, then writes the
   verified proof and trusted receipt only if verification succeeds
+
+### Optional human hot-join for the generator
+
+Set an explicit run id to replace only the generator's `codex exec` transport
+with a persistent Codex app-server thread. The mathematical skills, reasoning
+MCP, memory files, verifier API, and publication checks are unchanged:
+
+```bash
+cd agents/generation
+RETHLAS_HOTJOIN_RUN_ID=example-live ./tests/run_example.sh
+```
+
+While that run is active, the local repository owner can add a first-class user
+turn from another shell. Reuse `--client-message-id` safely after a lost CLI
+response; reusing it with different text or mode is rejected.
+
+To queue direction before the runner starts, initialize the same run id first;
+the runner later checks that its `problem_id` matches this durable binding:
+
+```bash
+python3 agents/hotjoin_adapter.py init \
+  --run-id example-live --problem-id example
+```
+
+```bash
+cd /path/to/Rethlas
+python3 agents/hotjoin_adapter.py send \
+  --run-id example-live \
+  --client-message-id owner-0001 \
+  --mode steer \
+  --text 'Explore the extremal-measure reformulation before more searching.'
+
+python3 agents/hotjoin_adapter.py status --run-id example-live
+python3 agents/hotjoin_adapter.py tail --run-id example-live --after-sequence 0
+python3 agents/hotjoin_adapter.py verify-ledger --run-id example-live
+```
+
+`steer` uses `turn/steer` with the exact active turn id, so the user text joins
+the current reasoning turn. `queue` waits and starts a later turn without
+interrupting. `interrupt` is the only mode that calls `turn/interrupt`; after
+the matching turn ends, the text starts a fresh turn. Timeouts never imply an
+interrupt. If Codex reports that a compact/review turn cannot be steered, the
+message is durably deferred and starts after that turn instead of being retried
+in a tight loop.
+
+The adapter depends on Codex's **experimental** app-server v2 protocol; it is
+supported only when the installed binary's generated schema passes the exact
+capability preflight. The preflight covers initialization, `model/list`, all
+thread and turn RPC parameters/results, and the turn, item, token-usage, and
+model-reroute notifications consumed by the adapter. A failed preflight occurs
+before a durable run or app-server process is created, so it cannot consume
+model tokens. Before starting or resuming a thread, the broker also requires an
+exact catalog match for the requested model/effort, disables provider fallback
+where the installed schema supports it, and checks the returned model, effort,
+both returned working-directory fields, persistent (`ephemeral=false`) thread
+state, approval policy, and an offline workspace-write sandbox whose every
+writable/runtime root stays inside the generation directory. Accepted messages,
+delivery attempts, replies, runtime attestations, exact token-usage updates, and
+terminal status/duration/failure records are stored in an owner-only SQLite
+database under `agents/.rethlas_hotjoin/` with an append-only SHA-256 receipt
+chain. A custom `--db` parent must already be owner-only; the adapter refuses it
+instead of changing permissions on a caller-owned directory.
+
+If a crash leaves an app-server side effect genuinely unobservable, the message
+becomes `delivery_unknown` and is never resent automatically. A process loss
+while a paid turn is active is stricter: app-server history cannot replay whether
+that turn was model-rerouted, so the whole run is durably quarantined and cannot
+be resumed or accepted. Use a new run id after investigating it. After inspecting
+an ordinary ambiguous delivery that has no active paid turn, the owner may
+explicitly authorize one retry:
+
+Every `turn/start` has a two-phase durable intent. The prompt/config binding is
+first stored as `prepared` with dispatch count zero; only then does a fenced
+transaction record `dispatch_started` immediately before the RPC. A brand-new
+app-server thread is not materialized until its first user message, so the sole
+strictly prepared bootstrap is sent directly without `thread/read`. Once a
+dispatch boundary has been crossed, recovery always uses exact thread history
+and never blindly resends. Legacy database intents migrate conservatively as
+already dispatched.
+
+```bash
+python3 agents/hotjoin_adapter.py retry-unknown \
+  --run-id example-live --message-id msg_...
+```
+
+An ambiguous bootstrap has no owner message row, so retry its durable turn
+intent explicitly by client id:
+
+```bash
+python3 agents/hotjoin_adapter.py retry-unknown-turn \
+  --run-id example-live --client-message-id bootstrap:example-live:1
+```
+
+Each persistent run is also bound to the Codex version/schema, model and effort,
+sandbox, working directory, shell policy, complete reasoning-MCP object, and the
+hot-join control-plane version/code hash. Ephemeral trusted-runtime paths are
+committed by file content plus the runner's full runtime manifest; secret
+environment values may rotate, but their names and all non-secret values remain
+bound. Completed, failed, and interrupted turns are projected atomically with
+their message states and error receipts. The adapter waits a bounded 250 ms after
+the terminal event for a delayed token update; receipts distinguish observed but
+not schema-attested-final usage, no usage after the full settle window, and
+unknown usage after an adapter interruption. Token receipts separately report
+raw notification count, distinct cumulative-total growth observations, duplicate
+notifications, and the sum of `last` breakdowns for growth observations. Every
+nonduplicate update must be monotone and its cumulative delta must exactly equal
+`last`; malformed usage fails before persistence, while other-thread usage is
+ignored without an audit receipt or counter change. These are observable usage
+semantics, not a claim that app-server schema attests one model inference per
+growth observation.
+
+### Recursive sub-agent cost policy
+
+The generation contract `rethlas_recursive_wait_v1` prevents the root agent
+from 60-second recursive busy polling. Its defaults are a 600-second initial
+completion wait, 2x timeout backoff up to one hour, no status query without a
+mailbox change, multi-tool spawn/follow-up fanout when supported, and stop gates
+at 16 root orchestration resumptions, 3,000,000 observed orchestration input
+tokens, or four consecutive no-progress timeouts. Long waits still wake early
+when a sub-agent message or completion arrives.
+
+This control is deliberately scoped. Codex collaboration tools are not routed
+through the hot-join adapter, and app-server token notifications do not identify
+whether a sample was mathematical reasoning or orchestration. The runner hashes
+and snapshots `AGENTS.md` plus `.agents/`, so the policy is integrity-bound and
+offline contract-tested, but the adapter cannot safely enforce an
+orchestration-only cutoff without also risking interruption of legitimate math
+work. Its minimal code-enforced seam is exact cumulative-growth accounting; an
+operator can audit the stop gate without treating duplicate notifications as
+paid samples. The agent never manufactures a human hot-join turn when a cost
+gate fires—only the repository owner decides to intervene.
+
+The 16-resumption gate is a deterministic fallback, not a universal 3,000,000
+token ceiling. Replaying this incident at its observed average input per
+resumption projects about 2.955 million input tokens, less than one third of the
+9.052 million-token collaboration phase. A future root context can be larger,
+and orchestration-only token usage can be unavailable; in that case the count
+gate still bounds resumptions but cannot promise the same token total.
+
+This is a local owner-operated generator transport adapter, not a browser/chat
+transcript endpoint or a general multi-participant room. Verification still
+launches a fresh, noninteractive verifier session for every adaptive proof-item
+round; human messages cannot enter verifier context, change a verdict, or
+bypass the authenticated manifest and atomic publication receipt.
 
 ## Lazy proof verification
 

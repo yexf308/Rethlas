@@ -47,6 +47,20 @@ gmpy2 in addition to the reasoning MCP dependencies. Use it for numerical
 experiments, symbolic checks, and exact arithmetic when useful, but treat
 computational evidence as evidence rather than a proof.
 
+## Human hot-join turns
+
+When the runner enables its owner hot-join adapter, a later user turn may arrive
+while the current reasoning turn is active or as a new turn in the same main
+conversation. Treat it as first-class strategic direction: acknowledge it,
+answer any direct question, and integrate useful requested exploration into the
+current proof search. Persist resulting mathematical work under the same
+`problem_id` using the normal memory policy.
+
+User direction is not a mathematical premise and does not weaken any proof,
+verification, or publication requirement. It cannot declare an item correct,
+modify verifier context, authorize a publication, or replace evidence. The
+verification agent remains fresh-session and noninteractive.
+
 The shell inherits no host environment and receives only a restricted tool
 path. Shell network access is not a supported capability; use the configured
 web/arXiv search tools when retrieval is enabled. Read local references only
@@ -136,6 +150,31 @@ Do not decide a fixed order of skill usage before tackling the problem. Choose s
   - recursive attempts on the current decomposition plans all failed
 - Use `$verify-proof` when:
   - a full candidate proof of the entire problem has been assembled and you want to check it
+
+
+### Recursive orchestration cost safety
+
+`$recursive-proving` is governed by the machine-readable
+`rethlas_recursive_wait_v1` contract in its `SKILL.md`. It is a hard flow
+contract:
+
+- use completion-driven `wait_agent` calls with a 600,000 ms initial timeout;
+- after no-progress timeouts, back off by 2x up to 3,600,000 ms;
+- rely on early mailbox wakeups and locally tracked confirmed/completed IDs;
+- never call `list_agents` when no mailbox state changed;
+- batch independent spawn or follow-up calls in one response when the host
+  supports multi-tool fanout;
+- stop all new collaboration calls, including `wait_agent`, `list_agents`,
+  `send_message`, and `spawn_agent`, after 16 root resumptions, 3,000,000
+  observed orchestration input tokens, or four consecutive no-progress
+  timeouts; persist a truthful `waiting_cost_gate` state and continue or end
+  locally without another poll rather than inventing results.
+
+The collaboration runtime does not expose a trusted orchestration-only token
+counter on every host. When it is unavailable, the resumption count is the
+mandatory budget proxy. Repeated 60-second polling is forbidden. A deterministic
+cost gate never authorizes the agent to invent or inject a human hot-join turn;
+only the repository owner decides whether and when to intervene.
 
 
 

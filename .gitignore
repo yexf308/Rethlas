@@ -32,6 +32,7 @@ Thumbs.db
 # Agent runtime artifacts
 /agents/.verification_receipts/
 /agents/.trusted_generation_runtime/
+/agents/.rethlas_hotjoin/
 /agents/.generation-venv/
 agents/generation/logs/
 agents/generation/memory/

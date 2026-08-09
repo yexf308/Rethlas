@@ -7,6 +7,9 @@ MODEL="${MODEL:-gpt-5.6-sol}"
 REASONING_EFFORT="${REASONING_EFFORT:-max}"
 MAX_ITERATIONS="${MAX_ITERATIONS:-10}"
 TIMER_INTERVAL_SECONDS="${TIMER_INTERVAL_SECONDS:-30}"
+RETHLAS_HOTJOIN_RUN_ID="${RETHLAS_HOTJOIN_RUN_ID:-}"
+HOTJOIN_ADAPTER="$ROOT_DIR/../hotjoin_adapter.py"
+HOTJOIN_DB="$ROOT_DIR/../.rethlas_hotjoin/messages.sqlite3"
 
 # The generation runtime is content-attested below. Never create interpreter
 # caches in that trusted tree: bytecode is executable input, not a disposable
@@ -346,6 +349,37 @@ if [[ ! -f "$ROOT_DIR/$PROBLEM_FILE" ]]; then
   exit 1
 fi
 
+# Resolve every component before any Codex invocation.  A final or ancestor
+# symlink could otherwise make a syntactically data-relative path read an
+# external statement and consume paid tokens before the publication layer
+# rejects the mismatch.
+if ! "$TRUSTED_PYTHON_BIN" -I -B - "$ROOT_DIR" "$PROBLEM_FILE" <<'PY'
+import pathlib
+import sys
+
+try:
+    root = pathlib.Path(sys.argv[1]).resolve(strict=True)
+    relative = pathlib.Path(sys.argv[2])
+    data_root = root / "data"
+    cursor = root
+    for component in relative.parts:
+        cursor /= component
+        if cursor.is_symlink():
+            raise ValueError(f"symlink component is forbidden: {cursor}")
+    resolved_data = data_root.resolve(strict=True)
+    resolved_problem = (root / relative).resolve(strict=True)
+    if not resolved_data.is_dir() or not resolved_data.is_relative_to(root):
+        raise ValueError("data root escapes the generation workspace")
+    if not resolved_problem.is_file() or not resolved_problem.is_relative_to(resolved_data):
+        raise ValueError("problem file escapes the authenticated data root")
+except (OSError, ValueError) as exc:
+    print(f"Unsafe problem file: {exc}", file=sys.stderr)
+    raise SystemExit(1)
+PY
+then
+  exit 1
+fi
+
 if ! [[ "$MAX_ITERATIONS" =~ ^[0-9]+$ ]] || [[ "$MAX_ITERATIONS" -le 0 ]]; then
   echo "MAX_ITERATIONS must be a positive integer: $MAX_ITERATIONS" >&2
   exit 1
@@ -529,6 +563,7 @@ TRUSTED_RUNTIME_MANIFEST="$(trusted_runtime_manifest)" || {
   echo "Could not establish the trusted generation runtime manifest." >&2
   exit 1
 }
+export RETHLAS_TRUSTED_RUNTIME_SHA256="$TRUSTED_RUNTIME_MANIFEST"
 
 # Codex can restart a failed MCP server within one session. A before/after hash
 # of the writable source tree alone cannot detect code that was changed,
@@ -747,7 +782,24 @@ fi
 
 prepare_references
 
-CODEX_VERSION="$(codex --version 2>/dev/null || echo 'unknown')"
+CODEX_BIN="$(command -v codex || true)"
+if [[ "$CODEX_BIN" != /* ]] || [[ ! -x "$CODEX_BIN" ]]; then
+  echo "codex must resolve to an absolute executable path." >&2
+  exit 1
+fi
+CODEX_VERSION="$("$CODEX_BIN" --version 2>/dev/null || echo 'unknown')"
+HOTJOIN_ADAPTER_SHA256=""
+if [[ -n "$RETHLAS_HOTJOIN_RUN_ID" ]]; then
+  if [[ ! -f "$HOTJOIN_ADAPTER" || -L "$HOTJOIN_ADAPTER" ]]; then
+    echo "Hot-join adapter must be a regular non-symlink file: $HOTJOIN_ADAPTER" >&2
+    exit 1
+  fi
+  HOTJOIN_ADAPTER_SHA256="$(
+    "$TRUSTED_PYTHON_BIN" -I -B -c \
+      'import hashlib, pathlib, sys; print(hashlib.sha256(pathlib.Path(sys.argv[1]).read_bytes()).hexdigest())' \
+      "$HOTJOIN_ADAPTER"
+  )"
+fi
 
 echo "========================================"
 echo " Codex:      $CODEX_VERSION"
@@ -760,6 +812,12 @@ echo " Math Python: $trusted_python_command"
 echo " Max iters:  $MAX_ITERATIONS"
 echo " Logs:       $LOG_DIR"
 echo " Stop file:  $verified_path"
+if [[ -n "$RETHLAS_HOTJOIN_RUN_ID" ]]; then
+  echo " Hot join:   $RETHLAS_HOTJOIN_RUN_ID"
+  echo " Join DB:    $HOTJOIN_DB"
+else
+  echo " Hot join:   disabled (legacy fresh-session loop)"
+fi
 echo "========================================"
 echo ""
 
@@ -796,6 +854,7 @@ names = (
     "RETHLAS_EXPECTED_STATEMENT_SHA256",
     "RETHLAS_GENERATION_ROOT",
     "RETHLAS_RECEIPTS_ROOT",
+    "RETHLAS_TRUSTED_RUNTIME_SHA256",
     "VERIFY_API_TOKEN",
     "VERIFY_PROOF_URL",
 )
@@ -807,7 +866,7 @@ entries = [
 print("{" + ", ".join(entries) + "}")
 PY
 )"
-TRUSTED_REASONING_AGENT_MCP_TOML="{command=$TRUSTED_PYTHON_COMMAND_TOML,args=$TRUSTED_MCP_ARGS_TOML,cwd=$TRUSTED_MCP_CWD_TOML,env=$TRUSTED_MCP_ENV_TOML,tool_timeout_sec=3600,default_tools_approval_mode=\"approve\"}"
+TRUSTED_REASONING_AGENT_MCP_TOML="{command=$TRUSTED_PYTHON_COMMAND_TOML,args=$TRUSTED_MCP_ARGS_TOML,cwd=$TRUSTED_MCP_CWD_TOML,env=$TRUSTED_MCP_ENV_TOML,required=true,tool_timeout_sec=3600,default_tools_approval_mode=\"approve\"}"
 
 START_EPOCH=$(date +%s)
 
@@ -845,29 +904,73 @@ for ((iter = 0; iter < MAX_ITERATIONS; iter += 1)); do
 
   echo "Starting iter=$iter -> $log_file"
 
+  if [[ -n "$RETHLAS_HOTJOIN_RUN_ID" ]]; then
+    current_hotjoin_sha256="$(
+      "$TRUSTED_PYTHON_BIN" -I -B -c \
+        'import hashlib, pathlib, sys; print(hashlib.sha256(pathlib.Path(sys.argv[1]).read_bytes()).hexdigest())' \
+        "$HOTJOIN_ADAPTER"
+    )"
+    if [[ "$current_hotjoin_sha256" != "$HOTJOIN_ADAPTER_SHA256" ]]; then
+      echo "Hot-join adapter changed; refusing to start another session." >&2
+      exit 70
+    fi
+  fi
+
   if [[ "$iter" -eq 0 ]]; then
     prompt="Use AGENTS.md exactly to solve the math problem in ${PROBLEM_FILE}. Use problem_id=${problem_rel}. ${ref_prompt} A trusted math-research runtime is available as both python and python3, with NumPy, SciPy, SymPy, mpmath, and gmpy2 importable. This is iteration 0 in a fresh session. Ignore any pre-existing blueprint_verified.md: only verify_blueprint_service and its trusted receipt can finish this run."
     web_mode="live"
   elif ((iter % 2 == 1)); then
-    prompt="Start a fresh reasoning session and continue problem_id=${problem_rel}. Read AGENTS.md, ${PROBLEM_FILE}, the current results/${problem_rel}/blueprint.md if it exists, and retrieve only relevant persisted memory through memory_search. Ignore any pre-existing blueprint_verified.md: only verify_blueprint_service and its trusted receipt can finish this run. This is iteration ${iter}. Do not use arXiv theorem search or web search; think deeply from the persisted artifacts."
+    if [[ -n "$RETHLAS_HOTJOIN_RUN_ID" ]]; then
+      session_instruction="Continue the persistent main conversation for problem_id=${problem_rel}."
+    else
+      session_instruction="Start a fresh reasoning session and continue problem_id=${problem_rel}."
+    fi
+    prompt="${session_instruction} Read AGENTS.md, ${PROBLEM_FILE}, the current results/${problem_rel}/blueprint.md if it exists, and retrieve only relevant persisted memory through memory_search. Ignore any pre-existing blueprint_verified.md: only verify_blueprint_service and its trusted receipt can finish this run. This is iteration ${iter}. Do not use arXiv theorem search or web search; think deeply from the persisted artifacts."
     web_mode="disabled"
   else
-    prompt="Start a fresh reasoning session and continue problem_id=${problem_rel}. Read AGENTS.md, ${PROBLEM_FILE}, the current results/${problem_rel}/blueprint.md if it exists, and retrieve only relevant persisted memory through memory_search. Ignore any pre-existing blueprint_verified.md: only verify_blueprint_service and its trusted receipt can finish this run. This is iteration ${iter}. You may use arXiv theorem search and web search, but also reason deeply from the persisted artifacts."
+    if [[ -n "$RETHLAS_HOTJOIN_RUN_ID" ]]; then
+      session_instruction="Continue the persistent main conversation for problem_id=${problem_rel}."
+    else
+      session_instruction="Start a fresh reasoning session and continue problem_id=${problem_rel}."
+    fi
+    prompt="${session_instruction} Read AGENTS.md, ${PROBLEM_FILE}, the current results/${problem_rel}/blueprint.md if it exists, and retrieve only relevant persisted memory through memory_search. Ignore any pre-existing blueprint_verified.md: only verify_blueprint_service and its trusted receipt can finish this run. This is iteration ${iter}. You may use arXiv theorem search and web search, but also reason deeply from the persisted artifacts."
     web_mode="live"
+  fi
+
+  if [[ -n "$RETHLAS_HOTJOIN_RUN_ID" ]]; then
+    generator_command=(
+      "$TRUSTED_PYTHON_BIN" -I -B "$HOTJOIN_ADAPTER"
+      --db "$HOTJOIN_DB"
+      run-generator
+      --run-id "$RETHLAS_HOTJOIN_RUN_ID"
+      --problem-id "$problem_rel"
+      --cwd "$ROOT_DIR"
+      --prompt "$prompt"
+      --model "$MODEL"
+      --effort "$REASONING_EFFORT"
+      --web-mode "$web_mode"
+      --mcp-config-toml "$TRUSTED_REASONING_AGENT_MCP_TOML"
+      --shell-policy-toml "$TRUSTED_SHELL_ENVIRONMENT_POLICY_TOML"
+      --codex-bin "$CODEX_BIN"
+    )
+  else
+    generator_command=(
+      "$CODEX_BIN" exec
+      -C "$ROOT_DIR"
+      -m "$MODEL"
+      --config "model_reasoning_effort=\"$REASONING_EFFORT\""
+      --config "web_search=\"$web_mode\""
+      --config "shell_environment_policy=$TRUSTED_SHELL_ENVIRONMENT_POLICY_TOML"
+      --config "mcp_servers.reasoning_agent=$TRUSTED_REASONING_AGENT_MCP_TOML"
+      --sandbox workspace-write
+      --ephemeral
+      "$prompt"
+    )
   fi
 
   if (
     cd "$ROOT_DIR"
-    codex exec \
-      -C "$ROOT_DIR" \
-      -m "$MODEL" \
-      --config "model_reasoning_effort=\"$REASONING_EFFORT\"" \
-      --config "web_search=\"$web_mode\"" \
-      --config "shell_environment_policy=$TRUSTED_SHELL_ENVIRONMENT_POLICY_TOML" \
-      --config "mcp_servers.reasoning_agent=$TRUSTED_REASONING_AGENT_MCP_TOML" \
-      --sandbox workspace-write \
-      --ephemeral \
-      "$prompt"
+    "${generator_command[@]}"
   ) >"$log_file" 2>&1; then
     codex_rc=0
   else
@@ -882,6 +985,18 @@ for ((iter = 0; iter < MAX_ITERATIONS; iter += 1)); do
   if ! trusted_runtime_unchanged; then
     echo "Trusted generation runtime was modified during iter=$iter; refusing to continue or accept publication." >&2
     exit 70
+  fi
+
+  if [[ -n "$RETHLAS_HOTJOIN_RUN_ID" ]]; then
+    current_hotjoin_sha256="$(
+      "$TRUSTED_PYTHON_BIN" -I -B -c \
+        'import hashlib, pathlib, sys; print(hashlib.sha256(pathlib.Path(sys.argv[1]).read_bytes()).hexdigest())' \
+        "$HOTJOIN_ADAPTER"
+    )"
+    if [[ "$current_hotjoin_sha256" != "$HOTJOIN_ADAPTER_SHA256" ]]; then
+      echo "Hot-join adapter was modified during iter=$iter; refusing to continue." >&2
+      exit 70
+    fi
   fi
 
   echo "Finished problem_id=$problem_rel iter=$iter -> $log_file"

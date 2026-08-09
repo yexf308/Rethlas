@@ -151,6 +151,7 @@ assert set(reasoning_mcp) == {
     "args",
     "cwd",
     "env",
+    "required",
     "tool_timeout_sec",
     "default_tools_approval_mode",
 }
@@ -163,6 +164,7 @@ assert pathlib.Path(reasoning_mcp["args"][1]).is_absolute()
 assert pathlib.Path(reasoning_mcp["args"][1]).name == "server.py"
 assert pathlib.Path(reasoning_mcp["cwd"]).resolve() == pathlib.Path.cwd().resolve()
 assert reasoning_mcp["tool_timeout_sec"] == 3600
+assert reasoning_mcp["required"] is True
 # The trusted MCP's memory_init/memory_append tools are writes. "approve" makes
 # every tool on this server noninteractive; approval_policy=never cannot cancel
 # the call while waiting for an unavailable prompt.
@@ -308,19 +310,19 @@ def test_runner_injects_complete_mcp_and_auto_approves_memory_tools(
     assert completed.returncode == 0, completed.stdout + completed.stderr
     generation_root = tmp_path / "agents" / "generation"
     config = json.loads(
-        (generation_root / "reasoning_mcp_config_seen.json").read_text(
-            encoding="utf-8"
-        )
+        (generation_root / "reasoning_mcp_config_seen.json").read_text(encoding="utf-8")
     )
     assert set(config) == {
         "command",
         "args",
         "cwd",
         "env",
+        "required",
         "tool_timeout_sec",
         "default_tools_approval_mode",
     }
     assert config["default_tools_approval_mode"] == "approve"
+    assert config["required"] is True
     assert config["tool_timeout_sec"] == 3600
     assert Path(config["args"][1]).is_absolute()
     assert not Path(config["args"][1]).is_relative_to(generation_root.resolve())
@@ -404,7 +406,10 @@ def test_runner_broken_runtime_import_starts_zero_codex_processes(
     )
 
     assert completed.returncode == 1
-    assert "sympy: import raised RuntimeError: mock native import failure" in completed.stderr
+    assert (
+        "sympy: import raised RuntimeError: mock native import failure"
+        in completed.stderr
+    )
     assert not calls_file.exists()
 
 
@@ -518,7 +523,9 @@ def test_runner_workspace_editable_origin_starts_zero_codex_processes(
     shutil.rmtree(_module_stub(fake_bin, "sympy"))
     editable_packages = fake_bin.parent / "editable-packages"
     editable_packages.mkdir()
-    (editable_packages / "sympy").symlink_to(workspace_package, target_is_directory=True)
+    (editable_packages / "sympy").symlink_to(
+        workspace_package, target_is_directory=True
+    )
     (_site_packages(fake_bin) / "workspace-editable-origin.pth").write_text(
         f"{editable_packages}\n",
         encoding="utf-8",
@@ -604,7 +611,9 @@ def test_runner_rejects_unchecked_hash_bytecode_before_codex_starts(
     runner, fake_bin = _make_runner_tree(tmp_path)
     generation_root = runner.parent.parent
     malicious_source = tmp_path / "malicious_verification_client.py"
-    malicious_source.write_text("MARKER = 'malicious bytecode loaded'\n", encoding="utf-8")
+    malicious_source.write_text(
+        "MARKER = 'malicious bytecode loaded'\n", encoding="utf-8"
+    )
     cache_dir = generation_root / "mcp" / "__pycache__"
     cache_dir.mkdir()
     bytecode_path = (
@@ -686,6 +695,39 @@ def test_runner_rejects_problem_name_that_would_be_normalized(tmp_path: Path) ->
     )
     assert completed.returncode == 1
     assert "Unsupported problem path component" in completed.stderr
+
+
+def test_runner_rejects_symlinked_problem_before_any_codex_call(
+    tmp_path: Path,
+) -> None:
+    runner, fake_bin = _make_runner_tree(tmp_path)
+    generation_root = runner.parent.parent
+    outside = tmp_path / "external-problem.md"
+    outside.write_text("external statement", encoding="utf-8")
+    problem = generation_root / "data" / "example.md"
+    problem.unlink()
+    problem.symlink_to(outside)
+    calls_file = tmp_path / "codex-calls.jsonl"
+    environment = _mock_environment(
+        runner,
+        fake_bin,
+        mode="forged",
+        extra_environment={"MOCK_CODEX_CALLS_FILE": str(calls_file)},
+    )
+
+    completed = subprocess.run(
+        [str(runner)],
+        cwd=generation_root,
+        env=environment,
+        text=True,
+        capture_output=True,
+        timeout=20,
+        check=False,
+    )
+
+    assert completed.returncode == 1
+    assert "symlink component is forbidden" in completed.stderr
+    assert not calls_file.exists()
 
 
 def test_runner_forwards_explicit_https_endpoint_and_api_token(tmp_path: Path) -> None:

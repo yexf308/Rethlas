@@ -114,3 +114,36 @@ an incident.
   mathematical verdict. Telemetry failure must not change proof state. Persist
   enough service-owned metadata to identify both without logging prompts,
   proofs, model streams, or secrets.
+
+## 2026-08-09: recursive wait amplified a large cached context
+
+- **Classification:** paid orchestration cost defect; mitigated by the
+  `rethlas_recursive_wait_v1` contract and exact usage-growth audit.
+- **Trigger:** while four recursive proof branches were active, the root agent
+  used 34 short `wait_agent` calls, eight status-list calls, and seven separate
+  follow-up calls. Twenty-three waits timed out without progress. The root
+  context was already about 180k--194k input tokens, so each tool resumption
+  sampled that context again.
+- **Observed effect:** the 49 collaboration resumptions added 9,052,168 reported
+  tokens, including 9,049,038 input tokens. Pure timeout resumptions accounted
+  for 4,239,999 tokens. Four duplicate token-usage notifications were also
+  observed, but their cumulative totals did not change and therefore did not
+  inflate the app-server total.
+- **Root cause:** the recursive-proving skill said only to wait for every
+  sub-agent. It specified no long completion wait, backoff, status-query rule,
+  fanout rule, or root orchestration budget. App-server usage notifications do
+  not identify orchestration versus mathematical samples, so an adapter-side
+  orchestration cutoff would be unsafe.
+- **Remediation:** start at a 600-second early-waking wait, back off to the tool
+  maximum, forbid status queries without mailbox changes, batch independent
+  fanout where supported, and stop new orchestration calls at the contract
+  budget. The runner integrity-binds `AGENTS.md` and `.agents/`. The hot-join
+  adapter now separately audits notifications, cumulative-growth observations,
+  and duplicates, and rejects nonmonotone or inconsistent cumulative deltas.
+- **Regression evidence:** offline policy tests parse the machine-readable
+  contract, execute timeout growth/reset and each exact stop gate, and forbid a
+  60-second polling fallback. At this incident's historical average, the
+  conservative 16-resumption proxy projects about 2.955 million input tokens;
+  that is incident evidence, not a universal token ceiling for larger future
+  contexts. Hot-join mocks cover early/duplicate/growth usage, malformed deltas,
+  cross-thread spoofing, and terminal count honesty.
