@@ -1,6 +1,6 @@
 ---
 name: obtain-immediate-conclusions
-description: Derive immediate mathematical consequences from a theorem statement or subgoal. Use when starting a new problem, branch, or subgoal, or when cheap progress or a cleaner reformulation is needed before deeper proof search.
+description: Derive and internally stress-test immediate mathematical consequences during a coherent root reasoning phase. Use at the start of a problem or after a genuine reformulation, without external retrieval or per-conclusion memory writes.
 ---
 
 # Obtain Immediate Conclusions
@@ -26,16 +26,22 @@ Read from memory and current context:
 
 ## Output Contract
 
-Append each conclusion to `immediate_conclusions` with JSON object payload:
+Return the durable conclusions as one consolidated record for the root's next
+`memory_append_batch` checkpoint. Omit transient rewrites and duplicate
+restatements:
 
 ```json
 {
-  "statement": "...",
-  "justification_type": "by_definition|calculation|known_fact|logical_equivalence",
-  "confidence": 0.0,
-  "is_fragile": false,
-  "fragility_reason": "",
-  "suggested_followup": "none|construct-counterexamples",
+  "conclusions": [
+    {
+      "statement": "...",
+      "justification_type": "by_definition|calculation|known_fact|logical_equivalence",
+      "confidence": 0.0,
+      "is_fragile": false,
+      "fragility_reason": "",
+      "suggested_followup": "none|construct-counterexamples"
+    }
+  ],
   "scope": "global|branch|subgoal",
   "branch_id": "optional",
   "subgoal_id": "optional"
@@ -51,13 +57,17 @@ Rules:
 ## MCP Tools
 
 - `memory_append`
+- `memory_append_batch`
 - `memory_search`
-- `search_arxiv_theorems` for nontrivial consequences
-- Codex built-in web search for background definitions/terminology
+
+Do not use external retrieval merely because an immediate consequence is
+nontrivial. A named external knowledge gap is handled later by
+`$search-math-results`.
 
 ## Failure Logging
 
-If no meaningful consequence is found, append an `events` entry with:
+If no meaningful consequence is found, include an event in the next phase
+checkpoint only when the stall changes the proof route:
 
 - `event_type="immediate_conclusions_stalled"`
 - missing assumptions and suspected blockers

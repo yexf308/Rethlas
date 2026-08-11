@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import io
 import json
 import os
 import queue
@@ -223,12 +225,16 @@ def _model_entry(
     }
 
 
-def _token_usage(input_tokens: int, output_tokens: int) -> dict[str, Any]:
+def _token_usage(
+    input_tokens: int,
+    output_tokens: int,
+    reasoning_output_tokens: int = 0,
+) -> dict[str, Any]:
     breakdown = {
         "cachedInputTokens": 0,
         "inputTokens": input_tokens,
         "outputTokens": output_tokens,
-        "reasoningOutputTokens": 0,
+        "reasoningOutputTokens": reasoning_output_tokens,
         "totalTokens": input_tokens + output_tokens,
     }
     return {"last": dict(breakdown), "total": dict(breakdown)}
@@ -287,14 +293,61 @@ def _assert_telemetry_projection(
 
 
 def _next_token_usage(
-    previous: dict[str, Any], input_tokens: int, output_tokens: int
+    previous: dict[str, Any],
+    input_tokens: int,
+    output_tokens: int,
+    reasoning_output_tokens: int = 0,
 ) -> dict[str, Any]:
-    current = _token_usage(input_tokens, output_tokens)
+    current = _token_usage(
+        input_tokens,
+        output_tokens,
+        reasoning_output_tokens,
+    )
     current["total"] = {
         field: previous["total"][field] + amount
         for field, amount in current["last"].items()
     }
     return current
+
+
+def _notify_item(
+    adapter: hotjoin.GeneratorHotJoin,
+    *,
+    method: str,
+    turn_id: str,
+    item: dict[str, Any],
+    timestamp_ms: int,
+) -> None:
+    timestamp_field = "startedAtMs" if method == "item/started" else "completedAtMs"
+    adapter._process_notification(
+        {
+            "method": method,
+            "params": {
+                timestamp_field: timestamp_ms,
+                "item": item,
+                "threadId": "thread-1",
+                "turnId": turn_id,
+            },
+        }
+    )
+
+
+def _notify_usage(
+    adapter: hotjoin.GeneratorHotJoin,
+    *,
+    turn_id: str,
+    usage: dict[str, Any],
+) -> None:
+    adapter._process_notification(
+        {
+            "method": "thread/tokenUsage/updated",
+            "params": {
+                "threadId": "thread-1",
+                "tokenUsage": usage,
+                "turnId": turn_id,
+            },
+        }
+    )
 
 
 def test_ledger_message_idempotency_and_conflict(
@@ -426,10 +479,429 @@ def test_v1_turn_intents_migrate_with_prior_dispatch_fail_closed(
             "SELECT dispatch_count FROM turn_intents WHERE run_id = 'legacy-run'"
         ).fetchone()[0]
 
-    assert version == "2"
+    assert version == "5"
     assert "dispatch_count" in columns
+    assert "source_kind" in columns
     assert migrated_dispatch_count == 1
     ledger.create_run("migrated", "p")
+
+
+def test_v3_pending_advisor_notice_migrates_terminal_fail_closed(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "v3-state" / "messages.sqlite3"
+    old = hotjoin.ConversationLedger(database)
+    old.create_run("run-1", "problem/example")
+    lease = old.acquire_lease("run-1", "legacy-advisor")
+    old.bind_thread("run-1", "thread-1", lease=lease)
+    old.set_active_turn("run-1", "turn-legacy", lease=lease)
+    accepted = old.enqueue_advisor_notice(
+        "run-1",
+        problem_id="problem/example",
+        receipt_id="adv_" + "1" * 32,
+        receipt_sha256="a" * 64,
+        authorization_id="owner-auth",
+        mode="steer",
+        client_message_id="advisor:migration",
+    )
+    old.release_lease("run-1", lease)
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "UPDATE messages SET expected_thread_id = NULL, expected_turn_id = NULL "
+            "WHERE message_id = ?",
+            (accepted["message_id"],),
+        )
+        connection.execute(
+            "UPDATE metadata SET value = '3' WHERE key = 'schema_version'"
+        )
+
+    migrated = hotjoin.ConversationLedger(database)
+    assert migrated.pending_messages("run-1") == []
+    assert migrated.status("run-1")["message_counts"]["failed"] == 1
+    assert migrated.events("run-1")[-1]["kind"] == (
+        "advisor_message_failed_closed_on_migration"
+    )
+    assert migrated.verify_chain("run-1")["valid"] is True
+
+
+def test_v4_source_projection_migrates_without_reclassifying_existing_messages(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "v4-state" / "messages.sqlite3"
+    old = hotjoin.ConversationLedger(database)
+    old.create_run("run-1", "problem/example")
+    old.enqueue_message(
+        "run-1",
+        text="owner text",
+        client_message_id="owner-before-v5",
+    )
+    lease = old.acquire_lease("run-1", "v4-migration")
+    old.bind_thread("run-1", "thread-1", lease=lease)
+    old.set_active_turn("run-1", "turn-1", lease=lease)
+    old.enqueue_advisor_notice(
+        "run-1",
+        problem_id="problem/example",
+        receipt_id="adv_" + "4" * 32,
+        receipt_sha256="d" * 64,
+        authorization_id="owner-auth",
+        mode="steer",
+        client_message_id="advisor-before-v5",
+    )
+    old.release_lease("run-1", lease)
+    with sqlite3.connect(database) as connection:
+        connection.execute("ALTER TABLE messages DROP COLUMN source_kind_v5")
+        connection.execute(
+            "UPDATE metadata SET value = '4' WHERE key = 'schema_version'"
+        )
+
+    migrated = hotjoin.ConversationLedger(database)
+    assert migrated.status("run-1")["message_source_counts"] == {
+        "advisor": 1,
+        "owner": 1,
+    }
+    with sqlite3.connect(database) as connection:
+        version = connection.execute(
+            "SELECT value FROM metadata WHERE key = 'schema_version'"
+        ).fetchone()[0]
+        projections = connection.execute(
+            "SELECT source_kind, source_kind_v5 FROM messages "
+            "ORDER BY client_message_id"
+        ).fetchall()
+    assert version == "5"
+    assert projections == [("advisor", "advisor"), ("owner", "owner")]
+
+
+def test_advisor_notice_expires_with_exact_active_turn_and_never_requeues(
+    ledger: hotjoin.ConversationLedger,
+) -> None:
+    lease = ledger.acquire_lease("run-1", "advisor-exact-turn")
+    ledger.bind_thread("run-1", "thread-1", lease=lease)
+    ledger.set_active_turn("run-1", "turn-1", lease=lease)
+    accepted = ledger.enqueue_advisor_notice(
+        "run-1",
+        problem_id="problem/example",
+        receipt_id="adv_" + "2" * 32,
+        receipt_sha256="b" * 64,
+        authorization_id="owner-auth",
+        mode="steer",
+        client_message_id="advisor:exact-turn",
+    )
+    message = ledger.pending_messages("run-1")[0]
+    assert message.expected_thread_id == "thread-1"
+    assert message.expected_turn_id == "turn-1"
+    ledger.finalize_turn(
+        "run-1",
+        turn_id="turn-1",
+        status="completed",
+        assistant_message="done",
+        error=None,
+        terminal_audit=_turn("turn-1", "completed"),
+        lease=lease,
+    )
+    assert ledger.pending_messages("run-1") == []
+    assert ledger.status("run-1")["message_counts"]["failed"] == 1
+    with pytest.raises(hotjoin.HotJoinError, match="only delivery_unknown"):
+        ledger.retry_unknown("run-1", accepted["message_id"])
+
+
+def test_advisor_enqueue_racing_turn_end_is_never_left_for_later_turn(
+    ledger: hotjoin.ConversationLedger,
+) -> None:
+    lease = ledger.acquire_lease("run-1", "advisor-race")
+    ledger.bind_thread("run-1", "thread-1", lease=lease)
+    ledger.set_active_turn("run-1", "turn-race", lease=lease)
+    barrier = threading.Barrier(2)
+    errors: list[BaseException] = []
+
+    def enqueue() -> None:
+        barrier.wait(timeout=5)
+        try:
+            ledger.enqueue_advisor_notice(
+                "run-1",
+                problem_id="problem/example",
+                receipt_id="adv_" + "3" * 32,
+                receipt_sha256="c" * 64,
+                authorization_id="owner-auth",
+                mode="steer",
+                client_message_id="advisor:turn-end-race",
+            )
+        except hotjoin.AdvisorDeliveryRejected as exc:
+            errors.append(exc)
+
+    thread = threading.Thread(target=enqueue)
+    thread.start()
+    barrier.wait(timeout=5)
+    ledger.finalize_turn(
+        "run-1",
+        turn_id="turn-race",
+        status="completed",
+        assistant_message="done",
+        error=None,
+        terminal_audit=_turn("turn-race", "completed"),
+        lease=lease,
+    )
+    thread.join(timeout=5)
+    assert not thread.is_alive()
+    pending = ledger.pending_messages("run-1")
+    if pending:
+        with pytest.raises(hotjoin.AdvisorDeliveryRejected):
+            ledger.begin_delivery(
+                "run-1",
+                pending[0].message_id,
+                thread_id="thread-1",
+                turn_id=None,
+                action="turn/steer",
+                lease=lease,
+            )
+    assert ledger.pending_messages("run-1") == []
+    assert ledger.status("run-1")["message_counts"]["failed"] == 1
+    assert len(errors) <= 1
+
+
+def test_encouragement_contract_is_exact_turn_bound_and_non_authoritative(
+    ledger: hotjoin.ConversationLedger,
+) -> None:
+    lease = ledger.acquire_lease("run-1", "encouragement-contract")
+    ledger.bind_thread("run-1", "thread-1", lease=lease)
+    ledger.set_active_turn("run-1", "turn-encouraged", lease=lease)
+    accepted = ledger.enqueue_encouragement(
+        "run-1",
+        note="Keep exploring that obstruction carefully.",
+        client_message_id="encourage:contract:1",
+    )
+    message = ledger.pending_messages("run-1")[0]
+
+    assert accepted["source_kind"] == "encouragement"
+    assert accepted["expected_thread_id"] == "thread-1"
+    assert accepted["expected_turn_id"] == "turn-encouraged"
+    assert message.source_kind == "encouragement"
+    assert message.mode == "steer"
+    assert message.expected_thread_id == "thread-1"
+    assert message.expected_turn_id == "turn-encouraged"
+    assert "NON-AUTHORITATIVE" in message.text
+    lowered = message.text.lower()
+    for exclusion in (
+        "not a task",
+        "owner direction",
+        "mathematical premise",
+        "evidence",
+        "proof",
+        "verdict",
+        "publication authority",
+        "permission to change scope",
+    ):
+        assert exclusion in lowered
+    assert ledger.status("run-1")["message_source_counts"] == {"encouragement": 1}
+
+
+def test_encouragement_replay_is_idempotent_and_cross_source_conflicts(
+    ledger: hotjoin.ConversationLedger,
+) -> None:
+    lease = ledger.acquire_lease("run-1", "encouragement-replay")
+    ledger.bind_thread("run-1", "thread-1", lease=lease)
+    ledger.set_active_turn("run-1", "turn-1", lease=lease)
+    first = ledger.enqueue_encouragement(
+        "run-1",
+        note="Steady progress matters.",
+        client_message_id="encourage:stable:1",
+    )
+    replay = ledger.enqueue_encouragement(
+        "run-1",
+        note="Steady progress matters.",
+        client_message_id="encourage:stable:1",
+    )
+    assert replay["message_id"] == first["message_id"]
+    assert replay["idempotent_replay"] is True
+    with pytest.raises(hotjoin.IdempotencyConflict):
+        ledger.enqueue_encouragement(
+            "run-1",
+            note="Different morale note.",
+            client_message_id="encourage:stable:1",
+        )
+    with pytest.raises(hotjoin.IdempotencyConflict):
+        ledger.enqueue_message(
+            "run-1",
+            text="owner direction",
+            client_message_id="encourage:stable:1",
+        )
+
+
+def test_encouragement_without_active_turn_is_terminal_and_never_steers_later(
+    ledger: hotjoin.ConversationLedger,
+) -> None:
+    with pytest.raises(hotjoin.EncouragementDeliveryRejected, match="currently active"):
+        ledger.enqueue_encouragement(
+            "run-1",
+            client_message_id="encourage:no-active:1",
+        )
+    assert ledger.pending_messages("run-1") == []
+    assert ledger.status("run-1")["message_counts"]["failed"] == 1
+    assert ledger.status("run-1")["message_source_counts"] == {"encouragement": 1}
+
+    lease = ledger.acquire_lease("run-1", "encouragement-later-turn")
+    ledger.bind_thread("run-1", "thread-1", lease=lease)
+    ledger.set_active_turn("run-1", "turn-later", lease=lease)
+    with pytest.raises(
+        hotjoin.EncouragementDeliveryRejected, match="terminally rejected"
+    ):
+        ledger.enqueue_encouragement(
+            "run-1",
+            client_message_id="encourage:no-active:1",
+        )
+    assert ledger.pending_messages("run-1") == []
+
+
+def test_encouragement_only_steers_exact_existing_turn(
+    ledger: hotjoin.ConversationLedger,
+) -> None:
+    rpc = _RpcStub()
+    rpc.add("turn/steer", {"turnId": "turn-1"})
+    adapter = _leased_adapter(ledger, rpc)
+    ledger.bind_thread("run-1", "thread-1", lease=adapter.lease)
+    ledger.set_active_turn("run-1", "turn-1", lease=adapter.lease)
+    adapter.thread_id = "thread-1"
+    adapter.active_turn_id = "turn-1"
+    ledger.enqueue_encouragement(
+        "run-1",
+        note="You can keep working through this.",
+        client_message_id="encourage:delivery:1",
+    )
+
+    assert adapter._deliver_message(ledger.pending_messages("run-1")[0]) is True
+    assert [method for method, _params in rpc.calls] == ["turn/steer"]
+    params = rpc.calls[0][1]
+    assert params["threadId"] == "thread-1"
+    assert params["expectedTurnId"] == "turn-1"
+    assert ledger.turn_intents("run-1") == []
+
+
+def test_encouragement_turn_end_and_rpc_rejection_fail_without_requeue(
+    ledger: hotjoin.ConversationLedger,
+) -> None:
+    lease = ledger.acquire_lease("run-1", "encouragement-terminal")
+    ledger.bind_thread("run-1", "thread-1", lease=lease)
+    ledger.set_active_turn("run-1", "turn-1", lease=lease)
+    ledger.enqueue_encouragement(
+        "run-1",
+        client_message_id="encourage:expired:1",
+    )
+    ledger.finalize_turn(
+        "run-1",
+        turn_id="turn-1",
+        status="completed",
+        assistant_message="done",
+        error=None,
+        terminal_audit=_turn("turn-1", "completed"),
+        lease=lease,
+    )
+    assert ledger.pending_messages("run-1") == []
+    assert ledger.status("run-1")["message_counts"]["failed"] == 1
+
+    ledger.set_active_turn("run-1", "turn-2", lease=lease)
+    rejected = ledger.enqueue_encouragement(
+        "run-1",
+        client_message_id="encourage:rpc-rejected:1",
+    )
+    rpc = _RpcStub()
+    rpc.add(
+        "turn/steer",
+        hotjoin.RpcError("turn/steer", {"code": -32000, "message": "rejected"}),
+    )
+    adapter = hotjoin.GeneratorHotJoin(ledger, "run-1", rpc)  # type: ignore[arg-type]
+    adapter.lease = lease
+    adapter.thread_id = "thread-1"
+    adapter.active_turn_id = "turn-2"
+    assert adapter._deliver_message(ledger.pending_messages("run-1")[0]) is False
+    assert [method for method, _params in rpc.calls] == ["turn/steer"]
+    assert ledger.pending_messages("run-1") == []
+    with pytest.raises(hotjoin.HotJoinError, match="automatically requeued"):
+        ledger.requeue_message(
+            "run-1",
+            rejected["message_id"],
+            reason="must stay terminal",
+            lease=lease,
+        )
+
+
+def test_encouragement_delivery_unknown_has_no_retry_surface(
+    ledger: hotjoin.ConversationLedger,
+) -> None:
+    lease = ledger.acquire_lease("run-1", "encouragement-unknown")
+    ledger.bind_thread("run-1", "thread-1", lease=lease)
+    ledger.set_active_turn("run-1", "turn-1", lease=lease)
+    accepted = ledger.enqueue_encouragement(
+        "run-1",
+        client_message_id="encourage:unknown:1",
+    )
+    ledger.begin_delivery(
+        "run-1",
+        accepted["message_id"],
+        thread_id="thread-1",
+        turn_id="turn-1",
+        action="turn/steer",
+        lease=lease,
+    )
+    ledger.mark_delivery_unknown(
+        "run-1",
+        accepted["message_id"],
+        reason="acknowledgement was not observable",
+        lease=lease,
+    )
+    with pytest.raises(
+        hotjoin.EncouragementDeliveryRejected, match="can never be retried"
+    ):
+        ledger.retry_unknown("run-1", accepted["message_id"])
+    assert ledger.pending_messages("run-1")[0].state == "delivery_unknown"
+
+
+def test_encouragement_enqueue_racing_turn_end_never_targets_next_turn(
+    ledger: hotjoin.ConversationLedger,
+) -> None:
+    lease = ledger.acquire_lease("run-1", "encouragement-race")
+    ledger.bind_thread("run-1", "thread-1", lease=lease)
+    ledger.set_active_turn("run-1", "turn-race", lease=lease)
+    barrier = threading.Barrier(2)
+    rejections: list[hotjoin.EncouragementDeliveryRejected] = []
+
+    def enqueue() -> None:
+        barrier.wait(timeout=5)
+        try:
+            ledger.enqueue_encouragement(
+                "run-1",
+                client_message_id="encourage:turn-end-race:1",
+            )
+        except hotjoin.EncouragementDeliveryRejected as exc:
+            rejections.append(exc)
+
+    thread = threading.Thread(target=enqueue)
+    thread.start()
+    barrier.wait(timeout=5)
+    ledger.finalize_turn(
+        "run-1",
+        turn_id="turn-race",
+        status="completed",
+        assistant_message="done",
+        error=None,
+        terminal_audit=_turn("turn-race", "completed"),
+        lease=lease,
+    )
+    thread.join(timeout=5)
+    assert not thread.is_alive()
+    pending = ledger.pending_messages("run-1")
+    if pending:
+        with pytest.raises(hotjoin.EncouragementDeliveryRejected):
+            ledger.begin_delivery(
+                "run-1",
+                pending[0].message_id,
+                thread_id="thread-1",
+                turn_id=None,
+                action="turn/steer",
+                lease=lease,
+            )
+    ledger.set_active_turn("run-1", "turn-next", lease=lease)
+    assert ledger.pending_messages("run-1") == []
+    assert ledger.status("run-1")["message_counts"]["failed"] == 1
+    assert len(rejections) <= 1
 
 
 def test_custom_database_parent_permissions_are_rejected_not_mutated(
@@ -443,6 +915,18 @@ def test_custom_database_parent_permissions_are_rejected_not_mutated(
         hotjoin.ConversationLedger(shared_parent / "messages.sqlite3")
 
     assert shared_parent.stat().st_mode & 0o777 == 0o755
+
+
+def test_database_path_replacement_is_rejected_by_pinned_inode(
+    ledger: hotjoin.ConversationLedger,
+) -> None:
+    original = ledger.path.with_name("messages-original.sqlite3")
+    ledger.path.rename(original)
+    ledger.path.write_bytes(b"")
+    ledger.path.chmod(0o600)
+
+    with pytest.raises(hotjoin.HotJoinError, match="changed"):
+        ledger.status("run-1")
 
 
 def test_per_run_lease_excludes_competing_broker(
@@ -709,6 +1193,47 @@ def test_terminal_failure_redacts_secrets_at_rest_but_binds_raw_error(
     assert "<redacted>" in serialized
 
 
+def test_oversized_terminal_diagnostic_compacts_without_blocking_terminal_state(
+    ledger: hotjoin.ConversationLedger,
+) -> None:
+    lease = ledger.acquire_lease("run-1", "oversized-terminal")
+    ledger.set_active_turn("run-1", "turn-oversized", lease=lease)
+    error = {
+        "code": "large_bounded_details",
+        "details": {f"detail_{index}": "x" * 4096 for index in range(80)},
+    }
+    raw_error_sha256 = hotjoin.hashlib.sha256(
+        hotjoin._canonical_json(error).encode("utf-8")
+    ).hexdigest()
+
+    ledger.finalize_turn(
+        "run-1",
+        turn_id="turn-oversized",
+        status="failed",
+        assistant_message="",
+        error=error,
+        terminal_audit=hotjoin._terminal_audit(
+            _turn("turn-oversized", "failed", error=error, duration_ms=1)
+        ),
+        lease=lease,
+    )
+
+    assert ledger.status("run-1")["active_turn_id"] is None
+    terminal = next(
+        event["payload"]["turn"]
+        for event in ledger.events("run-1", limit=1000)
+        if event["kind"] == "audit_turn_terminal"
+    )
+    assert terminal["diagnostic_projection"] == ("compact_due_to_audit_payload_limit")
+    assert terminal["error_sha256"] == raw_error_sha256
+    assert terminal["error"]["projection"] == ("omitted_due_to_audit_payload_limit")
+    assert terminal["projected_terminal_utf8_bytes"] > (hotjoin.MAX_AUDIT_PAYLOAD_BYTES)
+    assert (
+        len(hotjoin._canonical_json(terminal).encode("utf-8"))
+        < hotjoin.MAX_AUDIT_PAYLOAD_BYTES
+    )
+
+
 def test_fatal_quarantine_has_a_reserved_receipt_beyond_audit_budget(
     ledger: hotjoin.ConversationLedger, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -737,6 +1262,62 @@ def test_fatal_quarantine_has_a_reserved_receipt_beyond_audit_budget(
     assert [event["kind"] for event in ledger.events("run-1", limit=1000)].count(
         "audit_test_fatal"
     ) == 1
+
+
+def test_turn_terminal_has_a_reserved_receipt_beyond_telemetry_audit_budget(
+    ledger: hotjoin.ConversationLedger, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(hotjoin, "MAX_AUDIT_EVENTS_PER_RUN", 1)
+    adapter = _leased_adapter(ledger, _RpcStub())
+    adapter.thread_id = "thread-1"
+    adapter.active_turn_id = "turn-budget"
+    ledger.set_active_turn("run-1", "turn-budget", lease=adapter._lease())
+    ledger.record_audit_event(
+        "run-1",
+        kind="audit_budget_filler",
+        payload={"value": 1},
+        actor="adapter",
+        lease=adapter._lease(),
+    )
+
+    adapter._process_notification(
+        {
+            "method": "thread/tokenUsage/updated",
+            "params": {
+                "threadId": "thread-1",
+                "tokenUsage": _token_usage(1, 1),
+                "turnId": "turn-budget",
+            },
+        }
+    )
+    terminal_turn = _turn("turn-budget", "completed", duration_ms=1)
+    terminal_turn.pop("items")
+    adapter._process_notification(
+        {
+            "method": "turn/completed",
+            "params": {"threadId": "thread-1", "turn": terminal_turn},
+        }
+    )
+
+    assert ledger.status("run-1")["active_turn_id"] is None
+    events = ledger.events("run-1", limit=1000)
+    assert [event["kind"] for event in events].count("turn_terminal") == 1
+    terminal = next(
+        event["payload"]["turn"]
+        for event in events
+        if event["kind"] == "audit_turn_terminal"
+    )
+    assert terminal["token_usage_finality"] == (
+        "partial_due_to_unavailable_notifications"
+    )
+    assert terminal["token_usage_diagnostic_failure_reasons"] == [
+        "token_usage_notification_unavailable"
+    ]
+    assert terminal["reasoning_bandwidth"]["finality"] == "partial"
+    assert (
+        "terminal_items_unavailable"
+        in terminal["reasoning_bandwidth"]["finality_reasons"]
+    )
 
 
 def test_quarantine_redacts_nested_camel_case_secrets_at_rest(
@@ -831,6 +1412,22 @@ def test_generator_configuration_commitment_binds_args_files_and_nonsecret_env(
     assert env_one["MODE"] != env_two["MODE"]
     assert env_one["VERIFY_API_TOKEN"] == env_two["VERIFY_API_TOKEN"]
     assert secrets_one == secrets_two == ["VERIFY_API_TOKEN"]
+    control_one, control_secrets_one = hotjoin._mcp_env_commitment(
+        {"RETHLAS_GENERATION_CONTROL_TOKEN": "a" * 32}
+    )
+    control_two, control_secrets_two = hotjoin._mcp_env_commitment(
+        {"RETHLAS_GENERATION_CONTROL_TOKEN": "b" * 32}
+    )
+    assert (
+        control_one
+        == control_two
+        == {"RETHLAS_GENERATION_CONTROL_TOKEN": "<rotatable-secret>"}
+    )
+    assert (
+        control_secrets_one
+        == control_secrets_two
+        == ["RETHLAS_GENERATION_CONTROL_TOKEN"]
+    )
     tokenizer_env, tokenizer_secrets = hotjoin._mcp_env_commitment(
         {"TOKENIZERS_PARALLELISM": "false"}
     )
@@ -878,6 +1475,8 @@ def test_persistent_run_rejects_changed_hotjoin_control_plane(
             "--db",
             str(tmp_path / "state" / "messages.sqlite3"),
             "run-generator",
+            "--advisor-control-plane-sha256",
+            "a" * 64,
             "--run-id",
             "same-run",
             "--problem-id",
@@ -982,6 +1581,76 @@ def test_cli_init_send_status_and_tail(
     )
     tail = json.loads(capsys.readouterr().out)
     assert tail["events"][0]["payload"]["text"] == "Try a compactness argument."
+
+
+def test_encourage_cli_default_text_file_stdin_and_stable_id(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = tmp_path / "encourage-cli" / "messages.sqlite3"
+    ledger = hotjoin.ConversationLedger(database)
+    ledger.create_run("run-1", "problem/example")
+    lease = ledger.acquire_lease("run-1", "encourage-cli")
+    ledger.bind_thread("run-1", "thread-1", lease=lease)
+    ledger.set_active_turn("run-1", "turn-1", lease=lease)
+    ledger.release_lease("run-1", lease)
+
+    common = ["--db", str(database), "encourage", "--run-id", "run-1"]
+    assert hotjoin.main(common + ["--client-message-id", "encourage:cli:default"]) == 0
+    default = json.loads(capsys.readouterr().out)
+    assert default["source_kind"] == "encouragement"
+    assert default["idempotent_replay"] is False
+    assert hotjoin.main(common + ["--client-message-id", "encourage:cli:default"]) == 0
+    replay = json.loads(capsys.readouterr().out)
+    assert replay["message_id"] == default["message_id"]
+    assert replay["idempotent_replay"] is True
+
+    note_file = tmp_path / "encouragement.txt"
+    note_file.write_text("Believe in your careful analysis.", encoding="utf-8")
+    assert (
+        hotjoin.main(
+            common
+            + [
+                "--client-message-id",
+                "encourage:cli:file",
+                "--file",
+                str(note_file),
+            ]
+        )
+        == 0
+    )
+    capsys.readouterr()
+    assert (
+        hotjoin.main(
+            common
+            + [
+                "--client-message-id",
+                "encourage:cli:text",
+                "--text",
+                "Keep testing the exact obstruction.",
+            ]
+        )
+        == 0
+    )
+    capsys.readouterr()
+    monkeypatch.setattr(sys, "stdin", io.StringIO("Stay patient with the proof."))
+    assert (
+        hotjoin.main(common + ["--client-message-id", "encourage:cli:stdin", "--stdin"])
+        == 0
+    )
+    capsys.readouterr()
+
+    messages = hotjoin.ConversationLedger(database).pending_messages("run-1")
+    assert len(messages) == 4
+    assert all(message.source_kind == "encouragement" for message in messages)
+    assert hotjoin.DEFAULT_ENCOURAGEMENT_NOTE in messages[0].text
+    assert "Believe in your careful analysis." in messages[1].text
+    assert "Keep testing the exact obstruction." in messages[2].text
+    assert "Stay patient with the proof." in messages[3].text
+
+    with pytest.raises(SystemExit):
+        hotjoin._build_parser().parse_args(["encourage", "--run-id", "run-1"])
 
 
 def test_app_server_routes_notification_and_out_of_order_responses() -> None:
@@ -1663,6 +2332,8 @@ def test_failed_preflight_precedes_ledger_and_app_server(
             "--db",
             str(tmp_path / "never.sqlite3"),
             "run-generator",
+            "--advisor-control-plane-sha256",
+            "a" * 64,
             "--run-id",
             "run-1",
             "--problem-id",
@@ -1746,6 +2417,8 @@ def test_fingerprint_failure_precedes_ledger_and_app_server(
             "--db",
             str(tmp_path / "never.sqlite3"),
             "run-generator",
+            "--advisor-control-plane-sha256",
+            "a" * 64,
             "--run-id",
             "run-1",
             "--problem-id",
@@ -1764,6 +2437,95 @@ def test_fingerprint_failure_precedes_ledger_and_app_server(
     assert code == 2
     assert started == {"ledger": 0, "app_server": 0}
     assert not (tmp_path / "never.sqlite3").exists()
+
+
+@pytest.mark.parametrize("source_kind", ["owner", "advisor", "encouragement"])
+def test_run_fail_stops_delivery_unknown_before_materialization(
+    ledger: hotjoin.ConversationLedger,
+    source_kind: str,
+) -> None:
+    lease = ledger.acquire_lease("run-1", f"setup-{source_kind}")
+    ledger.bind_thread("run-1", "thread-1", lease=lease)
+    ledger.set_active_turn("run-1", "terminal-turn", lease=lease)
+    if source_kind == "owner":
+        accepted = ledger.enqueue_message(
+            "run-1",
+            text="owner direction with an ambiguous acknowledgement",
+            client_message_id="owner:delivery-unknown:run",
+        )
+    elif source_kind == "advisor":
+        accepted = ledger.enqueue_advisor_notice(
+            "run-1",
+            problem_id="problem/example",
+            receipt_id="adv_" + "5" * 32,
+            receipt_sha256="e" * 64,
+            authorization_id="owner-auth",
+            mode="steer",
+            client_message_id="advisor:delivery-unknown:run",
+        )
+    else:
+        accepted = ledger.enqueue_encouragement(
+            "run-1",
+            client_message_id="encourage:delivery-unknown:run",
+        )
+    ledger.begin_delivery(
+        "run-1",
+        accepted["message_id"],
+        thread_id="thread-1",
+        turn_id="terminal-turn",
+        action="turn/steer",
+        lease=lease,
+    )
+    ledger.mark_delivery_unknown(
+        "run-1",
+        accepted["message_id"],
+        reason="the exact steer acknowledgement was not observable",
+        lease=lease,
+    )
+    ledger.finalize_turn(
+        "run-1",
+        turn_id="terminal-turn",
+        status="completed",
+        assistant_message="done",
+        error=None,
+        terminal_audit=_turn("terminal-turn", "completed"),
+        lease=lease,
+    )
+    ledger.release_lease("run-1", lease)
+    before_status = ledger.status("run-1")
+    before_messages = ledger.pending_messages("run-1")
+    before_intents = ledger.turn_intents("run-1")
+    before_events = ledger.events("run-1", limit=1000)
+
+    rpc = _RpcStub()
+    rpc.add("model/list", {"data": [_model_entry()]})
+    rpc.add("thread/resume", _thread_response())
+    rpc.add("thread/read", _history())
+    rpc.add("turn/start", {"turn": _turn("new-bootstrap", "inProgress")})
+    adapter = hotjoin.GeneratorHotJoin(ledger, "run-1", rpc)  # type: ignore[arg-type]
+
+    with pytest.raises(
+        hotjoin.HotJoinError,
+        match=(
+            "owner messages require explicit retry_unknown"
+            if source_kind == "owner"
+            else "non-authoritative messages cannot be retried"
+        ),
+    ):
+        adapter.run(
+            initial_prompt="must not start a new paid turn",
+            thread_params=_thread_params(),
+            max_runtime_seconds=2,
+        )
+
+    assert rpc.calls == []
+    assert not any(
+        method in {"thread/start", "turn/start"} for method, _params in rpc.calls
+    )
+    assert ledger.status("run-1") == before_status
+    assert ledger.pending_messages("run-1") == before_messages
+    assert ledger.turn_intents("run-1") == before_intents
+    assert ledger.events("run-1", limit=1000) == before_events
 
 
 def test_generator_attests_exact_model_and_runtime_before_starting_turn(
@@ -1846,6 +2608,20 @@ def test_generator_attests_exact_model_and_runtime_before_starting_turn(
     terminal = next(
         event["payload"] for event in events if event["kind"] == "audit_turn_terminal"
     )
+    reasoning_bandwidth = terminal["turn"].pop("reasoning_bandwidth")
+    assert reasoning_bandwidth["schema"] == "rethlas_reasoning_bandwidth_v1"
+    assert reasoning_bandwidth["scope"] == "root_thread_only"
+    assert reasoning_bandwidth["finality"] == "complete"
+    assert reasoning_bandwidth["usage_growth_sample_count"] == 1
+    assert reasoning_bandwidth["usage_growth_sample_counts_by_resume_trigger"] == {
+        "initial_or_unattributed": 1
+    }
+    assert (
+        reasoning_bandwidth["usage_growth_tokens_by_resume_trigger"][
+            "initial_or_unattributed"
+        ]
+        == token_update["tokenUsage"]["last"]
+    )
     assert terminal == {
         "thread_id": "thread-1",
         "turn": {
@@ -1870,12 +2646,73 @@ def test_generator_attests_exact_model_and_runtime_before_starting_turn(
             "token_usage_cumulative_growth_sample_totals": token_update["tokenUsage"][
                 "last"
             ],
+            "token_usage_diagnostic_failure_reasons": [],
             "token_usage_duplicate_notification_count": 0,
             "token_usage_finality": "observed_not_schema_attested_final",
             "token_usage_notification_count": 1,
             "token_usage_observed": True,
         },
     }
+
+
+def test_run_terminalizes_after_malformed_usage_and_missing_terminal_items(
+    ledger: hotjoin.ConversationLedger,
+) -> None:
+    rpc = _RpcStub()
+    rpc.add("model/list", {"data": [_model_entry()], "nextCursor": None})
+    rpc.add("thread/start", _thread_response())
+    rpc.add(
+        "thread/read",
+        hotjoin.RpcError(
+            "thread/read",
+            {
+                "code": -32600,
+                "message": "thread is not materialized before first turn",
+            },
+        ),
+    )
+    rpc.add("turn/start", {"turn": _turn("turn-telemetry", "inProgress")})
+    rpc.notifications.put({"method": "thread/tokenUsage/updated", "params": None})
+    terminal_turn = _turn("turn-telemetry", "completed", duration_ms=7)
+    terminal_turn.pop("items")
+    rpc.notifications.put(
+        {
+            "method": "turn/completed",
+            "params": {"threadId": "thread-1", "turn": terminal_turn},
+        }
+    )
+    adapter = hotjoin.GeneratorHotJoin(
+        ledger,
+        "run-1",
+        rpc,  # type: ignore[arg-type]
+        poll_seconds=0,
+        idle_grace_seconds=0,
+        post_terminal_settle_seconds=0,
+    )
+
+    result = adapter.run(
+        initial_prompt="initial proof search",
+        thread_params=_thread_params(),
+        max_runtime_seconds=2,
+    )
+
+    assert result["active_turn_id"] is None
+    terminal = next(
+        event["payload"]["turn"]
+        for event in ledger.events("run-1", limit=1000)
+        if event["kind"] == "audit_turn_terminal"
+    )
+    assert terminal["token_usage_finality"] == (
+        "partial_due_to_unavailable_notifications"
+    )
+    assert terminal["token_usage_diagnostic_failure_reasons"] == [
+        "token_usage_notification_params_unavailable"
+    ]
+    assert terminal["reasoning_bandwidth"]["finality"] == "partial"
+    assert (
+        "terminal_items_unavailable"
+        in terminal["reasoning_bandwidth"]["finality_reasons"]
+    )
 
 
 def test_prepared_bootstrap_materializes_without_thread_read(
@@ -2114,7 +2951,7 @@ def test_terminal_audit_labels_missing_usage_after_bounded_settle(
     )
 
 
-def test_token_usage_rejects_untrusted_extra_fields_without_persisting_them(
+def test_token_usage_degrades_untrusted_extra_fields_without_persisting_them(
     ledger: hotjoin.ConversationLedger,
 ) -> None:
     adapter = _leased_adapter(ledger, _RpcStub())
@@ -2124,21 +2961,41 @@ def test_token_usage_rejects_untrusted_extra_fields_without_persisting_them(
     usage = _token_usage(4, 2)
     usage["VERIFY_API_TOKEN"] = "token-usage-secret"
 
-    with pytest.raises(hotjoin.ProtocolError, match="unaudited field"):
-        adapter._process_notification(
-            {
-                "method": "thread/tokenUsage/updated",
-                "params": {
-                    "threadId": "thread-1",
-                    "tokenUsage": usage,
-                    "turnId": "turn-1",
-                },
-            }
-        )
+    adapter._process_notification(
+        {
+            "method": "thread/tokenUsage/updated",
+            "params": {
+                "threadId": "thread-1",
+                "tokenUsage": usage,
+                "turnId": "turn-1",
+            },
+        }
+    )
+    adapter._process_notification(
+        {
+            "method": "turn/completed",
+            "params": {
+                "threadId": "thread-1",
+                "turn": _turn("turn-1", "completed", duration_ms=1),
+            },
+        }
+    )
 
     serialized = json.dumps(ledger.events("run-1", limit=1000), sort_keys=True)
     assert "token-usage-secret" not in serialized
     assert "audit_thread_token_usage_updated" not in serialized
+    terminal = next(
+        event["payload"]["turn"]
+        for event in ledger.events("run-1", limit=1000)
+        if event["kind"] == "audit_turn_terminal"
+    )
+    assert terminal["token_usage_finality"] == (
+        "partial_due_to_unavailable_notifications"
+    )
+    assert terminal["token_usage_diagnostic_failure_reasons"] == [
+        "token_usage_notification_unavailable"
+    ]
+    assert ledger.status("run-1")["active_turn_id"] is None
 
 
 def test_token_usage_audit_distinguishes_duplicates_from_cumulative_growth(
@@ -2205,8 +3062,300 @@ def test_token_usage_audit_distinguishes_duplicates_from_cumulative_growth(
     )
 
 
+def test_reasoning_bandwidth_aggregates_safe_root_trace_without_content(
+    ledger: hotjoin.ConversationLedger,
+) -> None:
+    adapter = _leased_adapter(ledger, _RpcStub())
+    adapter.thread_id = "thread-1"
+    adapter.active_turn_id = "turn-telemetry"
+    ledger.set_active_turn("run-1", "turn-telemetry", lease=adapter._lease())
+    secret = "REASONING-BANDWIDTH-SECRET-MUST-NOT-PERSIST"
+
+    reasoning = {
+        "content": [secret],
+        "id": "reasoning-1",
+        "summary": [secret],
+        "type": "reasoning",
+    }
+    memory_batch = {
+        "arguments": {
+            "items": [
+                {"channel": "proof_steps", "record": {"text": secret}},
+                {"channel": "failed_paths", "record": {"text": secret}},
+            ]
+        },
+        "durationMs": 100,
+        "id": "memory-batch-1",
+        "result": {"secret": secret},
+        "server": "reasoning_agent",
+        "status": "completed",
+        "tool": "memory_append_batch",
+        "type": "mcpToolCall",
+    }
+    memory_search = {
+        "arguments": {"query": secret},
+        "durationMs": 300,
+        "id": "memory-search-1",
+        "result": {"results": [secret]},
+        "server": "reasoning_agent",
+        "status": "completed",
+        "tool": "memory_search",
+        "type": "mcpToolCall",
+    }
+    spawn = {
+        "agentsStates": {},
+        "id": "spawn-1",
+        "prompt": secret,
+        "receiverThreadIds": ["child-a", "child-b"],
+        "senderThreadId": "thread-1",
+        "status": "completed",
+        "tool": "spawnAgent",
+        "type": "collabAgentToolCall",
+    }
+    wait = {
+        "agentsStates": {},
+        "id": "wait-1",
+        "prompt": secret,
+        "receiverThreadIds": ["child-a", "child-b"],
+        "senderThreadId": "thread-1",
+        "status": "completed",
+        "tool": "wait",
+        "type": "collabAgentToolCall",
+    }
+    web_search = {
+        "id": "web-1",
+        "query": secret,
+        "results": [{"secret": secret}],
+        "type": "webSearch",
+    }
+    compaction = {"id": "compact-1", "type": "contextCompaction"}
+    trace = (
+        (reasoning, 0, 1_000),
+        (memory_batch, 1_000, 1_100),
+        (memory_search, 1_100, 1_400),
+        (spawn, 1_400, 1_500),
+        (wait, 1_500, 5_500),
+        (web_search, 5_500, 6_000),
+        (compaction, 6_000, 6_100),
+    )
+
+    _notify_item(
+        adapter,
+        method="item/started",
+        turn_id="turn-telemetry",
+        item=reasoning,
+        timestamp_ms=0,
+    )
+    _notify_item(
+        adapter,
+        method="item/completed",
+        turn_id="turn-telemetry",
+        item=reasoning,
+        timestamp_ms=1_000,
+    )
+    usage_0 = _token_usage(100, 30, 20)
+    _notify_usage(adapter, turn_id="turn-telemetry", usage=usage_0)
+
+    _notify_item(
+        adapter,
+        method="item/started",
+        turn_id="turn-telemetry",
+        item=memory_batch,
+        timestamp_ms=1_000,
+    )
+    _notify_item(
+        adapter,
+        method="item/completed",
+        turn_id="turn-telemetry",
+        item=memory_batch,
+        timestamp_ms=1_100,
+    )
+    # A duplicate completion and duplicate usage notification must not create
+    # another memory checkpoint or consume another resume trigger.
+    _notify_item(
+        adapter,
+        method="item/completed",
+        turn_id="turn-telemetry",
+        item=memory_batch,
+        timestamp_ms=1_100,
+    )
+    usage_1 = _next_token_usage(usage_0, 80, 20, 15)
+    _notify_usage(adapter, turn_id="turn-telemetry", usage=usage_1)
+    _notify_usage(adapter, turn_id="turn-telemetry", usage=usage_1)
+
+    for item, started, completed in trace[2:5]:
+        _notify_item(
+            adapter,
+            method="item/started",
+            turn_id="turn-telemetry",
+            item=item,
+            timestamp_ms=started,
+        )
+        _notify_item(
+            adapter,
+            method="item/completed",
+            turn_id="turn-telemetry",
+            item=item,
+            timestamp_ms=completed,
+        )
+    usage_2 = _next_token_usage(usage_1, 70, 25, 25)
+    _notify_usage(adapter, turn_id="turn-telemetry", usage=usage_2)
+
+    for item, started, completed in trace[5:]:
+        _notify_item(
+            adapter,
+            method="item/started",
+            turn_id="turn-telemetry",
+            item=item,
+            timestamp_ms=started,
+        )
+        _notify_item(
+            adapter,
+            method="item/completed",
+            turn_id="turn-telemetry",
+            item=item,
+            timestamp_ms=completed,
+        )
+        if item is web_search:
+            usage_3 = _next_token_usage(usage_2, 60, 30, 30)
+            _notify_usage(adapter, turn_id="turn-telemetry", usage=usage_3)
+
+    adapter._process_notification(
+        {
+            "method": "turn/completed",
+            "params": {
+                "threadId": "thread-1",
+                "turn": _turn(
+                    "turn-telemetry",
+                    "completed",
+                    items=[entry[0] for entry in trace],
+                    duration_ms=8_000,
+                ),
+            },
+        }
+    )
+
+    events = ledger.events("run-1", limit=1000)
+    audit = next(
+        event["payload"]["turn"]["reasoning_bandwidth"]
+        for event in events
+        if event["kind"] == "audit_turn_terminal"
+    )
+    assert audit["schema"] == "rethlas_reasoning_bandwidth_v1"
+    assert audit["scope"] == "root_thread_only"
+    assert audit["finality"] == "complete"
+    assert audit["operation_counts"]["memory_write_batch"] == {"completed": 1}
+    assert audit["lifecycle"]["duplicate_completion_count"] == 1
+    assert audit["item_counts"]["mcpToolCall"] == 2
+    assert audit["branch_spawn_count"] == 1
+    assert audit["spawned_agent_count"] == 2
+    assert audit["compaction_count"] == 1
+    assert audit["reasoning_item_union_ms"] == 1_000
+    assert audit["memory_write_union_ms"] == 100
+    assert audit["memory_union_ms"] == 400
+    assert audit["retrieval_union_ms"] == 800
+    assert audit["wait_union_ms"] == 4_000
+    assert audit["tool_or_control_union_ms"] == 5_100
+    assert audit["measured_item_union_ms"] == 6_100
+    assert audit["unattributed_residual_ms"] == 1_900
+    assert audit["usage_growth_sample_count"] == 4
+    assert audit["usage_growth_sample_counts_by_resume_trigger"] == {
+        "initial_or_unattributed": 1,
+        "observed_after_external_retrieval": 1,
+        "observed_after_memory_write_batch": 1,
+        "observed_after_mixed_or_parallel": 1,
+    }
+    assert (
+        audit["usage_growth_tokens_by_resume_trigger"][
+            "observed_after_memory_write_batch"
+        ]["reasoningOutputTokens"]
+        == 15
+    )
+    assert secret not in json.dumps(events, sort_keys=True)
+    assert adapter.reasoning_bandwidth_by_turn == {}
+
+
+def test_missing_item_telemetry_degrades_only_diagnostics_and_turn_completes(
+    ledger: hotjoin.ConversationLedger,
+) -> None:
+    adapter = _leased_adapter(ledger, _RpcStub())
+    adapter.thread_id = "thread-1"
+    adapter.active_turn_id = "turn-partial"
+    ledger.set_active_turn("run-1", "turn-partial", lease=adapter._lease())
+    secret = "PARTIAL-ITEM-SECRET-MUST-NOT-PERSIST"
+    command = {
+        "aggregatedOutput": secret,
+        "command": secret,
+        "commandActions": [],
+        "cwd": "/safe",
+        "durationMs": 50,
+        "id": "command-1",
+        "status": "completed",
+        "type": "commandExecution",
+    }
+    compaction = {"id": "compact-terminal-only", "type": "contextCompaction"}
+
+    # Optional item telemetry is deliberately fail-open for the mathematical turn.
+    adapter._process_notification({"method": "item/started", "params": None})
+    adapter._process_notification(
+        {
+            "method": "item/completed",
+            "params": {
+                "completedAtMs": 10,
+                "item": command,
+                "threadId": "thread-1",
+                "turnId": "another-turn",
+            },
+        }
+    )
+    _notify_item(
+        adapter,
+        method="item/completed",
+        turn_id="turn-partial",
+        item=command,
+        timestamp_ms=200,
+    )
+    adapter._process_notification(
+        {
+            "method": "turn/completed",
+            "params": {
+                "threadId": "thread-1",
+                "turn": _turn(
+                    "turn-partial",
+                    "completed",
+                    items=[command, compaction],
+                    duration_ms=500,
+                ),
+            },
+        }
+    )
+
+    assert ledger.status("run-1")["active_turn_id"] is None
+    events = ledger.events("run-1", limit=1000)
+    audit = next(
+        event["payload"]["turn"]["reasoning_bandwidth"]
+        for event in events
+        if event["kind"] == "audit_turn_terminal"
+    )
+    assert audit["scope"] == "root_thread_only"
+    assert audit["finality"] == "partial"
+    assert "item_notification_params_unavailable" in audit["finality_reasons"]
+    assert "item_notification_missing_active_turn" in audit["finality_reasons"]
+    assert "missing_item_started_notification" in audit["finality_reasons"]
+    assert "missing_item_completed_notification" in audit["finality_reasons"]
+    assert audit["lifecycle"]["duration_fallback_count"] == 1
+    assert audit["lifecycle"]["terminal_recovered_count"] == 1
+    assert audit["operation_counts"]["command_execution"] == {"completed": 1}
+    assert audit["compaction_count"] == 1
+    assert secret not in json.dumps(events, sort_keys=True)
+
+
+def test_reasoning_bandwidth_interval_union_does_not_double_count_overlap() -> None:
+    assert hotjoin._interval_union_ms([(0, 200), (100, 300), (400, 450)]) == 350
+
+
 @pytest.mark.parametrize("failure", ["backwards", "delta_mismatch"])
-def test_token_usage_rejects_invalid_cumulative_growth_before_audit(
+def test_token_usage_degrades_invalid_cumulative_growth_without_blocking_terminal(
     ledger: hotjoin.ConversationLedger, failure: str
 ) -> None:
     adapter = _leased_adapter(ledger, _RpcStub())
@@ -2230,17 +3379,25 @@ def test_token_usage_rejects_invalid_cumulative_growth_before_audit(
     else:
         invalid["total"]["inputTokens"] += 1
 
-    with pytest.raises(hotjoin.ProtocolError, match="cumulative"):
-        adapter._process_notification(
-            {
-                "method": "thread/tokenUsage/updated",
-                "params": {
-                    "threadId": "thread-1",
-                    "tokenUsage": invalid,
-                    "turnId": "turn-1",
-                },
-            }
-        )
+    adapter._process_notification(
+        {
+            "method": "thread/tokenUsage/updated",
+            "params": {
+                "threadId": "thread-1",
+                "tokenUsage": invalid,
+                "turnId": "turn-1",
+            },
+        }
+    )
+    adapter._process_notification(
+        {
+            "method": "turn/completed",
+            "params": {
+                "threadId": "thread-1",
+                "turn": _turn("turn-1", "completed", duration_ms=1),
+            },
+        }
+    )
 
     audits = [
         event
@@ -2248,6 +3405,18 @@ def test_token_usage_rejects_invalid_cumulative_growth_before_audit(
         if event["kind"] == "audit_thread_token_usage_updated"
     ]
     assert len(audits) == 1
+    terminal = next(
+        event["payload"]["turn"]
+        for event in ledger.events("run-1", limit=1000)
+        if event["kind"] == "audit_turn_terminal"
+    )
+    assert terminal["token_usage_finality"] == (
+        "partial_due_to_unavailable_notifications"
+    )
+    assert terminal["token_usage_diagnostic_failure_reasons"] == [
+        "token_usage_notification_unavailable"
+    ]
+    assert ledger.status("run-1")["active_turn_id"] is None
 
 
 def test_token_usage_ignores_cross_thread_notification_without_audit(
@@ -2948,6 +4117,51 @@ def test_unsolicited_interrupted_terminal_is_persistently_quarantined(
     )
 
 
+def test_oversized_unsolicited_interruption_compacts_and_terminalizes(
+    ledger: hotjoin.ConversationLedger,
+) -> None:
+    adapter = _leased_adapter(ledger, _RpcStub())
+    adapter.thread_id = "thread-1"
+    adapter.active_turn_id = "turn-oversized-interrupt"
+    ledger.set_active_turn("run-1", "turn-oversized-interrupt", lease=adapter._lease())
+    error = {
+        "code": "large_bounded_interruption_details",
+        "details": {f"detail_{index}": "x" * 4096 for index in range(80)},
+    }
+
+    adapter._process_notification(
+        {
+            "method": "turn/completed",
+            "params": {
+                "threadId": "thread-1",
+                "turn": _turn(
+                    "turn-oversized-interrupt",
+                    "interrupted",
+                    error=error,
+                    duration_ms=3,
+                ),
+            },
+        }
+    )
+
+    status = ledger.status("run-1")
+    assert status["active_turn_id"] is None
+    assert status["quarantine"]["kind"] == "unexpected_turn_interruption"
+    events = ledger.events("run-1", limit=1000)
+    quarantine_audit = next(
+        event["payload"]
+        for event in events
+        if event["kind"] == "audit_unexpected_turn_interruption"
+    )
+    assert quarantine_audit["diagnostic_projection"] == (
+        "compact_due_to_audit_payload_limit"
+    )
+    assert quarantine_audit["projected_payload_utf8_bytes"] > (
+        hotjoin.MAX_AUDIT_PAYLOAD_BYTES
+    )
+    assert any(event["kind"] == "assistant_response_interrupted" for event in events)
+
+
 @pytest.mark.parametrize(
     "turn",
     [
@@ -3579,11 +4793,20 @@ pathlib.Path(os.environ["MOCK_HOTJOIN_CALLS_FILE"]).write_text(
     assert "run-generator" in arguments
     assert arguments[arguments.index("--run-id") + 1] == "owner-live"
     assert arguments[arguments.index("--codex-bin") + 1] == str(fake_bin / "codex")
+    advisor_bridge = tmp_path / "agents" / "advisor_bridge.py"
+    assert (
+        arguments[arguments.index("--advisor-control-plane-sha256") + 1]
+        == hashlib.sha256(advisor_bridge.read_bytes()).hexdigest()
+    )
     assert "--mcp-config-toml" in arguments
     injected_mcp = hotjoin._parse_toml_value(
         arguments[arguments.index("--mcp-config-toml") + 1], "test MCP"
     )
     assert injected_mcp["required"] is True
+    assert injected_mcp["env"]["RETHLAS_EXPECTED_HOTJOIN_RUN_ID"] == "owner-live"
+    assert injected_mcp["env"]["RETHLAS_ADVISOR_RECEIPTS_ROOT"] == str(
+        tmp_path / "agents" / ".rethlas_advisor" / "receipts"
+    )
     assert set(injected_mcp) == {
         "args",
         "command",
@@ -3599,3 +4822,45 @@ pathlib.Path(os.environ["MOCK_HOTJOIN_CALLS_FILE"]).write_text(
         for line in codex_calls.read_text(encoding="utf-8").splitlines()
     ]
     assert codex_invocations == [[str(fake_bin / "codex"), "--version"]]
+
+
+def test_runner_rejects_advisor_bridge_change_after_hotjoin_iteration(
+    tmp_path: Path,
+) -> None:
+    from agents.generation.tests.test_runner_mock import (  # noqa: PLC0415
+        _make_runner_tree,
+        _mock_environment,
+    )
+
+    runner, fake_bin = _make_runner_tree(tmp_path)
+    adapter_path = tmp_path / "agents" / "hotjoin_adapter.py"
+    advisor_path = tmp_path / "agents" / "advisor_bridge.py"
+    adapter_path.write_text(
+        """import os, pathlib
+pathlib.Path(os.environ["MOCK_ADVISOR_PATH"]).write_text(
+    "# changed during paid iteration\\n", encoding="utf-8"
+)
+""",
+        encoding="utf-8",
+    )
+    environment = _mock_environment(
+        runner,
+        fake_bin,
+        mode="forged",
+        extra_environment={
+            "MOCK_ADVISOR_PATH": str(advisor_path),
+            "RETHLAS_HOTJOIN_RUN_ID": "owner-live",
+        },
+    )
+    completed = subprocess.run(
+        [str(runner)],
+        cwd=runner.parent.parent,
+        env=environment,
+        text=True,
+        capture_output=True,
+        timeout=20,
+        check=False,
+    )
+
+    assert completed.returncode == 70
+    assert "Advisor bridge was modified" in completed.stderr

@@ -6,10 +6,14 @@ PROBLEM_FILE="${PROBLEM_FILE:-data/example.md}"
 MODEL="${MODEL:-gpt-5.6-sol}"
 REASONING_EFFORT="${REASONING_EFFORT:-max}"
 MAX_ITERATIONS="${MAX_ITERATIONS:-10}"
+DEEP_WORK_MINUTES="${RETHLAS_DEEP_WORK_MINUTES:-30}"
 TIMER_INTERVAL_SECONDS="${TIMER_INTERVAL_SECONDS:-30}"
 RETHLAS_HOTJOIN_RUN_ID="${RETHLAS_HOTJOIN_RUN_ID:-}"
 HOTJOIN_ADAPTER="$ROOT_DIR/../hotjoin_adapter.py"
 HOTJOIN_DB="$ROOT_DIR/../.rethlas_hotjoin/messages.sqlite3"
+ADVISOR_BRIDGE="$ROOT_DIR/../advisor_bridge.py"
+ADVISOR_ROOT="$(cd "$ROOT_DIR/.." && pwd -P)/.rethlas_advisor"
+ADVISOR_RECEIPTS_ROOT="$ADVISOR_ROOT/receipts"
 
 # The generation runtime is content-attested below. Never create interpreter
 # caches in that trusted tree: bytecode is executable input, not a disposable
@@ -385,12 +389,22 @@ if ! [[ "$MAX_ITERATIONS" =~ ^[0-9]+$ ]] || [[ "$MAX_ITERATIONS" -le 0 ]]; then
   exit 1
 fi
 
+if ! [[ "$DEEP_WORK_MINUTES" =~ ^[0-9]+$ ]] \
+   || [[ "$DEEP_WORK_MINUTES" -lt 10 ]] \
+   || [[ "$DEEP_WORK_MINUTES" -gt 90 ]]; then
+  echo "RETHLAS_DEEP_WORK_MINUTES must be an integer from 10 through 90: $DEEP_WORK_MINUTES" >&2
+  exit 1
+fi
+
 # data/algebra/prob1.md -> algebra/prob1
 problem_rel="${PROBLEM_FILE#data/}"
 problem_rel="${problem_rel%.md}"
 problem_name="$(basename "$PROBLEM_FILE" .md)"
 ref_dir="data/${problem_rel}.refs"
 ref_prompt="Use reference_dir=${ref_dir} if it exists."
+RETHLAS_GENERATION_CONTROL_TOKEN="$("$TRUSTED_PYTHON_BIN" -I -B -c \
+  'import secrets; print(secrets.token_hex(16))')"
+export RETHLAS_GENERATION_CONTROL_TOKEN
 
 # The publication tool intentionally uses a lossless, restricted identifier.
 # Reject names that its path validator would otherwise normalize differently.
@@ -613,6 +627,16 @@ trusted_runtime_unchanged() {
   [[ "$current_manifest" == "$TRUSTED_RUNTIME_MANIFEST" ]]
 }
 
+generation_control_resume() {
+  "$TRUSTED_PYTHON_BIN" -I -B "$trusted_runtime_dir/mcp/server.py" \
+    --generation-control-resume "$problem_rel"
+}
+
+generation_control_state() {
+  "$TRUSTED_PYTHON_BIN" -I -B "$trusted_runtime_dir/mcp/server.py" \
+    --generation-control-state "$problem_rel"
+}
+
 receipt_is_valid() {
   "$TRUSTED_PYTHON_BIN" -B - "$ROOT_DIR" "$receipt_path" "$verified_path" "$problem_rel" \
     "$RETHLAS_EXPECTED_STATEMENT_SHA256" "$ROOT_DIR/$PROBLEM_FILE" <<'PY'
@@ -789,6 +813,7 @@ if [[ "$CODEX_BIN" != /* ]] || [[ ! -x "$CODEX_BIN" ]]; then
 fi
 CODEX_VERSION="$("$CODEX_BIN" --version 2>/dev/null || echo 'unknown')"
 HOTJOIN_ADAPTER_SHA256=""
+ADVISOR_BRIDGE_SHA256=""
 if [[ -n "$RETHLAS_HOTJOIN_RUN_ID" ]]; then
   if [[ ! -f "$HOTJOIN_ADAPTER" || -L "$HOTJOIN_ADAPTER" ]]; then
     echo "Hot-join adapter must be a regular non-symlink file: $HOTJOIN_ADAPTER" >&2
@@ -799,6 +824,54 @@ if [[ -n "$RETHLAS_HOTJOIN_RUN_ID" ]]; then
       'import hashlib, pathlib, sys; print(hashlib.sha256(pathlib.Path(sys.argv[1]).read_bytes()).hexdigest())' \
       "$HOTJOIN_ADAPTER"
   )"
+  if [[ ! -f "$ADVISOR_BRIDGE" || -L "$ADVISOR_BRIDGE" ]]; then
+    echo "Advisor bridge must be a regular non-symlink file: $ADVISOR_BRIDGE" >&2
+    exit 1
+  fi
+  ADVISOR_BRIDGE_SHA256="$(
+    "$TRUSTED_PYTHON_BIN" -I -B -c \
+      'import hashlib, pathlib, sys; print(hashlib.sha256(pathlib.Path(sys.argv[1]).read_bytes()).hexdigest())' \
+      "$ADVISOR_BRIDGE"
+  )"
+  if [[ -n "${RETHLAS_ADVISOR_RECEIPTS_ROOT:-}" \
+     && "$RETHLAS_ADVISOR_RECEIPTS_ROOT" != "$ADVISOR_RECEIPTS_ROOT" ]]; then
+    echo "Advisor receipt root is fixed outside the generation workspace and cannot be overridden." >&2
+    exit 1
+  fi
+  if [[ -L "$ADVISOR_ROOT" || -L "$ADVISOR_RECEIPTS_ROOT" ]]; then
+    echo "Advisor state and receipt roots must not be symlinks." >&2
+    exit 1
+  fi
+  umask 077
+  mkdir -p "$ADVISOR_RECEIPTS_ROOT"
+  if ! "$TRUSTED_PYTHON_BIN" -I -B - "$ADVISOR_ROOT" "$ADVISOR_RECEIPTS_ROOT" <<'PY'
+import os
+import stat
+import sys
+from pathlib import Path
+
+for raw in sys.argv[1:]:
+    path = Path(raw).absolute()
+    metadata = path.lstat()
+    if not stat.S_ISDIR(metadata.st_mode) or path.is_symlink():
+        raise SystemExit(1)
+    if hasattr(os, "getuid") and metadata.st_uid != os.getuid():
+        raise SystemExit(1)
+    if stat.S_IMODE(metadata.st_mode) & 0o077:
+        raise SystemExit(1)
+PY
+  then
+    echo "Advisor state and receipt roots must be owner-only real directories." >&2
+    exit 1
+  fi
+  export RETHLAS_ADVISOR_RECEIPTS_ROOT="$ADVISOR_RECEIPTS_ROOT"
+  export RETHLAS_EXPECTED_HOTJOIN_RUN_ID="$RETHLAS_HOTJOIN_RUN_ID"
+else
+  # Legacy runs have no owner-authorized advisor delivery surface.  Never let
+  # inherited values silently enable the receipt reader or bind it to a stale
+  # run id.
+  unset RETHLAS_ADVISOR_RECEIPTS_ROOT
+  unset RETHLAS_EXPECTED_HOTJOIN_RUN_ID
 fi
 
 echo "========================================"
@@ -810,6 +883,7 @@ echo " Problem ID: $problem_rel"
 echo " References: $ref_dir"
 echo " Math Python: $trusted_python_command"
 echo " Max iters:  $MAX_ITERATIONS"
+echo " Deep work:  $DEEP_WORK_MINUTES minutes (soft target)"
 echo " Logs:       $LOG_DIR"
 echo " Stop file:  $verified_path"
 if [[ -n "$RETHLAS_HOTJOIN_RUN_ID" ]]; then
@@ -850,9 +924,12 @@ import os
 
 names = (
     "PYTHONDONTWRITEBYTECODE",
+    "RETHLAS_GENERATION_CONTROL_TOKEN",
     "RETHLAS_EXPECTED_PROBLEM_ID",
+    "RETHLAS_EXPECTED_HOTJOIN_RUN_ID",
     "RETHLAS_EXPECTED_STATEMENT_SHA256",
     "RETHLAS_GENERATION_ROOT",
+    "RETHLAS_ADVISOR_RECEIPTS_ROOT",
     "RETHLAS_RECEIPTS_ROOT",
     "RETHLAS_TRUSTED_RUNTIME_SHA256",
     "VERIFY_API_TOKEN",
@@ -869,6 +946,14 @@ PY
 TRUSTED_REASONING_AGENT_MCP_TOML="{command=$TRUSTED_PYTHON_COMMAND_TOML,args=$TRUSTED_MCP_ARGS_TOML,cwd=$TRUSTED_MCP_CWD_TOML,env=$TRUSTED_MCP_ENV_TOML,required=true,tool_timeout_sec=3600,default_tools_approval_mode=\"approve\"}"
 
 START_EPOCH=$(date +%s)
+
+# Starting this runner is the repository owner's explicit resume action. Clear
+# any prior legal yield before the first paid turn; a later generation_yield
+# in that turn is then authoritative for whether another iteration may start.
+if ! generation_control_resume; then
+  echo "Could not durably resume generation control; refusing to start Codex." >&2
+  exit 70
+fi
 
 elapsed_timer() {
   while true; do
@@ -889,6 +974,7 @@ cleanup_timer() {
 }
 trap cleanup_timer EXIT
 
+yielded_state=""
 for ((iter = 0; iter < MAX_ITERATIONS; iter += 1)); do
   log_file="$LOG_DIR/${problem_name}_iter_${iter}.md"
 
@@ -914,18 +1000,27 @@ for ((iter = 0; iter < MAX_ITERATIONS; iter += 1)); do
       echo "Hot-join adapter changed; refusing to start another session." >&2
       exit 70
     fi
+    current_advisor_sha256="$(
+      "$TRUSTED_PYTHON_BIN" -I -B -c \
+        'import hashlib, pathlib, sys; print(hashlib.sha256(pathlib.Path(sys.argv[1]).read_bytes()).hexdigest())' \
+        "$ADVISOR_BRIDGE"
+    )"
+    if [[ "$current_advisor_sha256" != "$ADVISOR_BRIDGE_SHA256" ]]; then
+      echo "Advisor bridge changed; refusing to start another session." >&2
+      exit 70
+    fi
   fi
 
   if [[ "$iter" -eq 0 ]]; then
-    prompt="Use AGENTS.md exactly to solve the math problem in ${PROBLEM_FILE}. Use problem_id=${problem_rel}. ${ref_prompt} A trusted math-research runtime is available as both python and python3, with NumPy, SciPy, SymPy, mpmath, and gmpy2 importable. This is iteration 0 in a fresh session. Ignore any pre-existing blueprint_verified.md: only verify_blueprint_service and its trusted receipt can finish this run."
-    web_mode="live"
+    prompt="Use AGENTS.md exactly with reasoning_contract=rethlas_reasoning_first_v1 to solve the math problem in ${PROBLEM_FILE}. Use problem_id=${problem_rel}. ${ref_prompt} A trusted math-research runtime is available as both python and python3, with NumPy, SciPy, SymPy, mpmath, and gmpy2 importable. This is iteration 0 in a fresh session. Begin with the protected root deep-work phase, targeting at least ${DEEP_WORK_MINUTES} minutes of coherent mathematical work: after reading the authoritative problem and local references, do not initialize or write memory, retrieve externally, update branches, or spawn collaborators until either a complete candidate exists or the primary plan plus at most one materially different fallback have been screened into one shared obstruction ready for the single pre-critic write-behind checkpoint. Necessary local exact, symbolic, and numerical computation is allowed. If a complete candidate appears, enter the candidate fast lane immediately. Ignore any pre-existing blueprint_verified.md: only verify_blueprint_service and its trusted receipt can finish this run."
+    web_mode="disabled"
   elif ((iter % 2 == 1)); then
     if [[ -n "$RETHLAS_HOTJOIN_RUN_ID" ]]; then
       session_instruction="Continue the persistent main conversation for problem_id=${problem_rel}."
     else
       session_instruction="Start a fresh reasoning session and continue problem_id=${problem_rel}."
     fi
-    prompt="${session_instruction} Read AGENTS.md, ${PROBLEM_FILE}, the current results/${problem_rel}/blueprint.md if it exists, and retrieve only relevant persisted memory through memory_search. Ignore any pre-existing blueprint_verified.md: only verify_blueprint_service and its trusted receipt can finish this run. This is iteration ${iter}. Do not use arXiv theorem search or web search; think deeply from the persisted artifacts."
+    prompt="${session_instruction} Use reasoning_contract=rethlas_reasoning_first_v1. Read AGENTS.md, ${PROBLEM_FILE}, the current results/${problem_rel}/blueprint.md if it exists, and use at most one bounded memory_search only when essential state is missing from the active conversation. Then perform another coherent deep-reasoning phase before any write-behind checkpoint. The trusted local runtime still provides NumPy, SciPy, SymPy, mpmath, and gmpy2. Ignore any pre-existing blueprint_verified.md: only verify_blueprint_service and its trusted receipt can finish this run. This is iteration ${iter}. Do not use arXiv theorem search or web search. If a complete candidate appears, enter the candidate fast lane immediately."
     web_mode="disabled"
   else
     if [[ -n "$RETHLAS_HOTJOIN_RUN_ID" ]]; then
@@ -933,7 +1028,7 @@ for ((iter = 0; iter < MAX_ITERATIONS; iter += 1)); do
     else
       session_instruction="Start a fresh reasoning session and continue problem_id=${problem_rel}."
     fi
-    prompt="${session_instruction} Read AGENTS.md, ${PROBLEM_FILE}, the current results/${problem_rel}/blueprint.md if it exists, and retrieve only relevant persisted memory through memory_search. Ignore any pre-existing blueprint_verified.md: only verify_blueprint_service and its trusted receipt can finish this run. This is iteration ${iter}. You may use arXiv theorem search and web search, but also reason deeply from the persisted artifacts."
+    prompt="${session_instruction} Use reasoning_contract=rethlas_reasoning_first_v1. Read AGENTS.md, ${PROBLEM_FILE}, the current results/${problem_rel}/blueprint.md if it exists, and use at most one bounded memory_search only when essential state is missing from the active conversation. Perform a coherent deep-reasoning phase first. The trusted local runtime still provides NumPy, SciPy, SymPy, mpmath, and gmpy2. Ignore any pre-existing blueprint_verified.md: only verify_blueprint_service and its trusted receipt can finish this run. This is iteration ${iter}. arXiv theorem search and web search are capabilities, not obligations: use them only for one named external knowledge gap under the two-query budget, then return to reasoning. If a complete candidate appears, enter the candidate fast lane immediately."
     web_mode="live"
   fi
 
@@ -952,6 +1047,7 @@ for ((iter = 0; iter < MAX_ITERATIONS; iter += 1)); do
       --mcp-config-toml "$TRUSTED_REASONING_AGENT_MCP_TOML"
       --shell-policy-toml "$TRUSTED_SHELL_ENVIRONMENT_POLICY_TOML"
       --codex-bin "$CODEX_BIN"
+      --advisor-control-plane-sha256 "$ADVISOR_BRIDGE_SHA256"
     )
   else
     generator_command=(
@@ -997,7 +1093,34 @@ for ((iter = 0; iter < MAX_ITERATIONS; iter += 1)); do
       echo "Hot-join adapter was modified during iter=$iter; refusing to continue." >&2
       exit 70
     fi
+    current_advisor_sha256="$(
+      "$TRUSTED_PYTHON_BIN" -I -B -c \
+        'import hashlib, pathlib, sys; print(hashlib.sha256(pathlib.Path(sys.argv[1]).read_bytes()).hexdigest())' \
+        "$ADVISOR_BRIDGE"
+    )"
+    if [[ "$current_advisor_sha256" != "$ADVISOR_BRIDGE_SHA256" ]]; then
+      echo "Advisor bridge was modified during iter=$iter; refusing to continue." >&2
+      exit 70
+    fi
   fi
+
+  if ! current_generation_state="$(generation_control_state)"; then
+    echo "Could not read durable generation control after iter=$iter; refusing to continue." >&2
+    exit 70
+  fi
+  case "$current_generation_state" in
+    running)
+      ;;
+    waiting_cost_gate|waiting_owner_advisor_decision)
+      yielded_state="$current_generation_state"
+      echo "Yielded unfinished problem_id=$problem_rel state=$yielded_state after iter=$iter; owner action is required before another paid turn."
+      break
+      ;;
+    *)
+      echo "Invalid durable generation control state after iter=$iter: $current_generation_state" >&2
+      exit 70
+      ;;
+  esac
 
   echo "Finished problem_id=$problem_rel iter=$iter -> $log_file"
 done
@@ -1016,6 +1139,12 @@ if receipt_is_valid; then
   echo "To view results in the browser, run:"
   echo "  ./site/serve.sh"
   echo "Then open http://localhost:3264"
+  exit 0
+fi
+
+if [[ -n "$yielded_state" ]]; then
+  echo "The theorem remains unsolved; generation stopped at state=$yielded_state."
+  printf "Total time: %s\n" "$(format_duration "$TOTAL")"
   exit 0
 fi
 

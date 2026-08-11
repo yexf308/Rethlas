@@ -20,7 +20,10 @@ Read:
 ## Procedure
 
 1. Identify the assumptions that must hold and the conclusion to fail.
-2. Use reasoning, decomposition, and retrieval to search for standard obstructions, pathological constructions, or previously known counterexamples.
+2. First use coherent local reasoning and, when useful, bounded exact or
+   numerical computation to search for an obstruction. Use retrieval only
+   after naming a specific missing counterexample family whose existence would
+   change the route.
 3. Decide status:
    - `refuted`: assumptions hold and the claim fails
    - `not_refuted`: no counterexample found yet
@@ -31,7 +34,8 @@ Read:
 
 ## Output Contract
 
-Append to `counterexamples`:
+Return one consolidated counterexample result for the root's next
+`memory_append_batch` checkpoint:
 
 ```json
 {
@@ -46,9 +50,11 @@ Append to `counterexamples`:
 }
 ```
 
-If `status="refuted"`, also append to `failed_paths` when it kills a branch.
+If `status="refuted"`, include one `failed_paths` item in the same batch when it
+kills a branch.
 
-If the search produced a concrete non-refuting example, also append a record to `toy_examples`:
+If the search produced a durable non-refuting example, include one
+`toy_examples` item in the same batch:
 
 ```json
 {
@@ -68,13 +74,15 @@ Do this whenever the constructed example is useful enough to test future claims 
 ## MCP Tools
 
 - `memory_append`
+- `memory_append_batch`
 - `memory_search`
 - `branch_update`
-- Codex built-in web search and `search_arxiv_theorems` to find standard counterexample patterns
+- bounded external retrieval only through the named-gap policy
 - reuse stored counterexamples to test future conjectures/claims
 
 ## Failure Logging
 
-If no meaningful counterexample space is identified, append:
+If no meaningful counterexample space is identified, include this event only
+when it changes the branch decision:
 
 - `events.event_type="counterexample_space_unclear"`

@@ -5,7 +5,9 @@ description: Generate and analyze simpler examples that satisfy both the assumpt
 
 # Construct Toy Examples
 
-Use this skill when the agent is stuck in reasoning and needs simpler examples that satisfy both the assumptions and the conclusion in order to understand why the statement works.
+Use this skill after the protected root phase has produced a specific
+obstruction and simpler examples could distinguish concrete mechanisms. Do not
+invoke it during the protected phase or merely because the problem is hard.
 
 ## Input Contract
 
@@ -23,11 +25,15 @@ Read:
 3. Check that the conclusion also holds in the toy example.
 4. Study where each assumption takes effect and what mechanism makes the conclusion true.
 5. Identify repeated patterns, invariants, or proof ideas suggested by the example.
-6. Use search/reasoning/decomposition as needed to find examples or simplify the situation.
+6. Construct and analyze examples locally first. If one named external
+   knowledge gap remains and its answer could change the active route, delegate
+   that gap to `$search-math-results` under its two-query budget. Do not start a
+   general example survey.
 
 ## Output Contract
 
-Append to `toy_examples`:
+Include the consolidated result in the root's next
+`memory_append_batch` checkpoint under `toy_examples`:
 
 ```json
 {
@@ -44,15 +50,14 @@ Append to `toy_examples`:
 
 ## MCP Tools
 
-- `memory_append`
-- `memory_search`
-- `search_arxiv_theorems` for matching examples/known motifs
-- Codex built-in web search for known example families and standard constructions
-- use `$search-math-results` when broader retrieval is needed
+- `memory_append_batch`
+- `memory_search` only for one bounded continuation-state rehydration
+- `$search-math-results` only for one named knowledge gap
 
 ## Failure Logging
 
-If generated examples are inconclusive, append an `events` record:
+If generated examples are inconclusive, include one compact `events` record in
+the same phase-boundary batch:
 
 - `event_type="toy_examples_inconclusive"`
 - include attempted example families

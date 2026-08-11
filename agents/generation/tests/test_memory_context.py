@@ -1,10 +1,19 @@
 from __future__ import annotations
 
+import json
+import os
+import signal
+import subprocess
 import sys
 import tempfile
+import textwrap
+import threading
+import time
 import types
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from unittest import mock
 
 
 try:
@@ -48,9 +57,7 @@ class MemoryContextTests(unittest.TestCase):
         )
 
         stored = list(
-            server._iter_jsonl(
-                server._channel_path("sample/problem", "proof_steps")
-            )
+            server._iter_jsonl(server._channel_path("sample/problem", "proof_steps"))
         )
         self.assertEqual(len(stored), 1)
         self.assertEqual(stored[0]["record_id"], receipt["record_id"])
@@ -75,6 +82,1129 @@ class MemoryContextTests(unittest.TestCase):
         self.assertIn("entry", receipt)
         self.assertEqual(receipt["entry"]["record_id"], receipt["record_id"])
         self.assertEqual(receipt["entry"]["record"], {"example": "expanded response"})
+
+    def test_memory_append_batch_persists_one_compact_phase_checkpoint(self) -> None:
+        response = server.memory_append_batch(
+            "sample/problem",
+            [
+                {
+                    "channel": "proof_steps",
+                    "record": {"claim": "frontier-changing lemma"},
+                },
+                {
+                    "channel": "failed_paths",
+                    "record": {"obstruction": "decisive counterexample"},
+                    "active": False,
+                    "supersedes": ["mem_old"],
+                },
+            ],
+        )
+
+        self.assertEqual(response["status"], "ok")
+        self.assertEqual(response["problem_id"], "sample/problem")
+        self.assertEqual(response["count"], 2)
+        self.assertTrue(response["batch_id"].startswith("batch_"))
+        self.assertNotIn("entry", response)
+        self.assertNotIn("record", response["records"][0])
+
+        logical = server._load_memory_entries("sample/problem")
+        proof = [entry["item"] for entry in logical["proof_steps"]]
+        failed = [entry["item"] for entry in logical["failed_paths"]]
+        self.assertEqual(proof[0]["batch_id"], response["batch_id"])
+        self.assertEqual(proof[0]["record"], {"claim": "frontier-changing lemma"})
+        self.assertEqual(failed[0]["batch_id"], response["batch_id"])
+        self.assertFalse(failed[0]["active"])
+        self.assertEqual(failed[0]["supersedes"], ["mem_old"])
+
+        events = [entry["item"] for entry in logical["events"]]
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["event_type"], "memory_append_batch")
+        self.assertEqual(events[0]["batch_id"], response["batch_id"])
+        self.assertEqual(len(events[0]["appended_records"]), 2)
+        self.assertEqual(
+            list(
+                server._iter_jsonl(
+                    server._channel_path("sample/problem", "proof_steps")
+                )
+            ),
+            [],
+        )
+        checkpoint = Path(response["checkpoint_path"])
+        self.assertTrue(checkpoint.is_file())
+        checkpoint_payload = json.loads(checkpoint.read_text(encoding="utf-8"))
+        self.assertEqual(checkpoint_payload["schema"], "rethlas_memory_batch_v2")
+        self.assertRegex(checkpoint_payload["checkpoint_sha256"], r"^[0-9a-f]{64}$")
+        self.assertEqual(
+            [path.name for path in checkpoint.parent.glob("batch_*.json")],
+            [f"{response['batch_id']}.json"],
+        )
+
+    def test_memory_append_batch_is_independent_of_partial_memory_init(self) -> None:
+        problem_id = "partial-init"
+        problem_dir = server._problem_dir(problem_id)
+        problem_dir.mkdir(parents=True)
+        invalid_meta = problem_dir / "meta.json"
+        invalid_meta.write_text('{"problem_id":', encoding="utf-8")
+        items = [
+            {
+                "channel": "proof_steps",
+                "record": {"claim": "batch survives an interrupted legacy init"},
+            }
+        ]
+
+        with mock.patch.object(
+            server,
+            "memory_init",
+            side_effect=AssertionError("batch must not call memory_init"),
+        ):
+            first = server.memory_append_batch(problem_id, items)
+            retry = server.memory_append_batch(problem_id, items)
+
+        self.assertEqual(retry, first)
+        self.assertEqual(invalid_meta.read_text(encoding="utf-8"), '{"problem_id":')
+        self.assertEqual(
+            len(list(server._batch_checkpoint_dir(problem_id).glob("batch_*.json"))),
+            1,
+        )
+
+    def test_memory_init_atomic_failure_preserves_meta_and_retry_updates(self) -> None:
+        problem_id = "atomic-meta"
+        first = server.memory_init(problem_id, {"generation": 1})
+        meta_path = Path(first["meta_path"])
+        original = meta_path.read_bytes()
+
+        with mock.patch.object(
+            server.os,
+            "replace",
+            side_effect=OSError("injected metadata replace failure"),
+        ):
+            with self.assertRaisesRegex(OSError, "injected metadata replace failure"):
+                server.memory_init(problem_id, {"generation": 2})
+
+        self.assertEqual(meta_path.read_bytes(), original)
+        self.assertEqual(
+            json.loads(meta_path.read_text(encoding="utf-8"))["generation"], 1
+        )
+        self.assertEqual(list(meta_path.parent.glob(".meta.json.*.tmp")), [])
+
+        server.memory_init(problem_id, {"generation": 2})
+        self.assertEqual(
+            json.loads(meta_path.read_text(encoding="utf-8"))["generation"], 2
+        )
+
+    def test_memory_init_concurrent_updates_are_serialized_and_complete(self) -> None:
+        problem_id = "concurrent-meta"
+        worker_count = 6
+        start = threading.Barrier(worker_count)
+
+        def initialize(index: int) -> None:
+            start.wait(timeout=10)
+            server.memory_init(problem_id, {f"worker_{index}": index})
+
+        with ThreadPoolExecutor(max_workers=worker_count) as executor:
+            list(executor.map(initialize, range(worker_count)))
+
+        meta_path = server._problem_dir(problem_id) / "meta.json"
+        loaded = json.loads(meta_path.read_text(encoding="utf-8"))
+        self.assertEqual(
+            {key: loaded[key] for key in loaded if key.startswith("worker_")},
+            {f"worker_{index}": index for index in range(worker_count)},
+        )
+        self.assertEqual(list(meta_path.parent.glob(".meta.json.*.tmp")), [])
+
+    def test_batch_creation_and_temp_cleanup_have_parent_fsyncs(self) -> None:
+        problem_id = "durability-trace"
+        problem_dir = server._problem_dir(problem_id)
+        checkpoint_dir = server._batch_checkpoint_dir(problem_id)
+        operations: list[tuple[str, Path]] = []
+        real_fsync_directory_fd = server._fsync_directory_fd
+        real_cleanup = server._unlink_temporary_durable_at
+
+        def trace_fsync(descriptor: int, path: Path) -> None:
+            operations.append(("fsync", path))
+            real_fsync_directory_fd(descriptor, path)
+
+        def trace_cleanup(
+            parent_descriptor: int,
+            parent_path: Path,
+            name: str,
+            descriptor: int | None,
+        ) -> None:
+            operations.append(("cleanup", parent_path))
+            real_cleanup(parent_descriptor, parent_path, name, descriptor)
+
+        with (
+            mock.patch.object(server, "_fsync_directory_fd", side_effect=trace_fsync),
+            mock.patch.object(
+                server, "_unlink_temporary_durable_at", side_effect=trace_cleanup
+            ),
+            mock.patch.object(
+                server.os,
+                "link",
+                side_effect=OSError("injected pre-publication link failure"),
+            ),
+        ):
+            with self.assertRaisesRegex(
+                OSError, "injected pre-publication link failure"
+            ):
+                server.memory_append_batch(
+                    problem_id,
+                    [{"channel": "events", "record": {"phase": "root"}}],
+                )
+
+        self.assertIn(("fsync", server._memory_root_path()), operations)
+        self.assertIn(("fsync", problem_dir), operations)
+        cleanup_index = operations.index(("cleanup", checkpoint_dir))
+        self.assertEqual(
+            operations[cleanup_index + 1],
+            ("fsync", checkpoint_dir),
+        )
+        self.assertEqual(list(checkpoint_dir.glob(".*.tmp")), [])
+
+    def test_batch_directory_parent_fsync_failures_are_retry_safe(self) -> None:
+        items = [{"channel": "events", "record": {"phase": "root"}}]
+        for problem_id, parent_selector in (
+            ("problem-parent-failure", "problem"),
+            ("checkpoint-parent-failure", "checkpoint"),
+        ):
+            with self.subTest(parent_selector=parent_selector):
+                problem_dir = server._problem_dir(problem_id)
+                failing_parent = (
+                    server._memory_root_path()
+                    if parent_selector == "problem"
+                    else problem_dir
+                )
+                real_fsync_directory_fd = server._fsync_directory_fd
+                failed = False
+                attempted = 0
+
+                def fail_once(descriptor: int, path: Path) -> None:
+                    nonlocal failed, attempted
+                    if path == failing_parent:
+                        attempted += 1
+                        if not failed:
+                            failed = True
+                            raise OSError("injected parent fsync failure")
+                    real_fsync_directory_fd(descriptor, path)
+
+                with mock.patch.object(
+                    server,
+                    "_fsync_directory_fd",
+                    side_effect=fail_once,
+                ):
+                    with self.assertRaisesRegex(
+                        OSError, "injected parent fsync failure"
+                    ):
+                        server.memory_append_batch(problem_id, items)
+                    receipt = server.memory_append_batch(problem_id, items)
+
+                self.assertGreaterEqual(attempted, 2)
+                self.assertTrue(Path(receipt["checkpoint_path"]).is_file())
+
+    def test_memory_root_symlink_cannot_redirect_batch_outside(self) -> None:
+        configured_parent = server.MEMORY_ROOT
+        attack_root = configured_parent / "memory-root"
+        with tempfile.TemporaryDirectory() as outside_directory:
+            outside = Path(outside_directory)
+            attack_root.symlink_to(outside, target_is_directory=True)
+            server.MEMORY_ROOT = attack_root
+            try:
+                with self.assertRaises((OSError, ValueError)):
+                    server.memory_append_batch(
+                        "root-escape",
+                        [{"channel": "events", "record": {"attack": True}}],
+                    )
+            finally:
+                server.MEMORY_ROOT = configured_parent
+                attack_root.unlink()
+
+            self.assertEqual(list(outside.iterdir()), [])
+
+    def test_problem_directory_symlink_cannot_redirect_append_outside(self) -> None:
+        with tempfile.TemporaryDirectory() as outside_directory:
+            outside = Path(outside_directory)
+            sentinel = outside / "events.jsonl"
+            sentinel.write_text("outside-sentinel\n", encoding="utf-8")
+            (server.MEMORY_ROOT / "problem-escape").symlink_to(
+                outside,
+                target_is_directory=True,
+            )
+
+            with self.assertRaises((OSError, ValueError)):
+                server.memory_append(
+                    "problem-escape",
+                    "events",
+                    {"attack": True},
+                )
+
+            self.assertEqual(sentinel.read_text(encoding="utf-8"), "outside-sentinel\n")
+
+    def test_channel_symlink_and_hardlink_cannot_redirect_append(self) -> None:
+        problem_id = "channel-escape"
+        server.memory_init(problem_id)
+        channel = server._channel_path(problem_id, "events")
+        with tempfile.TemporaryDirectory() as outside_directory:
+            outside = Path(outside_directory) / "outside.jsonl"
+            outside.write_text("outside-sentinel\n", encoding="utf-8")
+
+            channel.unlink()
+            channel.symlink_to(outside)
+            with self.assertRaises((OSError, ValueError)):
+                server.memory_append(problem_id, "events", {"attack": "symlink"})
+            channel.unlink()
+
+            channel.hardlink_to(outside)
+            with self.assertRaises((OSError, ValueError)):
+                server.memory_append(problem_id, "events", {"attack": "hardlink"})
+            channel.unlink()
+
+            self.assertEqual(outside.read_text(encoding="utf-8"), "outside-sentinel\n")
+
+    def test_meta_and_lock_links_are_rejected_without_outside_writes(self) -> None:
+        problem_id = "metadata-escape"
+        initialized = server.memory_init(problem_id, {"safe": True})
+        problem_dir = Path(initialized["memory_dir"])
+        meta_path = Path(initialized["meta_path"])
+        lock_path = problem_dir / ".meta.lock"
+        with tempfile.TemporaryDirectory() as outside_directory:
+            outside = Path(outside_directory) / "outside.json"
+            outside.write_text('{"outside":true}\n', encoding="utf-8")
+
+            meta_path.unlink()
+            meta_path.symlink_to(outside)
+            with self.assertRaises((OSError, ValueError)):
+                server.memory_init(problem_id, {"attack": "meta-symlink"})
+            meta_path.unlink()
+
+            meta_path.hardlink_to(outside)
+            with self.assertRaises((OSError, ValueError)):
+                server.memory_init(problem_id, {"attack": "meta-hardlink"})
+            meta_path.unlink()
+
+            lock_path.unlink()
+            lock_path.symlink_to(outside)
+            with self.assertRaises((OSError, ValueError)):
+                server.memory_init(problem_id, {"attack": "lock-symlink"})
+            lock_path.unlink()
+
+            lock_path.hardlink_to(outside)
+            with self.assertRaises((OSError, ValueError)):
+                server.memory_init(problem_id, {"attack": "lock-hardlink"})
+            lock_path.unlink()
+
+            self.assertEqual(outside.read_text(encoding="utf-8"), '{"outside":true}\n')
+
+    def test_checkpoint_directory_and_file_links_are_rejected(self) -> None:
+        items = [{"channel": "events", "record": {"phase": "root"}}]
+        problem_id = "checkpoint-dir-escape"
+        server.memory_init(problem_id)
+        checkpoint_dir = server._batch_checkpoint_dir(problem_id)
+        with tempfile.TemporaryDirectory() as outside_directory:
+            outside_dir = Path(outside_directory)
+            checkpoint_dir.symlink_to(outside_dir, target_is_directory=True)
+            with self.assertRaises((OSError, ValueError)):
+                server.memory_append_batch(problem_id, items)
+            checkpoint_dir.unlink()
+            self.assertEqual(list(outside_dir.iterdir()), [])
+
+        problem_id = "checkpoint-file-escape"
+        receipt = server.memory_append_batch(problem_id, items)
+        checkpoint = Path(receipt["checkpoint_path"])
+        original_bytes = checkpoint.read_bytes()
+        with tempfile.TemporaryDirectory() as outside_directory:
+            outside = Path(outside_directory) / "outside.json"
+            outside.write_bytes(original_bytes)
+
+            checkpoint.unlink()
+            checkpoint.symlink_to(outside)
+            with self.assertRaises((OSError, ValueError)):
+                server.memory_append_batch(problem_id, items)
+            checkpoint.unlink()
+
+            checkpoint.hardlink_to(outside)
+            with self.assertRaises((OSError, ValueError)):
+                server.memory_append_batch(problem_id, items)
+            checkpoint.unlink()
+
+            self.assertEqual(outside.read_bytes(), original_bytes)
+
+    def test_channel_post_open_inode_swap_is_detected_before_append(self) -> None:
+        problem_id = "channel-toctou"
+        server.memory_init(problem_id)
+        channel = server._channel_path(problem_id, "events")
+        displaced = channel.with_name("events.displaced")
+        with tempfile.TemporaryDirectory() as outside_directory:
+            outside = Path(outside_directory) / "outside.jsonl"
+            outside.write_text("outside-sentinel\n", encoding="utf-8")
+            real_open = server.os.open
+            swapped = False
+
+            def swap_after_open(
+                path: str | Path,
+                flags: int,
+                *args: object,
+                **kwargs: object,
+            ) -> int:
+                nonlocal swapped
+                descriptor = real_open(path, flags, *args, **kwargs)
+                if (
+                    path == "events.jsonl"
+                    and flags & server.os.O_APPEND
+                    and not swapped
+                ):
+                    swapped = True
+                    channel.rename(displaced)
+                    channel.symlink_to(outside)
+                return descriptor
+
+            try:
+                with mock.patch.object(server.os, "open", side_effect=swap_after_open):
+                    with self.assertRaises((OSError, ValueError)):
+                        server.memory_append(problem_id, "events", {"attack": True})
+            finally:
+                if channel.is_symlink():
+                    channel.unlink()
+                if displaced.exists():
+                    displaced.rename(channel)
+
+            self.assertTrue(swapped)
+            self.assertEqual(outside.read_text(encoding="utf-8"), "outside-sentinel\n")
+
+    def test_memory_append_batch_prepublish_failure_retry_exposes_one_batch(
+        self,
+    ) -> None:
+        prior = server.memory_append(
+            "atomic-failure",
+            "proof_steps",
+            {"claim": "prior route remains active"},
+        )
+
+        with mock.patch.object(
+            server.os,
+            "link",
+            side_effect=OSError("injected pre-commit failure"),
+        ):
+            with self.assertRaisesRegex(OSError, "injected pre-commit failure"):
+                server.memory_append_batch(
+                    "atomic-failure",
+                    [
+                        {
+                            "channel": "proof_steps",
+                            "record": {"claim": "uncommitted replacement"},
+                            "supersedes": [prior["record_id"]],
+                        },
+                        {
+                            "channel": "failed_paths",
+                            "record": {"obstruction": "must remain invisible"},
+                        },
+                    ],
+                )
+
+        logical = server._load_memory_entries("atomic-failure")
+        self.assertEqual(len(logical["proof_steps"]), 1)
+        self.assertEqual(logical["proof_steps"][0]["record_id"], prior["record_id"])
+        self.assertTrue(logical["proof_steps"][0]["effective_active"])
+        self.assertEqual(logical["failed_paths"], [])
+        checkpoint_dir = server._batch_checkpoint_dir("atomic-failure")
+        self.assertEqual(list(checkpoint_dir.glob("batch_*.json")), [])
+        self.assertEqual(list(checkpoint_dir.glob(".*.tmp")), [])
+
+        retry = server.memory_append_batch(
+            "atomic-failure",
+            [
+                {
+                    "channel": "proof_steps",
+                    "record": {"claim": "uncommitted replacement"},
+                    "supersedes": [prior["record_id"]],
+                },
+                {
+                    "channel": "failed_paths",
+                    "record": {"obstruction": "must remain invisible"},
+                },
+            ],
+        )
+        self.assertEqual(
+            [path.name for path in checkpoint_dir.glob("batch_*.json")],
+            [f"{retry['batch_id']}.json"],
+        )
+        committed = server._load_memory_entries("atomic-failure")
+        self.assertEqual(len(committed["failed_paths"]), 1)
+        self.assertEqual(
+            committed["proof_steps"][-1]["record_id"],
+            retry["records"][0]["record_id"],
+        )
+
+    def test_memory_append_batch_postpublish_fsync_failure_retry_is_idempotent(
+        self,
+    ) -> None:
+        items = [
+            {
+                "channel": "proof_steps",
+                "record": {"claim": "durable retry checkpoint"},
+            },
+            {
+                "channel": "branch_states",
+                "record": {"state": "critic_pending"},
+            },
+        ]
+        checkpoint_dir = server._batch_checkpoint_dir("post-publish-retry")
+        real_fsync_directory_fd = server._fsync_directory_fd
+        real_link = server.os.link
+        failure_injected = False
+        published = False
+
+        def track_link(
+            source: str,
+            destination: str,
+            *,
+            src_dir_fd: int,
+            dst_dir_fd: int,
+            follow_symlinks: bool,
+        ) -> None:
+            nonlocal published
+            real_link(
+                source,
+                destination,
+                src_dir_fd=src_dir_fd,
+                dst_dir_fd=dst_dir_fd,
+                follow_symlinks=follow_symlinks,
+            )
+            published = True
+
+        def fail_postpublish_fsync(descriptor: int, path: Path) -> None:
+            nonlocal failure_injected
+            if path == checkpoint_dir and published and not failure_injected:
+                failure_injected = True
+                raise OSError("injected post-publication fsync failure")
+            real_fsync_directory_fd(descriptor, path)
+
+        with (
+            mock.patch.object(server.os, "link", side_effect=track_link),
+            mock.patch.object(
+                server,
+                "_fsync_directory_fd",
+                side_effect=fail_postpublish_fsync,
+            ),
+        ):
+            with self.assertRaisesRegex(
+                OSError, "injected post-publication fsync failure"
+            ):
+                server.memory_append_batch("post-publish-retry", items)
+
+        published_paths = list(checkpoint_dir.glob("batch_*.json"))
+        self.assertEqual(len(published_paths), 1)
+        self.assertEqual(list(checkpoint_dir.glob(".*.tmp")), [])
+
+        retry = server.memory_append_batch("post-publish-retry", items)
+        self.assertEqual(Path(retry["checkpoint_path"]), published_paths[0])
+        self.assertEqual(
+            [path.name for path in checkpoint_dir.glob("batch_*.json")],
+            [f"{retry['batch_id']}.json"],
+        )
+        logical = server._load_memory_entries("post-publish-retry")
+        self.assertEqual(len(logical["proof_steps"]), 1)
+        self.assertEqual(len(logical["branch_states"]), 1)
+        self.assertEqual(len(logical["events"]), 1)
+
+    def _sigkill_batch_at_cut(
+        self,
+        problem_id: str,
+        items: list[dict[str, object]],
+        cut: str,
+    ) -> None:
+        self.assertIn(cut, {"prelink", "postlink"})
+        marker = server.MEMORY_ROOT / f".sigkill-{cut}-{time.time_ns()}.marker"
+        child_source = textwrap.dedent(
+            """
+            import json
+            import os
+            import signal
+            import sys
+            from pathlib import Path
+
+            from agents.generation.mcp import server
+
+            server.MEMORY_ROOT = Path(sys.argv[1])
+            marker = Path(sys.argv[2])
+            problem_id = sys.argv[3]
+            items = json.loads(sys.argv[4])
+            cut = sys.argv[5]
+            real_fsync = server._fsync_directory_fd
+
+            def stop_before_link(
+                source,
+                destination,
+                *,
+                src_dir_fd,
+                dst_dir_fd,
+                follow_symlinks,
+            ):
+                del (
+                    source,
+                    destination,
+                    src_dir_fd,
+                    dst_dir_fd,
+                    follow_symlinks,
+                )
+                marker.write_text("pre-link", encoding="utf-8")
+                while True:
+                    signal.pause()
+
+            def stop_after_published_fsync(descriptor, path):
+                real_fsync(descriptor, path)
+                names = os.listdir(descriptor)
+                has_final = any(
+                    name.startswith("batch_") and name.endswith(".json")
+                    for name in names
+                )
+                has_temp = any(
+                    name.startswith(".batch_") and name.endswith(".tmp")
+                    for name in names
+                )
+                if path.name == ".phase_checkpoints" and has_final and has_temp:
+                    marker.write_text("post-publication-fsync", encoding="utf-8")
+                    while True:
+                        signal.pause()
+
+            if cut == "prelink":
+                server.os.link = stop_before_link
+            elif cut == "postlink":
+                server._fsync_directory_fd = stop_after_published_fsync
+            else:
+                raise ValueError(f"unknown cut: {cut}")
+            server.memory_append_batch(problem_id, items)
+            """
+        )
+        environment = dict(os.environ)
+        environment["PYTHONDONTWRITEBYTECODE"] = "1"
+        process = subprocess.Popen(
+            [
+                sys.executable,
+                "-B",
+                "-c",
+                child_source,
+                str(server.MEMORY_ROOT),
+                str(marker),
+                problem_id,
+                json.dumps(items, ensure_ascii=False),
+                cut,
+            ],
+            cwd=Path(__file__).resolve().parents[3],
+            env=environment,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        communicated = False
+        try:
+            deadline = time.monotonic() + 10
+            while not marker.exists() and process.poll() is None:
+                if time.monotonic() >= deadline:
+                    self.fail(f"child did not reach the {cut} cut")
+                time.sleep(0.01)
+            if not marker.exists():
+                _stdout, stderr = process.communicate(timeout=2)
+                communicated = True
+                self.fail(f"child exited before the {cut} cut: {stderr}")
+            process.kill()
+            _stdout, stderr = process.communicate(timeout=5)
+            communicated = True
+            self.assertEqual(
+                process.returncode,
+                -signal.SIGKILL,
+                msg=f"unexpected child stderr: {stderr}",
+            )
+        finally:
+            if not communicated:
+                if process.poll() is None:
+                    process.kill()
+                process.communicate(timeout=5)
+            for pipe in (process.stdout, process.stderr):
+                if pipe is not None and not pipe.closed:
+                    pipe.close()
+            marker.unlink(missing_ok=True)
+
+    def test_sigkill_after_checkpoint_fsync_recovers_exact_orphan(self) -> None:
+        problem_id = "sigkill-checkpoint-cut"
+        items = [
+            {
+                "channel": "proof_steps",
+                "record": {"claim": "survives a post-fsync SIGKILL"},
+            }
+        ]
+        self._sigkill_batch_at_cut(problem_id, items, "postlink")
+
+        checkpoint_dir = server._batch_checkpoint_dir(problem_id)
+        finals = list(checkpoint_dir.glob("batch_*.json"))
+        temporaries = list(checkpoint_dir.glob(".*.tmp"))
+        self.assertEqual(len(finals), 1)
+        self.assertEqual(len(temporaries), 1)
+        self.assertEqual(finals[0].stat().st_ino, temporaries[0].stat().st_ino)
+        self.assertEqual(finals[0].stat().st_nlink, 2)
+
+        retry = server.memory_append_batch(problem_id, items)
+        self.assertEqual(Path(retry["checkpoint_path"]), finals[0])
+        self.assertEqual(list(checkpoint_dir.glob("batch_*.json")), finals)
+        self.assertEqual(list(checkpoint_dir.glob(".*.tmp")), [])
+        self.assertEqual(finals[0].stat().st_nlink, 1)
+        logical = server._load_memory_entries(problem_id)
+        self.assertEqual(len(logical["proof_steps"]), 1)
+        self.assertEqual(len(logical["events"]), 1)
+
+    def test_read_first_recovers_authenticated_postlink_orphan(self) -> None:
+        problem_id = "read-first-checkpoint-cut"
+        items = [
+            {
+                "channel": "proof_steps",
+                "record": {"claim": "read performs constrained recovery"},
+            }
+        ]
+        self._sigkill_batch_at_cut(problem_id, items, "postlink")
+
+        checkpoint_dir = server._batch_checkpoint_dir(problem_id)
+        checkpoint = next(checkpoint_dir.glob("batch_*.json"))
+        self.assertEqual(checkpoint.stat().st_nlink, 2)
+
+        logical = server._load_memory_entries(problem_id)
+
+        self.assertEqual(len(logical["proof_steps"]), 1)
+        self.assertEqual(len(logical["events"]), 1)
+        self.assertEqual(checkpoint.stat().st_nlink, 1)
+        self.assertEqual(list(checkpoint_dir.glob(".*.tmp")), [])
+
+    def test_repeated_sigkill_preserves_stale_temp_and_recovers_true_orphan(
+        self,
+    ) -> None:
+        problem_id = "repeated-sigkill-checkpoint-cut"
+        items = [
+            {
+                "channel": "failed_paths",
+                "record": {"obstruction": "multi-cut recovery"},
+            }
+        ]
+        checkpoint_dir = server._batch_checkpoint_dir(problem_id)
+
+        self._sigkill_batch_at_cut(problem_id, items, "prelink")
+        self.assertEqual(list(checkpoint_dir.glob("batch_*.json")), [])
+        prelink_temporaries = list(checkpoint_dir.glob(".*.tmp"))
+        self.assertEqual(len(prelink_temporaries), 1)
+        stale = prelink_temporaries[0]
+        stale_inode = stale.stat().st_ino
+        self.assertEqual(stale.stat().st_nlink, 1)
+
+        self._sigkill_batch_at_cut(problem_id, items, "postlink")
+        finals = list(checkpoint_dir.glob("batch_*.json"))
+        temporaries = list(checkpoint_dir.glob(".*.tmp"))
+        self.assertEqual(len(finals), 1)
+        self.assertEqual(len(temporaries), 2)
+        final = finals[0]
+        self.assertEqual(final.stat().st_nlink, 2)
+        same_inode = [
+            temporary
+            for temporary in temporaries
+            if temporary.stat().st_ino == final.stat().st_ino
+        ]
+        self.assertEqual(len(same_inode), 1)
+        self.assertEqual(stale.stat().st_ino, stale_inode)
+        self.assertNotEqual(stale_inode, final.stat().st_ino)
+
+        retry = server.memory_append_batch(problem_id, items)
+
+        self.assertEqual(Path(retry["checkpoint_path"]), final)
+        self.assertEqual(final.stat().st_nlink, 1)
+        remaining_temporaries = list(checkpoint_dir.glob(".*.tmp"))
+        self.assertEqual(remaining_temporaries, [stale])
+        self.assertEqual(stale.stat().st_ino, stale_inode)
+        self.assertEqual(stale.stat().st_nlink, 1)
+        logical = server._load_memory_entries(problem_id)
+        self.assertEqual(len(logical["failed_paths"]), 1)
+        self.assertEqual(len(logical["events"]), 1)
+
+    def test_checkpoint_orphan_recovery_fails_closed_when_link_count_ambiguous(
+        self,
+    ) -> None:
+        problem_id = "ambiguous-checkpoint-cut"
+        items = [{"channel": "events", "record": {"phase": "root"}}]
+        receipt = server.memory_append_batch(problem_id, items)
+        checkpoint = Path(receipt["checkpoint_path"])
+        first_orphan = checkpoint.with_name(f".{checkpoint.name}.{'a' * 32}.tmp")
+        second_orphan = checkpoint.with_name(f".{checkpoint.name}.{'b' * 32}.tmp")
+        first_orphan.hardlink_to(checkpoint)
+        second_orphan.hardlink_to(checkpoint)
+
+        with self.assertRaisesRegex(ValueError, "unsafe hard-link count"):
+            server._load_memory_entries(problem_id)
+
+        self.assertTrue(first_orphan.is_file())
+        self.assertTrue(second_orphan.is_file())
+        self.assertEqual(checkpoint.stat().st_nlink, 3)
+
+    def test_checkpoint_orphan_recovery_fails_closed_without_same_inode(
+        self,
+    ) -> None:
+        problem_id = "no-same-inode-checkpoint-cut"
+        receipt = server.memory_append_batch(
+            problem_id,
+            [{"channel": "events", "record": {"phase": "root"}}],
+        )
+        checkpoint = Path(receipt["checkpoint_path"])
+        outside_name = checkpoint.with_name("outside-hardlink")
+        outside_name.hardlink_to(checkpoint)
+        unrelated = checkpoint.with_name(f".{checkpoint.name}.{'c' * 32}.tmp")
+        unrelated.write_bytes(b"unrelated-stale-temp\n")
+
+        with self.assertRaisesRegex(ValueError, "no unique same-inode orphan"):
+            server._load_memory_entries(problem_id)
+
+        self.assertTrue(outside_name.is_file())
+        self.assertEqual(unrelated.read_bytes(), b"unrelated-stale-temp\n")
+        self.assertEqual(checkpoint.stat().st_nlink, 2)
+
+    def test_memory_append_batch_exact_retry_returns_original_receipt(self) -> None:
+        items = [
+            {
+                "channel": "proof_steps",
+                "record": {"claim": "same checkpoint"},
+                "active": True,
+                "supersedes": ["mem_old", "mem_old"],
+            }
+        ]
+
+        with mock.patch.object(
+            server,
+            "_utc_now",
+            side_effect=(
+                "2026-08-10T00:00:00+00:00",
+                "2026-08-10T01:00:00+00:00",
+            ),
+        ):
+            first = server.memory_append_batch("exact-retry", items)
+            second = server.memory_append_batch("exact-retry", items)
+
+        self.assertEqual(second, first)
+        self.assertEqual(first["timestamp_utc"], "2026-08-10T00:00:00+00:00")
+        checkpoint_dir = server._batch_checkpoint_dir("exact-retry")
+        self.assertEqual(len(list(checkpoint_dir.glob("batch_*.json"))), 1)
+        logical = server._load_memory_entries("exact-retry")
+        self.assertEqual(len(logical["proof_steps"]), 1)
+        self.assertEqual(len(logical["events"]), 1)
+
+    def test_memory_append_batch_hash_collision_rejects_different_items(self) -> None:
+        problem_id = "simulated-hash-collision"
+        first_items = [{"channel": "proof_steps", "record": {"claim": "original item"}}]
+        different_items = [
+            {"channel": "proof_steps", "record": {"claim": "different item"}}
+        ]
+        first = server.memory_append_batch(problem_id, first_items)
+
+        with mock.patch.object(
+            server,
+            "_batch_id_for_items",
+            return_value=first["batch_id"],
+        ):
+            with self.assertRaisesRegex(ValueError, "collides with different items"):
+                server.memory_append_batch(problem_id, different_items)
+
+        checkpoint_dir = server._batch_checkpoint_dir(problem_id)
+        self.assertEqual(list(checkpoint_dir.glob(".*.tmp")), [])
+        logical = server._load_memory_entries(problem_id)
+        self.assertEqual(len(logical["proof_steps"]), 1)
+        self.assertEqual(
+            logical["proof_steps"][0]["item"]["record"],
+            {"claim": "original item"},
+        )
+
+    def test_memory_append_batch_concurrent_exact_calls_publish_one_winner(
+        self,
+    ) -> None:
+        items = [
+            {
+                "channel": "failed_paths",
+                "record": {"obstruction": "shared concurrent checkpoint"},
+            }
+        ]
+        worker_count = 4
+        publish_barrier = threading.Barrier(worker_count)
+        real_link = server.os.link
+
+        def synchronized_link(
+            source: str,
+            destination: str,
+            *,
+            src_dir_fd: int,
+            dst_dir_fd: int,
+            follow_symlinks: bool,
+        ) -> None:
+            publish_barrier.wait(timeout=10)
+            real_link(
+                source,
+                destination,
+                src_dir_fd=src_dir_fd,
+                dst_dir_fd=dst_dir_fd,
+                follow_symlinks=follow_symlinks,
+            )
+
+        with mock.patch.object(server.os, "link", side_effect=synchronized_link):
+            with ThreadPoolExecutor(max_workers=worker_count) as executor:
+                responses = list(
+                    executor.map(
+                        lambda _: server.memory_append_batch("concurrent", items),
+                        range(worker_count),
+                    )
+                )
+
+        self.assertTrue(all(response == responses[0] for response in responses))
+        checkpoint_dir = server._batch_checkpoint_dir("concurrent")
+        self.assertEqual(len(list(checkpoint_dir.glob("batch_*.json"))), 1)
+        self.assertEqual(list(checkpoint_dir.glob(".*.tmp")), [])
+        logical = server._load_memory_entries("concurrent")
+        self.assertEqual(len(logical["failed_paths"]), 1)
+        self.assertEqual(len(logical["events"]), 1)
+
+    def test_content_addressed_batch_rejects_record_body_tampering(self) -> None:
+        receipt = server.memory_append_batch(
+            "hash-binding",
+            [
+                {
+                    "channel": "proof_steps",
+                    "record": {"claim": "hash-bound checkpoint"},
+                }
+            ],
+        )
+        checkpoint = Path(receipt["checkpoint_path"])
+        payload = json.loads(checkpoint.read_text(encoding="utf-8"))
+        payload["records"][0]["record"]["claim"] = "tampered checkpoint"
+        checkpoint.write_text(
+            json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n",
+            encoding="utf-8",
+        )
+
+        with self.assertRaisesRegex(ValueError, "not hash-bound"):
+            server._load_memory_entries("hash-binding")
+
+    def test_content_addressed_batch_rejects_timestamp_tampering(self) -> None:
+        problem_id = "timestamp-binding"
+        receipt = server.memory_append_batch(
+            problem_id,
+            [{"channel": "proof_steps", "record": {"claim": "time-bound"}}],
+        )
+        checkpoint = Path(receipt["checkpoint_path"])
+        payload = json.loads(checkpoint.read_text(encoding="utf-8"))
+        forged = "9999-12-31T23:59:59+00:00"
+        payload["timestamp_utc"] = forged
+        payload["records"][0]["timestamp_utc"] = forged
+        payload["event"]["timestamp_utc"] = forged
+        checkpoint.write_text(
+            json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n",
+            encoding="utf-8",
+        )
+
+        with self.assertRaisesRegex(ValueError, "not hash-bound"):
+            server._load_memory_entries(problem_id)
+
+    def test_content_addressed_batch_requires_canonical_utc_timestamp(self) -> None:
+        problem_id = "canonical-timestamp"
+        receipt = server.memory_append_batch(
+            problem_id,
+            [{"channel": "proof_steps", "record": {"claim": "UTC only"}}],
+        )
+        checkpoint = Path(receipt["checkpoint_path"])
+        payload = json.loads(checkpoint.read_text(encoding="utf-8"))
+        noncanonical = "2026-08-10T00:00:00Z"
+        payload["timestamp_utc"] = noncanonical
+        payload["records"][0]["timestamp_utc"] = noncanonical
+        payload["event"]["timestamp_utc"] = noncanonical
+        payload["checkpoint_sha256"] = server._memory_batch_checkpoint_sha256(payload)
+        checkpoint.write_text(
+            json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n",
+            encoding="utf-8",
+        )
+
+        with self.assertRaisesRegex(ValueError, "canonical UTC timestamp"):
+            server._load_memory_entries(problem_id)
+
+    def test_memory_batch_strict_json_rejects_nested_duplicate_keys(self) -> None:
+        problem_id = "duplicate-checkpoint-key"
+        receipt = server.memory_append_batch(
+            problem_id,
+            [{"channel": "proof_steps", "record": {"claim": "original"}}],
+        )
+        checkpoint = Path(receipt["checkpoint_path"])
+        raw = checkpoint.read_text(encoding="utf-8")
+        tampered = raw.replace(
+            '"record":{"claim":"original"}',
+            '"record":{"claim":"first","claim":"second"}',
+        )
+        self.assertNotEqual(tampered, raw)
+        checkpoint.write_text(tampered, encoding="utf-8")
+
+        with self.assertRaisesRegex(ValueError, "duplicate JSON key 'claim'"):
+            server._load_memory_entries(problem_id)
+
+    def test_memory_meta_strict_json_rejects_duplicate_keys(self) -> None:
+        initialized = server.memory_init("duplicate-meta")
+        meta_path = Path(initialized["meta_path"])
+        meta_path.write_text(
+            '{"problem_id":"duplicate-meta","problem_id":"other"}\n',
+            encoding="utf-8",
+        )
+
+        with self.assertRaisesRegex(ValueError, "duplicate JSON key 'problem_id'"):
+            server.memory_init("duplicate-meta")
+
+    def test_v2_checkpoint_rejects_canonical_non_sha_batch_id(self) -> None:
+        problem_id = "non-sha-checkpoint"
+        server.memory_init(problem_id)
+        checkpoint_dir = server._batch_checkpoint_dir(problem_id)
+        server._ensure_memory_directory_durable(checkpoint_dir)
+        batch_id = "batch_not_a_sha"
+        timestamp = "2026-08-10T00:00:00+00:00"
+        record = {
+            "record_id": "mem_non_sha",
+            "timestamp_utc": timestamp,
+            "channel": "proof_steps",
+            "active": True,
+            "supersedes": [],
+            "batch_id": batch_id,
+            "record": {"claim": "must not enter logical memory"},
+        }
+        payload = {
+            "schema": server.MEMORY_BATCH_SCHEMA,
+            "batch_id": batch_id,
+            "timestamp_utc": timestamp,
+            "records": [record],
+            "event": {
+                "record_id": "event_non_sha",
+                "timestamp_utc": timestamp,
+                "event_type": "memory_append_batch",
+                "batch_id": batch_id,
+                "active": True,
+                "supersedes": [],
+                "appended_records": [
+                    {"record_id": record["record_id"], "channel": record["channel"]}
+                ],
+            },
+        }
+        payload["checkpoint_sha256"] = server._memory_batch_checkpoint_sha256(payload)
+        checkpoint = checkpoint_dir / "batch_not_a_sha.json"
+        checkpoint.write_text(
+            json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n",
+            encoding="utf-8",
+        )
+
+        with self.assertRaisesRegex(ValueError, "requires a full-SHA"):
+            server._load_memory_entries(problem_id)
+
+        self.assertTrue(checkpoint.is_file())
+
+    def test_unreleased_v1_checkpoint_fails_closed(self) -> None:
+        problem_id = "old-v1-checkpoint"
+        receipt = server.memory_append_batch(
+            problem_id,
+            [{"channel": "proof_steps", "record": {"claim": "v2 winner"}}],
+        )
+        checkpoint = Path(receipt["checkpoint_path"])
+        payload = json.loads(checkpoint.read_text(encoding="utf-8"))
+        payload["schema"] = "rethlas_memory_batch_v1"
+        payload.pop("checkpoint_sha256")
+        checkpoint.write_text(
+            json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n",
+            encoding="utf-8",
+        )
+
+        with self.assertRaisesRegex(ValueError, "invalid envelope"):
+            server._load_memory_entries(problem_id)
+
+    def test_committed_batch_supersedes_legacy_record_as_one_logical_update(
+        self,
+    ) -> None:
+        prior = server.memory_append(
+            "atomic-success",
+            "proof_steps",
+            {"claim": "batchneedle old route"},
+        )
+        batch = server.memory_append_batch(
+            "atomic-success",
+            [
+                {
+                    "channel": "proof_steps",
+                    "record": {"claim": "batchneedle replacement route"},
+                    "supersedes": [prior["record_id"]],
+                }
+            ],
+        )
+
+        current = server.memory_search(
+            "atomic-success",
+            "batchneedle",
+            channels=["proof_steps"],
+            max_chars=LARGE_SEARCH_BUDGET,
+        )
+        current_items = current["results_by_channel"]["proof_steps"]["results"]
+        self.assertEqual(len(current_items), 1)
+        self.assertEqual(
+            current_items[0]["item"]["record_id"], batch["records"][0]["record_id"]
+        )
+
+        history = server.memory_search(
+            "atomic-success",
+            "batchneedle",
+            channels=["proof_steps"],
+            max_chars=LARGE_SEARCH_BUDGET,
+            include_inactive=True,
+        )
+        history_items = history["results_by_channel"]["proof_steps"]["results"]
+        active_by_id = {
+            result["item"]["record_id"]: result["item"]["active"]
+            for result in history_items
+        }
+        self.assertEqual(
+            active_by_id,
+            {prior["record_id"]: False, batch["records"][0]["record_id"]: True},
+        )
+
+    def test_orphan_batch_temp_file_is_not_logically_visible(self) -> None:
+        server.memory_init("orphan-temp")
+        checkpoint_dir = server._batch_checkpoint_dir("orphan-temp")
+        checkpoint_dir.mkdir(parents=True)
+        orphan = checkpoint_dir / ".batch_deadbeef.json.crash.tmp"
+        orphan.write_text('{"record":"must remain invisible"}\n', encoding="utf-8")
+
+        logical = server._load_memory_entries("orphan-temp")
+        self.assertTrue(all(not entries for entries in logical.values()))
+
+    def test_memory_append_batch_validates_every_item_before_writing(self) -> None:
+        with self.assertRaisesRegex(ValueError, r"items\[1\]\.record"):
+            server.memory_append_batch(
+                "invalid-batch",
+                [
+                    {"channel": "proof_steps", "record": {"text": "valid"}},
+                    {"channel": "failed_paths", "record": "not-an-object"},
+                ],
+            )
+        self.assertFalse((server.MEMORY_ROOT / "invalid-batch").exists())
+
+        with self.assertRaisesRegex(ValueError, "strict JSON data"):
+            server.memory_append_batch(
+                "invalid-json",
+                [
+                    {
+                        "channel": "proof_steps",
+                        "record": {"score": float("nan")},
+                    }
+                ],
+            )
+        self.assertFalse((server.MEMORY_ROOT / "invalid-json").exists())
+
+        with self.assertRaisesRegex(ValueError, "at most"):
+            server.memory_append_batch(
+                "too-many",
+                [
+                    {"channel": "events", "record": {"index": index}}
+                    for index in range(server.MAX_MEMORY_BATCH_RECORDS + 1)
+                ],
+            )
+        self.assertFalse((server.MEMORY_ROOT / "too-many").exists())
 
     def test_active_and_supersedes_filter_stale_records(self) -> None:
         first = server.memory_append(
@@ -153,9 +1283,9 @@ class MemoryContextTests(unittest.TestCase):
             channels=["counterexamples"],
             max_chars=LARGE_SEARCH_BUDGET,
         )
-        legacy_item = first_search["results_by_channel"]["counterexamples"][
-            "results"
-        ][0]["item"]
+        legacy_item = first_search["results_by_channel"]["counterexamples"]["results"][
+            0
+        ]["item"]
         legacy_id = legacy_item["record_id"]
         self.assertTrue(legacy_id.startswith("legacy_"))
         self.assertTrue(legacy_item["active"])
@@ -264,7 +1394,9 @@ class MemoryContextTests(unittest.TestCase):
         self.assertEqual(tied_ids, ["equal-new", "equal-old"])
         self.assertAlmostEqual(tied_results[0]["score"], tied_results[1]["score"])
 
-    def test_search_budget_returns_only_whole_records_and_reports_omissions(self) -> None:
+    def test_search_budget_returns_only_whole_records_and_reports_omissions(
+        self,
+    ) -> None:
         for index in range(3):
             server.memory_append(
                 "budget",
@@ -398,14 +1530,10 @@ class MemoryContextTests(unittest.TestCase):
                 expected_listed = min(omitted_count, 2)
                 self.assertEqual(response["omitted_count"], omitted_count)
                 self.assertEqual(len(response["omitted_ids"]), expected_listed)
-                self.assertEqual(
-                    response["omitted_ids_complete"], omitted_count <= 2
-                )
+                self.assertEqual(response["omitted_ids_complete"], omitted_count <= 2)
                 self.assertEqual(channel["omitted_count"], omitted_count)
                 self.assertEqual(len(channel["omitted_ids"]), expected_listed)
-                self.assertEqual(
-                    channel["omitted_ids_complete"], omitted_count <= 2
-                )
+                self.assertEqual(channel["omitted_ids_complete"], omitted_count <= 2)
         finally:
             server.MAX_OMITTED_IDS = original_limit
 

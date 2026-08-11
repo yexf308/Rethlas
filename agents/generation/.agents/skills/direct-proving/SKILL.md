@@ -1,6 +1,6 @@
 ---
 name: direct-proving
-description: Screen a decomposition plan by first trying to prove all of its subgoals directly, then identifying the key stuck points if the plan does not fully go through. Use when a decomposition plan is created.
+description: Carry one selected decomposition plan through in a coherent root reasoning phase, then persist one consolidated outcome. Use after the protected initial attack identifies a primary plan or one fallback, and before adding an adversarial critic or wider parallel work.
 ---
 
 # Direct Proving
@@ -19,7 +19,9 @@ Read:
 
 ## Procedure
 
-1. Take one decomposition plan at a time.
+1. Take the selected primary plan, or its one recorded fallback, in one coherent
+   reasoning phase. Do not interleave another plan, retrieval, memory writes, or
+   collaboration unless a named external knowledge gap is reached.
 2. For each subgoal, actively use the searched results, toy examples, and counterexamples that are most relevant to that subgoal.
 3. When a similar theorem has been found, try to adapt its proof idea, construction, or reduction to the current subgoal instead of treating it as a black-box citation.
 4. If that theorem is only a partial result with extra hypotheses, first analyze why the method needs those hypotheses and where it fails for the current subgoal. Do not skip this by merely trying to prove the current object satisfies the extra hypotheses and applying the partial result directly.
@@ -30,22 +32,30 @@ Read:
    - partially advanced
    - blocked
 8. If a proof adaptation attempt fails, identify why the migration fails. Be concrete: for example, note which hypothesis is missing, which construction does not transfer, which step breaks, which counterexample blocks the migration, or which part of the searched proof depends on structure absent in the current setting.
-9. If a subgoal is blocked or you get stuck while proving it, immediately try `$construct-counterexamples` for that subgoal before moving on. The goal is to test whether the subgoal itself is false, too strong, missing hypotheses, or merely hard.
+9. If a subgoal is blocked, test the claim and its negation locally before
+   changing skills. Invoke `$construct-counterexamples` only when this produces
+   a concrete falsifiability question, not merely because a step is hard.
 10. If all subgoals are solved directly, mark the plan as solved and assemble the proof draft.
+   Enter the candidate fast lane immediately: do not search, spawn, propose a
+   new plan, or wait for unrelated work before writing and verifying the draft.
 11. If the plan does not fully go through, then identify the key stuck points as concretely as possible.
 12. Focus on locating the decisive failure modes of the plan after this first full attempt, not on polishing a full proof.
 
 ## Output Contract
 
-Append one record per attempted subgoal to `proof_steps`:
+Return one consolidated plan record for the root's next
+`memory_append_batch`. Keep per-subgoal results inside that record instead of
+issuing one MCP call per subgoal:
 
 ```json
 {
   "plan_id": "...",
   "attempt_type": "direct",
-  "subgoal": "...",
   "attempt_summary": "...",
   "status": "solved|partial|stuck",
+  "subgoal_results": [
+    {"subgoal": "...", "status": "solved|partial|stuck", "summary": "..."}
+  ],
   "used_examples": ["..."],
   "used_counterexamples": ["..."],
   "key_stuck_points": ["..."],
@@ -56,15 +66,20 @@ Append one record per attempted subgoal to `proof_steps`:
 }
 ```
 
-Update the corresponding decomposition-plan record in `subgoals` to `screening`, `screened`, or `solved`.
+Include the corresponding decomposition-plan state (`screened` or `solved`) in
+the same phase checkpoint. Do not write a transient `screening` state solely to
+mirror execution order.
 
 ## MCP Tools
 
 - `memory_search`
 - `memory_append`
+- `memory_append_batch`
 - `branch_update`
 - `search_arxiv_theorems`
 
 ## Failure Logging
 
-If a decomposition plan does not solve the problem directly after attempting all of its subgoals, append a `failed_paths` record that summarizes the plan-local stuck points and any important proof-migration failures.
+If the plan does not solve the problem after attempting all subgoals, include
+one `failed_paths` summary in the same batch checkpoint. Do not emit a separate
+record for each temporary obstruction.

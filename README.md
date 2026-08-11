@@ -174,13 +174,41 @@ Operational failures found in paid or mock generation runs are recorded in
 their token impact, security classification, remediation, and regression
 evidence.
 
-This script:
+This script uses the machine-readable `rethlas_reasoning_first_v1` contract:
+
+- iteration 0 is search-disabled and begins with a protected root deep-work
+  phase (30 minutes by default as a soft target)
+- transient scratch stays in the active reasoning context; durable conclusions,
+  counterexamples, branch decisions, and failed routes are flushed with one
+  bounded, atomically visible `memory_append_batch` checkpoint at a phase
+  boundary; sequential root-only skills share one pre-critic checkpoint rather
+  than each forcing a model resumption
+- retrieval is allowed only for a named external knowledge gap, with at most
+  two targeted queries for that gap
+- the root remains the primary solver; the first recursive addition is one
+  context-free adversarial critic rather than one agent per speculative plan
+- a complete candidate enters a fast lane that freezes new search, branches,
+  advisor checkpoints, and sub-agent work until assembly and verification
+- an evidence-bound `generation_yield` is the only unfinished state that stops
+  the loop; its per-run control record lives outside the model-writable
+  generation workspace, so a cost/advisor wait cannot silently start another
+  paid turn
+
+The deep-work duration is an instruction-level target, not a claim that the
+runner can measure private model reasoning time. Set it from 10 through 90
+minutes when a problem calls for a different uninterrupted window:
+
+```bash
+RETHLAS_DEEP_WORK_MINUTES=45 ./tests/run_example.sh
+```
+
+The script also:
 
 - reads `agents/generation/data/example.md`
 - runs `codex exec` inside `agents/generation` by default
-- starts a fresh Codex session for each default iteration, alternating search-disabled
-  and search-enabled turns, and resumes only from the current blueprint plus
-  budgeted persisted memory
+- starts a fresh Codex session for each default iteration; the initial and odd
+  turns are search-disabled, while later search-enabled turns treat retrieval
+  as a capability rather than an obligation
 - stops only when the verified file matches a publication receipt written
   outside the generation agent's writable workspace
 - hashes the project MCP/config/agent runtime before and after every iteration;
@@ -247,6 +275,34 @@ interrupt. If Codex reports that a compact/review turn cannot be steered, the
 message is durably deferred and starts after that turn instead of being retried
 in a tight loop.
 
+Morale-only encouragement uses a separate command and source contract. It is
+never an owner message and cannot queue work or authorize any action:
+
+```bash
+# Uses the built-in gentle note.
+python3 agents/hotjoin_adapter.py encourage \
+  --run-id example-live \
+  --client-message-id encourage-0001
+
+# Or supply one bounded note through --text, --file, or --stdin.
+python3 agents/hotjoin_adapter.py encourage \
+  --run-id example-live \
+  --client-message-id encourage-0002 \
+  --text 'Keep going; take the time needed for a careful argument.'
+```
+
+`encourage` is accepted only when the durable run has one authoritative active
+thread and turn. The transaction binds both exact identifiers and a stable
+client id; replay with identical content is idempotent, while changed content
+conflicts. Its delivered body always starts with `NON-AUTHORITATIVE` and states
+that the note is not a task, owner direction, mathematical premise, evidence,
+proof, verdict, publication authority, or permission to change scope. The
+broker may only call `turn/steer` for that exact current turn. No active turn,
+a terminal or replaced turn, or a known RPC rejection becomes terminal
+`failed`; the note is never deferred, requeued, used for `turn/start`, or sent
+to a later turn. An unobservable acknowledgement becomes `delivery_unknown`
+and has no retry surface. Ordinary `send` retains the owner semantics above.
+
 The adapter depends on Codex's **experimental** app-server v2 protocol; it is
 supported only when the installed binary's generated schema passes the exact
 capability preflight. The preflight covers initialization, `model/list`, all
@@ -308,10 +364,22 @@ unknown usage after an adapter interruption. Token receipts separately report
 raw notification count, distinct cumulative-total growth observations, duplicate
 notifications, and the sum of `last` breakdowns for growth observations. Every
 nonduplicate update must be monotone and its cumulative delta must exactly equal
-`last`; malformed usage fails before persistence, while other-thread usage is
-ignored without an audit receipt or counter change. These are observable usage
-semantics, not a claim that app-server schema attests one model inference per
-growth observation.
+`last`; malformed or unavailable root telemetry is excluded from the counters
+and marks the terminal diagnostic partial, but can never block the mathematical
+turn from becoming terminal. Other-thread usage is ignored without an audit
+receipt or counter change. These are observable usage semantics, not a claim
+that app-server schema attests one model inference per growth observation.
+
+For hot-join runs, each terminal audit also contains a content-free
+`rethlas_reasoning_bandwidth_v1` summary for the root thread. It reports exact
+root token fields (including `reasoningOutputTokens` when supplied), safe item
+and operation counts, unioned reasoning/tool/memory/retrieval/wait intervals,
+compactions, and token growth observed after each resume-trigger category.
+Arguments, results, queries, prompts, reasoning text, command output, and child
+thread ids are never stored. Missing optional item lifecycle events make the
+summary `partial` without changing the mathematical turn. Legacy `codex exec`
+runs have no equivalent structured usage feed and must be treated as telemetry
+unavailable, not zero.
 
 ### Recursive sub-agent cost policy
 
@@ -322,6 +390,14 @@ mailbox change, multi-tool spawn/follow-up fanout when supported, and stop gates
 at 16 root orchestration resumptions, 3,000,000 observed orchestration input
 tokens, or four consecutive no-progress timeouts. Long waits still wake early
 when a sub-agent message or completion arrives.
+
+The companion `rethlas_recursive_pair_v1` contract changes the mathematical
+fanout itself. The root solver first receives one adversarial critic using a
+bounded context-free handoff. Sub-agents cannot recursively spawn or stream
+progress into shared memory; the root batch-persists their bounded final
+reports. Wider expansion requires concrete mutually exclusive obligations and
+an explicit cost justification, with at most two live sub-agents. Any complete
+candidate preempts wait-all and moves directly to the verifier.
 
 This control is deliberately scoped. Codex collaboration tools are not routed
 through the hot-join adapter, and app-server token notifications do not identify
@@ -346,6 +422,284 @@ transcript endpoint or a general multi-participant room. Verification still
 launches a fresh, noninteractive verifier session for every adaptive proof-item
 round; human messages cannot enter verifier context, change a verdict, or
 bypass the authenticated manifest and atomic publication receipt.
+
+### Optional owner-authorized Chrome advisor
+
+With hot-join enabled, the repository owner may obtain a bounded second opinion from
+ChatGPT Pro through an already signed-in Chrome session. This path uses no API:
+`agents/advisor_bridge.py` is only a durable owner-side broker, and a separate
+owner-operated task must follow the `query-chatgpt-pro` and Computer Use skills
+to perform the visible browser interaction. Generation, recursive agents, cost
+gates, and the broker never open Chrome or submit automatically.
+
+The broker database is `agents/.rethlas_advisor/jobs.sqlite3`; completion
+commitments and terminal browser-outcome receipts are owner-only JSON files
+under `agents/.rethlas_advisor/receipts/`. The database contains an append-only
+SHA-256 event chain. `complete` durably stores only the answer SHA-256, UTF-8
+byte count, completion evidence, and provenance—not the answer text. A report
+containing plaintext is materialized only by the owner's later explicit
+`import`, after the owner resupplies bytes matching that commitment. It enters
+hot-join only as one bounded `advisor_available` notice with
+`source_kind=advisor`. Ordinary
+`hotjoin_adapter.py send` always has `source_kind=owner` and cannot forge this
+provenance. Advisor delivery is `steer` only: it cannot interrupt, queue a new
+paid turn, or create `turn/start` when no independent reasoning turn is active.
+Import atomically binds the notice to the one authoritative active thread and
+turn. No active turn, a turn ending before delivery, or a thread/turn mismatch
+is a terminal delivery rejection: the notice is never retained for a later
+turn and no app-server steer is attempted.
+
+The minimal complete owner workflow is below. Use exact files so multiline text
+is neither shell-normalized nor exposed in process arguments:
+
+```bash
+cd /path/to/Rethlas
+RUN_ID=example-live
+PROBLEM_ID=example
+REQUEST_ID=adv_11111111111111111111111111111111
+QUESTION_FILE=/tmp/rethlas-advisor-question.txt
+ANSWER_FILE=/tmp/rethlas-advisor-answer.txt
+URL_FILE=/tmp/rethlas-advisor-url.txt
+QUERY_SKILL=$HOME/.codex/skills/query-chatgpt-pro/SKILL.md
+COMPUTER_SKILL=$HOME/.codex/plugins/cache/openai-bundled/computer-use/1.0.1000633/skills/computer-use/SKILL.md
+
+chmod 600 "$QUESTION_FILE"
+QUESTION_SHA=$(shasum -a 256 "$QUESTION_FILE" | awk '{print $1}')
+QUERY_SKILL_SHA=$(shasum -a 256 "$QUERY_SKILL" | awk '{print $1}')
+COMPUTER_SKILL_SHA=$(shasum -a 256 "$COMPUTER_SKILL" | awk '{print $1}')
+
+python3 agents/advisor_bridge.py prepare \
+  --request-id "$REQUEST_ID" --run-id "$RUN_ID" --problem-id "$PROBLEM_ID" \
+  --query-skill-sha256 "$QUERY_SKILL_SHA" \
+  --computer-use-skill-sha256 "$COMPUTER_SKILL_SHA" \
+  --question-file "$QUESTION_FILE"
+python3 agents/advisor_bridge.py authorize \
+  --request-id "$REQUEST_ID" --authorization-id owner-consent-0001 \
+  --question-sha256 "$QUESTION_SHA"
+python3 agents/advisor_bridge.py begin-dispatch --request-id "$REQUEST_ID"
+```
+
+Every later Pro intervention is a new broker request with a new exact question
+and a new owner authorization. It may nevertheless continue in the same
+physical ChatGPT conversation. For a prior Rethlas request, `prepare` verifies
+that the predecessor is `completed` or `imported`, belongs to the same
+`problem_id` and `run_id`, has an intact terminal receipt, and has a durable
+conversation digest. The fresh pre-click call must transiently resupply the
+original URL from a mode-0600 file (or stdin); only its SHA-256 is persisted:
+
+```bash
+FOLLOWUP_ID=adv_22222222222222222222222222222222
+FOLLOWUP_FILE=/tmp/rethlas-advisor-followup.txt
+FOLLOWUP_SHA=$(shasum -a 256 "$FOLLOWUP_FILE" | awk '{print $1}')
+python3 agents/advisor_bridge.py prepare \
+  --request-id "$FOLLOWUP_ID" --run-id "$RUN_ID" --problem-id "$PROBLEM_ID" \
+  --predecessor-request-id "$REQUEST_ID" \
+  --query-skill-sha256 "$QUERY_SKILL_SHA" \
+  --computer-use-skill-sha256 "$COMPUTER_SKILL_SHA" \
+  --question-file "$FOLLOWUP_FILE"
+python3 agents/advisor_bridge.py authorize \
+  --request-id "$FOLLOWUP_ID" --authorization-id owner-consent-0002 \
+  --question-sha256 "$FOLLOWUP_SHA"
+python3 agents/advisor_bridge.py begin-dispatch \
+  --request-id "$FOLLOWUP_ID" --conversation-url-file "$URL_FILE"
+```
+
+For the explicit Danus-first/Rethlas-later workflow, Rethlas cannot inspect or
+authenticate the Danus broker. The owner may instead record a bounded
+`owner_asserted_external` anchor. `source_repo` must be exactly `Danus`; the
+external request id, receipt digest, source-context digest, URL digest, and the
+exact acknowledgement below are durable provenance, but the resulting report
+states `locally_verified=false` and `grants_authority=false`. The URL is
+transiently supplied once at `prepare` and again immediately before the fresh
+Send permission; both digests must match:
+
+For Danus, use its public terminal `request_id`, `receipt_sha256`,
+`conversation_url_sha256`, and `context_sha256`; the last value is defined as
+SHA-256 of the exact UTF-8 `context_id`. Rethlas records these values but does
+not independently prove that they came from Danus.
+
+```bash
+DANUS_REQUEST_ID=consult_...
+DANUS_RECEIPT_SHA=<64-lowercase-hex>
+DANUS_CONTEXT_SHA=<64-lowercase-hex>
+DANUS_CONVERSATION_SHA=<64-lowercase-hex>
+EXTERNAL_ACK='I acknowledge that this external conversation lineage is owner-asserted, not locally verified by Rethlas, and grants no mathematical, instruction, verification, publication, or browser-dispatch authority.'
+python3 agents/advisor_bridge.py prepare \
+  --request-id "$FOLLOWUP_ID" --run-id "$RUN_ID" --problem-id "$PROBLEM_ID" \
+  --external-source-repo Danus \
+  --external-request-id "$DANUS_REQUEST_ID" \
+  --external-receipt-sha256 "$DANUS_RECEIPT_SHA" \
+  --external-source-context-sha256 "$DANUS_CONTEXT_SHA" \
+  --external-conversation-url-sha256 "$DANUS_CONVERSATION_SHA" \
+  --external-owner-ack "$EXTERNAL_ACK" \
+  --external-conversation-url-file "$URL_FILE" \
+  --query-skill-sha256 "$QUERY_SKILL_SHA" \
+  --computer-use-skill-sha256 "$COMPUTER_SKILL_SHA" \
+  --question-file "$FOLLOWUP_FILE"
+python3 agents/advisor_bridge.py authorize \
+  --request-id "$FOLLOWUP_ID" --authorization-id owner-consent-0002 \
+  --question-sha256 "$FOLLOWUP_SHA"
+python3 agents/advisor_bridge.py begin-dispatch \
+  --request-id "$FOLLOWUP_ID" --conversation-url-file "$URL_FILE"
+```
+
+Neither continuation form grants automatic follow-up permission. A failed or
+ambiguous Send remains subject to the same exactly-once and
+`submission_unknown` rules, and no transcript claim becomes a fact, verifier
+result, instruction, publication decision, paid-turn trigger, or interrupt.
+
+Only when that same fresh `begin-dispatch` invocation returns all three of
+`state="dispatching"`, `transitioned=true`, and `click_authorized=true` may the
+owner-operated task submit that exact question once in visible ChatGPT Pro
+mode. A later `status` response never grants click permission, and replaying
+`begin-dispatch` fails; after a lost response, do not call it again or infer
+permission from `state="dispatching"`. Copy the
+resulting conversation URL and the completed answer into the files above, with
+no trailing newline unless it was visibly part of the text. Record the visible
+full question, visible `Pro` mode, conversation, and two stable answer snapshots:
+
+```bash
+chmod 600 "$ANSWER_FILE" "$URL_FILE"
+ANSWER_SHA=$(shasum -a 256 "$ANSWER_FILE" | awk '{print $1}')
+python3 agents/advisor_bridge.py submitted \
+  --request-id "$REQUEST_ID" --ui-mode Pro \
+  --conversation-url-file "$URL_FILE" \
+  --observed-question-file "$QUESTION_FILE"
+python3 agents/advisor_bridge.py complete \
+  --request-id "$REQUEST_ID" --answer-file "$ANSWER_FILE" \
+  --answer-snapshot-a-sha256 "$ANSWER_SHA" \
+  --answer-snapshot-b-sha256 "$ANSWER_SHA" --ui-mode Pro \
+  --response-actions-present --composer-available --working-indicators-absent
+python3 agents/advisor_bridge.py import \
+  --request-id "$REQUEST_ID" --answer-file "$ANSWER_FILE" \
+  --hotjoin-db agents/.rethlas_hotjoin/messages.sqlite3 --mode steer
+python3 agents/advisor_bridge.py status --request-id "$REQUEST_ID"
+python3 agents/advisor_bridge.py verify-ledger
+```
+
+Keep `$ANSWER_FILE` only in the stopped owner-side browser task, import it
+before resuming generation, then remove that temporary plaintext. The broker
+itself never persists answer text before import. If the owner task crashes
+after `complete` but before `import`, reopen the same recorded ChatGPT
+conversation, re-observe the stable response, and supply those exact bytes to
+`import`; a mismatching response fails closed.
+
+The raw conversation URL is persisted only as `conversation_url_sha256`;
+receipts and status never expose the URL. Every conversation-URL input at
+external `prepare`, `begin-dispatch`, `submitted`, `recover-submitted`, and
+`submission-unknown` deliberately has only owner-only file/stdin forms, so the
+URL cannot appear in process arguments. Other bounded text inputs accept an
+explicit argument, file, or stdin where applicable. `status.receipt_sha256` is the immutable
+terminal commitment digest that an owner workflow binds before releasing its
+global Chrome lease. After explicit import,
+`status.report_receipt_sha256` is the separate digest announced in the
+hot-join notice and required by `advisor_report_get`. Both receipts deliberately
+record `model=null`, `usage=null`, `cost=null`, and
+`billing_basis=subscription`; visible UI does not provide API-style usage.
+
+The browser boundary is exactly-once. After a possible Send click, any crash,
+timeout, or disconnect becomes `submission_unknown` and is never dispatched
+again. If the crash happened before a conversation URL was observable, omit
+all `--conversation-url*` options; status and the unknown-abandon receipt
+honestly retain `conversation_url_sha256=null`. Reconcile only after finding
+the exact question in a visible conversation; that later validated URL becomes
+the binding when no earlier digest existed:
+
+```bash
+python3 agents/advisor_bridge.py submission-unknown \
+  --request-id "$REQUEST_ID" --reason 'browser outcome and URL were not observable'
+python3 agents/advisor_bridge.py recover-submitted \
+  --request-id "$REQUEST_ID" --ui-mode Pro \
+  --conversation-url-file "$URL_FILE" \
+  --observed-question-file "$QUESTION_FILE"
+```
+
+If Send was positively never clicked—including an attempted CAS that remains
+`authorized`—record the narrow terminal receipt with
+`failed-not-submitted --send-not-clicked-confirmed`. Never use it for an
+ambiguous click. If the owner instead abandons a `submission_unknown` job, the
+exact acknowledgement below produces an
+`owner_abandoned_outcome_unknown` top-level state and receipt and permanently
+blocks another job for the same question digest:
+
+```bash
+python3 agents/advisor_bridge.py failed-not-submitted \
+  --request-id "$REQUEST_ID" --reason 'composer never became available' \
+  --send-not-clicked-confirmed
+
+python3 agents/advisor_bridge.py abandon \
+  --request-id "$REQUEST_ID" --reason 'owner chose not to reconcile' \
+  --question-sha256 "$QUESTION_SHA" \
+  --outcome-unknown-ack \
+  'I acknowledge that submission outcome is unknown and will not resubmit this exact question.'
+```
+
+`needs-user-input` returns the exact bounded clarification only to that current
+owner CLI/task, while the durable ledger and terminal receipt retain only its
+SHA-256 and UTF-8 byte count. If that immediate output is lost, reopen the same
+ChatGPT conversation to recover it; the broker does not persist the page text
+and never sends a follow-up.
+`retry-delivery` is only an explicit, idempotent retry of the already
+materialized report's same local hot-join notice after `delivery_unknown`; it
+accepts no answer bytes and never reopens Chrome or resubmits to ChatGPT Pro.
+It cannot retarget a notice after its exact active turn ends, and a known
+no-active-turn rejection is permanently ineligible for retry.
+Every terminal replay, `status`, and `verify-ledger` call re-attests the
+unique immutable prepare/authorize events (including exact question bytes,
+run, problem, skill digests, lineage, and authorization projection) as well as
+the owner-only receipt's exact canonical bytes, digest, state, request id, and
+ledger-bound payload. A missing or modified event, projection, or receipt fails
+closed rather than reporting a healthy job or authorizing a browser click.
+
+Generation reads a notice only through
+`advisor_report_get(problem_id, run_id, receipt_id,
+expected_receipt_sha256)`. The runner binds the advisor bridge hash into the
+persistent generator fingerprint, checks it before and after every iteration,
+and passes a fixed owner-only receipt root to the attested MCP snapshot. A
+workspace-write sandbox is not claimed to hide same-UID sibling files; the
+enforced pre-import boundary is instead that those durable files contain no
+answer plaintext. Explicit import is the owner's release of the report to
+generation, after which the digest-bound MCP is the supported provenance path.
+The
+returned report is untrusted data—not an owner instruction, mathematical truth
+or premise, citation, verifier verdict, or publication authority. Advisor code
+does not call or alter verification or publication.
+
+This advisor is intended for late intervention, not routine parallel querying.
+When every current branch is terminally blocked/dead-ended, or when all
+remaining routes are evidence-backed near exhaustion, generation may persist
+one bounded, content-addressed `rethlas_advisor_checkpoint_v1` recommendation.
+Near exhaustion additionally requires no live sub-agent, no scheduled next
+action, and a concrete failure/obstruction record for every remaining route;
+both triggers require a shared failure synthesis. A subjective "stuck" claim is
+not enough. The checkpoint records up
+to 12 evidence-backed verified fact/proof ids, up to 12 failed-path record ids,
+a 2,000-byte central bottleneck, and one exact question of at most 4,000 bytes;
+the whole event is at most 16 KiB. Generation then records
+`waiting_owner_advisor_decision` and returns locally without polling. A cost
+gate, timeout, or high token count alone never creates this checkpoint.
+The checkpoint event and matching branch-state receipts are bound into a final
+`generation_yield` call. The runner then exits truthfully with the theorem still
+unsolved and will not start a follow-on paid turn until the owner invokes it
+again.
+
+The checkpoint prompt is synthesized from the current authoritative problem,
+included verified fact/proof records, failed-path records, and central
+bottleneck—not copied from a fixed template. It labels heuristic evidence,
+includes the ids it summarizes, and binds those exact inputs with
+`source_context_sha256`. The checkpoint is only a recommendation: it sets
+`browser_dispatch_authorized=false` and `advisor_request_id=null`, and cannot
+call `prepare`, acquire the Chrome lease, or click Send. The owner may ignore or
+edit it and must separately authorize every exact Pro question through the
+broker. When a report returns, the root first records a review of accepted and
+rejected suggestions against the checkpoint's facts/proof ids and failed paths,
+then synthesizes a new branch. The report remains untrusted throughout.
+If later evidence justifies a second consultation, the root synthesizes a new
+checkpoint from the accepted/rejected prior suggestions, work completed since
+the prior report, current verified evidence and failures, and the new
+bottleneck. It then stops again in `waiting_owner_advisor_decision`. The owner
+must create a new request id and authorize the new exact question; continuing
+the bound ChatGPT conversation is optional and never automatic.
 
 ## Lazy proof verification
 

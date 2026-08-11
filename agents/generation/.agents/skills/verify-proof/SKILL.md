@@ -27,8 +27,9 @@ Read:
    bound source digest.
 4. Read `verification_report.summary`, `critical_errors`, `gaps`, `verdict`,
    `repair_hints`, `checked_item_ids`, both digests, and `published`.
-5. Persist the complete MCP publication envelope without renaming or dropping
-   fields. It contains the six-field HTTP verification result plus
+5. Persist the complete MCP publication envelope at this terminal phase
+   boundary with one `memory_append_batch` record in `verification_reports`,
+   without renaming or dropping fields. It contains the six-field HTTP verification result plus
    `published`; successful publication also includes `published_path` and
    `publication_receipt_path`.
 6. Treat the proof as failed if any of the following hold:
@@ -71,16 +72,26 @@ the values bound to the current blueprint.
 
 Persist the verification service response exactly as returned.
 
-If verification fails, revise `blueprint.md` directly and append to `failed_paths` when a branch is invalidated.
+If verification fails, revise `blueprint.md` directly. Include any branch
+invalidation in the same phase-boundary batch under `failed_paths`; do not emit
+one memory write per verifier field.
+
+The candidate fast lane permits no retrieval by default. Leave it only when a
+concrete verifier defect identifies a named missing lemma or external knowledge
+gap whose answer is necessary for repair. In that case use
+`$search-math-results` under its two-query budget, then return to coherent
+reasoning. A generic failed verdict, elapsed time, or uncertainty is not such a
+gap.
 
 ## MCP Tools
 
 - `verify_blueprint_service`
-- `memory_append`
-- `memory_search`
+- `memory_append_batch`
+- `memory_search` only for one bounded missing-state rehydration
 - `branch_update`
-- Codex built-in web search and `search_arxiv_theorems` when the verifier identifies a missing lemma or gap
+- `$search-math-results` only for a verifier-identified named knowledge gap
 
 ## Failure Logging
 
-Always persist verification output, including successful checks.
+Always persist verification output, including successful checks, in the one
+phase-boundary batch.

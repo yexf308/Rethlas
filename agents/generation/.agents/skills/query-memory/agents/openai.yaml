@@ -1,7 +1,7 @@
 interface:
   display_name: "Query Memory"
-  short_description: "Search prior local reasoning artifacts"
-  default_prompt: "Use $query-memory to retrieve previously saved immediate conclusions, toy examples, counterexamples, failed paths, or branch states from memory."
+  short_description: "Rehydrate only the memory needed now"
+  default_prompt: "Use $query-memory to retrieve one bounded slice of durable memory for the current proof decision."
 
 policy:
   allow_implicit_invocation: true

@@ -71,6 +71,10 @@ def _make_runner_tree(tmp_path: Path) -> tuple[Path, Path]:
     shutil.copy2(RUNNER, tests_dir / "run_example.sh")
     shutil.copy2(GENERATION_ROOT / "AGENTS.md", generation / "AGENTS.md")
     shutil.copy2(
+        GENERATION_ROOT.parent / "advisor_bridge.py",
+        generation.parent / "advisor_bridge.py",
+    )
+    shutil.copy2(
         GENERATION_ROOT / "requirements-math-research.txt",
         generation / "requirements-math-research.txt",
     )
@@ -125,12 +129,12 @@ assert shell_policy == {
     },
 }
 safe_path = shell_policy["set"]["PATH"]
-assert shutil.which("python", path=safe_path) == str(
+assert pathlib.Path(shutil.which("python", path=safe_path)).resolve() == (
     pathlib.Path(sys.executable).parent / "python"
-)
-assert shutil.which("python3", path=safe_path) == str(
+).resolve()
+assert pathlib.Path(shutil.which("python3", path=safe_path)).resolve() == (
     pathlib.Path(sys.executable).parent / "python3"
-)
+).resolve()
 (pathlib.Path.cwd() / "shell_environment_policy_seen.json").write_text(
     json.dumps(shell_policy), encoding="utf-8"
 )
@@ -146,6 +150,13 @@ assert reasoning_mcp_configs[0].startswith("mcp_servers.reasoning_agent=")
 reasoning_mcp = tomllib.loads(
     "value=" + reasoning_mcp_configs[0].split("=", 1)[1]
 )["value"]
+if os.environ.get("MOCK_EXPECT_NO_ADVISOR_ENV"):
+    for name in (
+        "RETHLAS_ADVISOR_RECEIPTS_ROOT",
+        "RETHLAS_EXPECTED_HOTJOIN_RUN_ID",
+    ):
+        assert name not in os.environ
+        assert name not in reasoning_mcp["env"]
 assert set(reasoning_mcp) == {
     "command",
     "args",
@@ -179,6 +190,43 @@ if os.environ.get("MOCK_EXPECT_VERIFY_API_TOKEN"):
     assert os.environ["VERIFY_API_TOKEN"] == os.environ["MOCK_EXPECT_VERIFY_API_TOKEN"]
 root = pathlib.Path.cwd()
 problem_id = os.environ["RETHLAS_EXPECTED_PROBLEM_ID"]
+generation_control_state = os.environ.get("MOCK_GENERATION_CONTROL_STATE")
+if generation_control_state:
+    assert generation_control_state in {
+        "waiting_cost_gate",
+        "waiting_owner_advisor_decision",
+    }
+    snapshot_mcp = pathlib.Path(reasoning_mcp["args"][1]).resolve().parent
+    sys.path.insert(0, str(snapshot_mcp))
+    import server as trusted_generation_server
+
+    if generation_control_state == "waiting_cost_gate":
+        event_payload = {
+            "event_type": "recursive_proving_round",
+            "status": generation_control_state,
+        }
+    else:
+        event_payload = {
+            "event_type": "advisor_checkpoint",
+            "status": generation_control_state,
+            "owner_action_required": True,
+            "browser_dispatch_authorized": False,
+            "advisor_request_id": None,
+        }
+    event_receipt = trusted_generation_server.memory_append(
+        problem_id, "events", event_payload
+    )
+    branch_receipt = trusted_generation_server.branch_update(
+        problem_id,
+        "mock-control-branch",
+        {"status": generation_control_state},
+    )
+    trusted_generation_server.generation_yield(
+        problem_id,
+        generation_control_state,
+        "mock evidence-backed unfinished yield",
+        [event_receipt["record_id"], branch_receipt["record_id"]],
+    )
 verified = root / "results" / problem_id / "blueprint_verified.md"
 verified.parent.mkdir(parents=True, exist_ok=True)
 proof = b"mock verified proof"
@@ -301,6 +349,182 @@ def test_runner_accepts_mock_atomic_publication_receipt(tmp_path: Path) -> None:
     completed = _run_mock(tmp_path, mode="trusted")
     assert completed.returncode == 0, completed.stdout + completed.stderr
     assert "Solved problem_id=example" in completed.stdout
+
+
+def test_runner_prompts_enforce_reasoning_first_phase_sequence(tmp_path: Path) -> None:
+    runner, fake_bin = _make_runner_tree(tmp_path)
+    calls_file = tmp_path / "codex-calls.jsonl"
+    environment = _mock_environment(
+        runner,
+        fake_bin,
+        mode="forged",
+        extra_environment={
+            "MAX_ITERATIONS": "3",
+            "RETHLAS_DEEP_WORK_MINUTES": "90",
+            "MOCK_CODEX_CALLS_FILE": str(calls_file),
+        },
+    )
+
+    completed = subprocess.run(
+        [str(runner)],
+        cwd=runner.parent.parent,
+        env=environment,
+        text=True,
+        capture_output=True,
+        timeout=20,
+        check=False,
+    )
+
+    assert completed.returncode == 1
+    calls = [json.loads(line) for line in calls_file.read_text().splitlines()]
+    exec_calls = [call for call in calls if "exec" in call]
+    assert len(exec_calls) == 3
+    prompts = [call[-1] for call in exec_calls]
+    assert all("reasoning_contract=rethlas_reasoning_first_v1" in p for p in prompts)
+    assert "protected root deep-work phase" in prompts[0]
+    assert "at least 90 minutes" in prompts[0]
+    assert "do not initialize or write memory" in prompts[0]
+    assert "primary plan plus at most one materially different fallback" in prompts[0]
+    assert "single pre-critic write-behind checkpoint" in prompts[0]
+    assert "at most one bounded memory_search" in prompts[1]
+    assert "Do not use arXiv theorem search or web search" in prompts[1]
+    assert "capabilities, not obligations" in prompts[2]
+    assert "one named external knowledge gap" in prompts[2]
+    assert all("candidate fast lane" in prompt for prompt in prompts)
+
+    web_modes = []
+    for call in exec_calls:
+        config_values = [
+            call[index + 1]
+            for index, value in enumerate(call[:-1])
+            if value == "--config" and call[index + 1].startswith("web_search=")
+        ]
+        assert len(config_values) == 1
+        web_modes.append(config_values[0])
+    assert web_modes == [
+        'web_search="disabled"',
+        'web_search="disabled"',
+        'web_search="live"',
+    ]
+
+
+@pytest.mark.parametrize(
+    "waiting_state",
+    ("waiting_cost_gate", "waiting_owner_advisor_decision"),
+)
+def test_runner_stops_before_a_second_paid_turn_for_durable_legal_yield(
+    tmp_path: Path, waiting_state: str
+) -> None:
+    runner, fake_bin = _make_runner_tree(tmp_path)
+    calls_file = tmp_path / "codex-calls.jsonl"
+    environment = _mock_environment(
+        runner,
+        fake_bin,
+        mode="forged",
+        extra_environment={
+            "MAX_ITERATIONS": "2",
+            "MOCK_CODEX_CALLS_FILE": str(calls_file),
+            "MOCK_GENERATION_CONTROL_STATE": waiting_state,
+        },
+    )
+
+    completed = subprocess.run(
+        [str(runner)],
+        cwd=runner.parent.parent,
+        env=environment,
+        text=True,
+        capture_output=True,
+        timeout=20,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    calls = [json.loads(line) for line in calls_file.read_text().splitlines()]
+    assert len([call for call in calls if "exec" in call]) == 1
+    assert not (Path(environment["LOG_DIR"]) / "example_iter_1.md").exists()
+    assert f"state={waiting_state}" in completed.stdout
+    assert "owner action is required before another paid turn" in completed.stdout
+    assert "The theorem remains unsolved" in completed.stdout
+    assert "Solved problem_id=" not in completed.stdout
+
+
+def test_runner_ordinary_unfinished_turn_still_advances_to_iteration_limit(
+    tmp_path: Path,
+) -> None:
+    runner, fake_bin = _make_runner_tree(tmp_path)
+    calls_file = tmp_path / "codex-calls.jsonl"
+    environment = _mock_environment(
+        runner,
+        fake_bin,
+        mode="forged",
+        extra_environment={
+            "MAX_ITERATIONS": "2",
+            "MOCK_CODEX_CALLS_FILE": str(calls_file),
+        },
+    )
+
+    completed = subprocess.run(
+        [str(runner)],
+        cwd=runner.parent.parent,
+        env=environment,
+        text=True,
+        capture_output=True,
+        timeout=20,
+        check=False,
+    )
+
+    assert completed.returncode == 1
+    calls = [json.loads(line) for line in calls_file.read_text().splitlines()]
+    assert len([call for call in calls if "exec" in call]) == 2
+    assert (Path(environment["LOG_DIR"]) / "example_iter_1.md").exists()
+    assert "Reached MAX_ITERATIONS=2" in completed.stderr
+
+
+@pytest.mark.parametrize("invalid_minutes", ("0", "9", "91", "thirty"))
+def test_runner_rejects_invalid_deep_work_window_before_codex(
+    tmp_path: Path,
+    invalid_minutes: str,
+) -> None:
+    runner, fake_bin = _make_runner_tree(tmp_path)
+    calls_file = tmp_path / "codex-calls.jsonl"
+    environment = _mock_environment(
+        runner,
+        fake_bin,
+        mode="forged",
+        extra_environment={
+            "RETHLAS_DEEP_WORK_MINUTES": invalid_minutes,
+            "MOCK_CODEX_CALLS_FILE": str(calls_file),
+        },
+    )
+
+    completed = subprocess.run(
+        [str(runner)],
+        cwd=runner.parent.parent,
+        env=environment,
+        text=True,
+        capture_output=True,
+        timeout=20,
+        check=False,
+    )
+
+    assert completed.returncode == 1
+    assert "RETHLAS_DEEP_WORK_MINUTES" in completed.stderr
+    assert not calls_file.exists()
+
+
+def test_legacy_runner_drops_inherited_advisor_and_hotjoin_bindings(
+    tmp_path: Path,
+) -> None:
+    completed = _run_mock(
+        tmp_path,
+        mode="trusted",
+        extra_environment={
+            "MOCK_EXPECT_NO_ADVISOR_ENV": "1",
+            "RETHLAS_ADVISOR_RECEIPTS_ROOT": "/tmp/inherited-advisor-root",
+            "RETHLAS_EXPECTED_HOTJOIN_RUN_ID": "stale-owner-run",
+        },
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
 
 
 def test_runner_injects_complete_mcp_and_auto_approves_memory_tools(

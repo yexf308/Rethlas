@@ -1,17 +1,21 @@
 ---
 name: search-math-results
-description: Find relevant math results, constructions, examples, counterexamples, and background references for a statement. Use when you need context for a new problem, supporting references for constructing examples or counterexamples, or external results while proving subgoals.
+description: Resolve one named external knowledge gap that blocks an active proof route. Use only after a coherent local reasoning pass has identified a specific missing theorem, construction, counterexample, definition, or attribution whose answer could materially advance or kill that route.
 ---
 
 # Search Math Results
 
-Use this skill as the default retrieval workflow for mathematical background and related results.
+Use this skill as a bounded exception to independent reasoning, not as the
+default opening move or a general background sweep. Do not invoke it during the
+protected deep-work phase or after the candidate fast lane begins.
 
 ## Input Contract
 
 Read:
 
 - the current target statement, subgoal, lemma, or claim
+- one explicit `named_knowledge_gap`
+- the route-changing decision that the answer would enable
 - the search intent:
   - `theorem`
   - `construction`
@@ -22,22 +26,25 @@ Read:
 
 ## Procedure
 
-1. Start with `search_arxiv_theorems`.
-2. When using `search_arxiv_theorems`, phrase the query as a complete mathematical statement whenever possible.
-3. Inspect the returned items and decide whether they are useful for the current need.
-4. If a useful theorem/example/counterexample is found and it comes from a paper, download that paper into the workspace, extract its text, and read the extracted text before relying on the result.
-5. If a useful theorem is found, do not stop at the statement alone. Read the proof of that theorem as well and extract any techniques, constructions, reductions, or proof patterns that may help with the current target statement.
-6. Expand the definitions and concepts appearing in that theorem using the surrounding context of the paper, and check carefully whether the theorem is actually applicable to the current situation. Be explicit about terminology that may shift across contexts.
-7. If the theorem is only a partial result for the current problem, analyze why its method does not immediately prove the full target statement. If it assumes extra hypotheses, do not merely try to force the current object to satisfy them; instead record why those hypotheses are used, where the proof breaks without them, and what obstruction or difficulty this reveals.
-8. Keep all downloaded PDFs and extracted text files inside `downloads/` in the current working directory.
-9. Record not only what the theorem says, but also what its proof suggests for the current problem.
-10. If the theorem search returns no useful information, switch to Codex's built-in web search.
-11. Use the built-in web search either to look for specific math results or to gather background information, terminology, standard references, and canonical constructions/examples/counterexamples.
-12. If the built-in web search reveals a useful paper, again download it, extract its text, and read the relevant extracted text before using it in reasoning.
-13. If the built-in web search reveals a useful theorem, also read its proof, expand its local definitions from the paper context, and extract the techniques that look adaptable to the current statement.
-14. If the built-in web search reveals only a partial result, perform the same partial-result analysis: extra hypotheses, why the method needs them, why the method does not solve the full current problem, and what real difficulty is exposed.
-15. Summarize the most useful findings and explain why they matter for the current proof state.
-16. If a result may later be used in a proof, preserve its full statement and source identifiers so downstream proof steps can cite it explicitly.
+1. State the named gap and why resolving it could change the active route. If
+   that cannot be stated precisely, return to independent reasoning without a
+   search call.
+2. Start with one `search_arxiv_theorems` query.
+3. Phrase the query as a complete mathematical statement whenever possible,
+   inspect the results, and stop as soon as the named gap is resolved or the
+   active route is killed.
+4. If the theorem query is not useful, use at most one built-in web-search
+   query for the same named gap. Do not broaden it into a survey. The total
+   query budget for one gap is two.
+5. Download a paper only when one identified result is likely to resolve the
+   named gap. Keep the PDF and extracted text inside `downloads/`, read the
+   relevant proof and definitions, and verify applicability before relying on
+   it.
+6. If the result is partial, identify the extra hypotheses, where the proof
+   fails without them, and whether that failure advances or kills the route.
+7. Return immediately to a coherent reasoning phase. Summarize only findings
+   that change the proof state; preserve the complete statement and source ids
+   if the result may enter the proof.
 
 ## Usefulness Test
 
@@ -48,15 +55,21 @@ Treat theorem-search results as useful only if they do at least one of the follo
 - suggest a standard technique or reformulation relevant to the current branch
 - expose a meaningful obstruction or extra hypothesis in a partial result that clarifies why the full problem is harder
 
-If the results are vague, off-topic, or too weak to guide the next step, fall back to the built-in web search.
+If the first results are vague, off-topic, or too weak, use the one permitted
+fallback query. If that also fails, close the named gap as unresolved and stop
+retrieval for this phase.
 
 ## Output Contract
 
-Append a summary record to `events`:
+Return this compact record to the root for inclusion in the next
+`memory_append_batch` phase checkpoint:
 
 ```json
 {
   "event_type": "search_math_results",
+  "named_knowledge_gap": "...",
+  "route_changing_decision": "...",
+  "query_count": 1,
   "query": "...",
   "search_intent": "theorem|construction|example|counterexample|background",
   "primary_tool": "search_arxiv_theorems",
@@ -92,7 +105,8 @@ Append a summary record to `events`:
 
 ## Failure Logging
 
-If neither theorem search nor web search yields useful information, append an `events` record with:
+If neither bounded query yields useful information, return an event payload
+for the next phase checkpoint with:
 
 - `event_type="search_math_results_stalled"`
 - the attempted queries

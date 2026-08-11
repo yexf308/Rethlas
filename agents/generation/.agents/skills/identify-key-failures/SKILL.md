@@ -1,6 +1,6 @@
 ---
 name: identify-key-failures
-description: Synthesize the common stuck points across failed decomposition plans and recursive sub-agent reports. Use when the current batch of decomposition plans has failed.
+description: Compress a blocked root attempt and adversarial-critic report into one reusable failure synthesis. Use before any wider recursive expansion, a new plan generation, or an evidence-triggered Pro recommendation.
 ---
 
 # Identify Key Failures
@@ -19,19 +19,24 @@ Read:
 
 ## Procedure
 
-1. Gather the reports from all failed plans and sub-agents.
+1. Gather the protected root-attempt record, primary/fallback plan outcomes, and
+   the first adversarial-critic report. Include later selected obligations only
+   when they actually ran.
 2. List the key stuck points for each plan.
 3. Identify common points across those failures:
    - recurring obstructions or counterexamples
    - decomposition patterns that keep breaking
    - search gaps or missing background facts
 4. Summarize what the failures suggest for the next generation of decomposition plans.
-5. Save the synthesized failure knowledge to `failed_paths` so later planning skills can use it.
-6. After recording the failure synthesis, return control to `$propose-subgoal-decomposition-plans`.
+5. Return one synthesized `failed_paths` item for the root's next
+   `memory_append_batch` checkpoint.
+6. Decide among three next states: one genuinely new plan mechanism, an
+   evidence-triggered owner Pro checkpoint, or a truthful non-success yield.
+   Do not automatically generate another plan set.
 
 ## Output Contract
 
-Append to `failed_paths`:
+Return for `failed_paths`:
 
 ```json
 {
@@ -48,14 +53,19 @@ Append to `failed_paths`:
 }
 ```
 
-Also append an `events` record indicating that a new planning round is needed.
+Include a next-state event in the same batch only when a concrete next action
+has been selected.
 
 ## MCP Tools
 
 - `memory_search`
 - `memory_append`
+- `memory_append_batch`
 - `branch_update`
 
 ## Failure Logging
 
-If the reports are too weak to identify meaningful common failures, append an `events` record with `event_type="key_failures_inconclusive"` and state what information is still missing.
+If the reports are too weak to identify meaningful common failures, return an
+`events` payload with `event_type="key_failures_inconclusive"` and state what
+information is still missing. Do not expand or request Pro until the evidence
+gap is closed.
