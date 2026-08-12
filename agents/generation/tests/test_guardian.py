@@ -1539,6 +1539,34 @@ def test_normal_rc_zero_requires_empty_group_and_durable_finalize() -> None:
 
 
 @pytest.mark.skipif(os.name != "posix", reason="requires POSIX process groups")
+def test_known_nonzero_worker_rc_is_still_an_exact_completed_terminal() -> None:
+    now_wall = time.time()
+    now_mono = time.monotonic()
+    callbacks = RecordingCallbacks(
+        projection(
+            start=now_wall - 1,
+            projected_wall=now_wall,
+            projected_monotonic=now_mono,
+            boot=SystemProcessInspector().boot_identity(),
+        )
+    )
+    read_fd, write_fd = os.pipe()
+    try:
+        report = Guardian(callbacks).run(
+            [sys.executable, "-c", "raise SystemExit(70)"],
+            **guardian_kwargs(read_fd),
+        )
+        assert report.state == "completed"
+        assert report.direct_returncode == 70
+        assert report.reason == "paid_group_empty"
+        assert report.forced is False
+        assert callbacks.finalized == [report]
+    finally:
+        os.close(read_fd)
+        os.close(write_fd)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="requires POSIX process groups")
 def test_lost_finalize_reply_replays_exact_same_marker() -> None:
     inspector = SystemProcessInspector()
     now_wall = time.time()

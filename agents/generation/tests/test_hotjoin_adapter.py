@@ -18,6 +18,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Callable, Mapping
+from unittest import mock
 
 import pytest
 
@@ -1270,21 +1271,14 @@ def _arm_same_cycle_guardian_for_runner_admission(
     )
 
 
-def _admit_test_runner_identity(
+def _test_runner_admission_topology(
     ledger: hotjoin.ConversationLedger,
     *,
     registration_id: str,
-    runner_token: str,
-) -> dict[str, Any]:
+) -> tuple[str, _GuardianIdentity, _GuardianIdentity]:
     runtime_command_sha256 = hashlib.sha256(
         registration_id.encode("utf-8")
     ).hexdigest()
-    current_identity = _GuardianIdentity(
-        pid=os.getpid(),
-        uid=os.getuid(),
-        pgid=os.getpgrp(),
-        start_marker=f"pytest-runner:{registration_id}",
-    )
     with ledger._connect() as connection:
         connection.execute("BEGIN IMMEDIATE")
         registration = connection.execute(
@@ -1302,7 +1296,6 @@ def _admit_test_runner_identity(
         launch_payload["launch_manifest"] = {
             "worker_runtime_command_sha256": runtime_command_sha256
         }
-        identity = current_identity.as_dict()
         connection.execute(
             "UPDATE guardian_launch_intents SET payload_json = ? "
             "WHERE launch_intent_sha256 = ?",
@@ -1311,26 +1304,47 @@ def _admit_test_runner_identity(
                 registration["launch_intent_sha256"],
             ),
         )
-        connection.execute(
-            "UPDATE guardian_registrations SET leader_pid = ?, leader_uid = ?, "
-            "leader_pgid = ?, leader_start_marker = ? WHERE registration_id = ?",
-            (
-                identity["pid"],
-                identity["uid"],
-                identity["pgid"],
-                identity["start_marker"],
-                registration_id,
-            ),
+        leader_identity = _GuardianIdentity(
+            pid=int(registration["leader_pid"]),
+            uid=int(registration["leader_uid"]),
+            pgid=int(registration["leader_pgid"]),
+            start_marker=str(registration["leader_start_marker"]),
+        )
+        current_identity = _GuardianIdentity(
+            pid=os.getpid(),
+            uid=os.getuid(),
+            pgid=int(registration["leader_pgid"]),
+            start_marker=f"pytest-runner:{registration_id}",
         )
         boot_identity = str(registration["boot_identity"])
         connection.commit()
-    _, _, receipt = ledger.released_runner_admission(
-        "run-1",
-        runner_token=runner_token,
-        inspector=_GuardianInspector(
-            boot_identity=boot_identity, identities=[current_identity]
-        ),
+    return boot_identity, leader_identity, current_identity
+
+
+def _admit_test_runner_identity(
+    ledger: hotjoin.ConversationLedger,
+    *,
+    registration_id: str,
+    runner_token: str,
+) -> dict[str, Any]:
+    boot_identity, leader_identity, current_identity = (
+        _test_runner_admission_topology(
+            ledger,
+            registration_id=registration_id,
+        )
     )
+    with mock.patch.object(
+        hotjoin.os, "getpgrp", return_value=leader_identity.pgid
+    ):
+        _, _, receipt = ledger.released_runner_admission(
+            "run-1",
+            runner_token=runner_token,
+            inspector=_GuardianInspector(
+                boot_identity=boot_identity,
+                identities=[leader_identity, current_identity],
+                descendants={leader_identity.pid: [current_identity]},
+            ),
+        )
     return receipt
 
 
@@ -12363,6 +12377,64 @@ def test_guardian_status_terminal_report_precedes_execution_unknown_disposition(
     assert status["terminal_report"] == report
 
 
+def test_guardian_finalize_persists_known_nonzero_worker_terminal_as_blocked(
+    ledger: hotjoin.ConversationLedger,
+) -> None:
+    registered = _arm_initial_guardian(
+        ledger, wall_epoch=1_000.0, monotonic_epoch=2_000.0
+    )
+    ack = registered["registration_ack"]
+    inspector = _GuardianInspector(boot_identity="boot-test-1", identities=[])
+    report = {
+        "registration_id": ack["registration_id"],
+        "request_sha256": ack["request_sha256"],
+        "state": "completed",
+        "reason": "paid_group_empty",
+        "forced": False,
+        "direct_returncode": 70,
+        "stopped_pgids": [],
+        "killed_pgids": [],
+        "already_empty_pgids": [10_101],
+    }
+    terminal = ledger.finalize_guardian(
+        "run-1",
+        report=report,
+        report_sha256=hashlib.sha256(
+            hotjoin._canonical_json(report).encode("utf-8")
+        ).hexdigest(),
+        guardian_token="4" * 64,
+        inspector=inspector,
+        wall_epoch=1_001.0,
+        monotonic_epoch=2_001.0,
+    )
+    assert terminal["state"] == "completed"
+    status = ledger.guardian_status(
+        "run-1",
+        watchdog_id="watchdog-initial",
+        auth_kind="owner",
+        raw_token="9" * 64,
+        owner_fence=ledger.review_control_fence("run-1", "9" * 64),
+        inspector=inspector,
+        wall_epoch=1_001.0,
+        monotonic_epoch=2_001.0,
+    )
+    assert status["disposition"] == "guardian_terminal"
+    assert status["terminal_report"] == report
+    with ledger._connect() as connection:
+        cycle = connection.execute(
+            "SELECT * FROM cadence_cycles WHERE run_id = ?",
+            ("run-1",),
+        ).fetchone()
+        assert cycle is not None
+        assert cycle["state"] == "operational_blocked"
+        assert cycle["allowed_action"] == "close_only"
+        assert not ledger._guardian_terminal_clean_txn(
+            connection,
+            cycle_id=str(cycle["cycle_id"]),
+            inspector=inspector,
+        )
+
+
 def test_guardian_clock_digest_binds_action_deadlines_and_offline_stop_rejects_tamper(
     ledger: hotjoin.ConversationLedger,
 ) -> None:
@@ -16882,7 +16954,7 @@ You may use local read-only shell/Python for the `q=7` arithmetic. Do not use th
     private_adapter.write_text(private_source, encoding="utf-8")
     private_adapter_sha256 = hashlib.sha256(private_adapter.read_bytes()).hexdigest()
     assert private_adapter_sha256 == (
-        "50e20aa97b0c9dc5d0ed295a0e0712112ed267f01636b6a8cef2d91620da56ea"
+        "21464f016f590a9c43f2891e5d23c332035357322241d544d7b802a077f951df"
     )
 
     monkeypatch.setattr(hotjoin, "__file__", str(private_adapter))
@@ -17055,6 +17127,443 @@ def test_released_runner_admission_accepts_blank_or_valid_initial_seed(
         ).fetchone()[0]
     assert (seed["state"] if seed is not None else None) == seed_state
     assert admitted == 1
+    assert receipt["root_pid"] != receipt["worker_pid"]
+    assert receipt["root_pgid"] == receipt["worker_pgid"]
+    assert receipt["root_uid"] == receipt["worker_uid"]
+    assert receipt["schema_version"] == "rethlas_released_runner_admission_v2"
+    assert set(receipt) == {
+        "admitted_at_utc",
+        "admitted_monotonic",
+        "admitted_sequence",
+        "admitted_wall_epoch",
+        "boot_identity",
+        "capability_revision",
+        "cycle_generation",
+        "cycle_id",
+        "launch_intent_sha256",
+        "launch_manifest_sha256",
+        "receipt_sha256",
+        "registration_id",
+        "request_sha256",
+        "root_pgid",
+        "root_pid",
+        "root_start_marker",
+        "root_uid",
+        "run_id",
+        "schema_version",
+        "worker_pgid",
+        "worker_pid",
+        "worker_runtime_command_sha256",
+        "worker_start_marker",
+        "worker_uid",
+    }
+    receipt_material = dict(receipt)
+    del receipt_material["receipt_sha256"]
+    assert receipt["receipt_sha256"] == hashlib.sha256(
+        hotjoin._canonical_json(receipt_material).encode("utf-8")
+    ).hexdigest()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="requires POSIX process groups")
+def test_released_runner_admission_accepts_real_blocked_worker(
+    ledger: hotjoin.ConversationLedger,
+    tmp_path: Path,
+) -> None:
+    from agents.generation import guardian
+
+    repo = Path(hotjoin.__file__).resolve().parents[1]
+    result_path = tmp_path / "real-runner-admission.json"
+    runner_token = "5" * 64
+    guardian_token = "4" * 64
+    token_read, token_write = os.pipe()
+    os.write(token_write, runner_token.encode("ascii"))
+    os.close(token_write)
+    worker_source = r'''
+import json
+import os
+import sys
+from pathlib import Path
+
+sys.path.insert(0, sys.argv[1])
+from agents import hotjoin_adapter as hotjoin
+from agents.generation.guardian import SystemProcessInspector
+
+descriptor = int(sys.argv[3])
+parts = []
+remaining = 64
+while remaining:
+    chunk = os.read(descriptor, remaining)
+    if not chunk:
+        raise SystemExit(126)
+    parts.append(chunk)
+    remaining -= len(chunk)
+if os.read(descriptor, 1):
+    raise SystemExit(126)
+os.close(descriptor)
+raw_token = b"".join(parts).decode("ascii")
+_, _, receipt = hotjoin.ConversationLedger(Path(sys.argv[2])).released_runner_admission(
+    "run-1",
+    runner_token=raw_token,
+    inspector=SystemProcessInspector(),
+)
+Path(sys.argv[4]).write_text(
+    json.dumps(
+        {
+            "pid": os.getpid(),
+            "ppid": os.getppid(),
+            "pgid": os.getpgrp(),
+            "receipt": receipt,
+        },
+        sort_keys=True,
+    ),
+    encoding="utf-8",
+)
+'''
+    command = [
+        sys.executable,
+        "-I",
+        "-B",
+        "-c",
+        worker_source,
+        str(repo),
+        str(ledger.path),
+        str(token_read),
+        str(result_path),
+    ]
+    inspector = guardian.SystemProcessInspector()
+    daemon = subprocess.Popen(
+        [sys.executable, "-I", "-B", "-c", "import time; time.sleep(30)"],
+        env={},
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    group = guardian.BlockedProcessGroup.spawn(
+        command,
+        env={},
+        pass_fds=(token_read,),
+        inspector=inspector,
+    )
+    retired = False
+    try:
+        leader = inspector.identity(group.leader_pid)
+        daemon_identity = inspector.identity(daemon.pid)
+        assert leader is not None and leader.pid == leader.pgid
+        assert daemon_identity is not None
+        assert daemon_identity.pid == daemon_identity.pgid
+        owner_token = _bind_continuation_capability(
+            ledger,
+            guardian_process_inspector=inspector,
+        )
+        fence = ledger.review_control_fence("run-1", owner_token)
+        boot_identity = inspector.boot_identity()
+        now_wall = time.time()
+        now_monotonic = time.monotonic()
+        watchdog_id = "watchdog-real-runner-topology"
+        cycle_id = hotjoin._guardian_cycle_id(
+            run_id="run-1",
+            generation=1,
+            watchdog_id=watchdog_id,
+        )
+        prepared = ledger.prepare_guardian_launch(
+            "run-1",
+            payload={
+                "run_id": "run-1",
+                "watchdog_id": watchdog_id,
+                "generation_control_instance_id": "1" * 32,
+                "admission_mode": "initial_new_cycle",
+                "expected_cycle_id": cycle_id,
+                "expected_generation": 1,
+                "expected_clock_sha256": None,
+                "policy_digest": hotjoin.REVIEW_CADENCE_POLICY_SHA256,
+                "command_sha256": group.command_sha256,
+                "launch_manifest_sha256": "2" * 64,
+                "guardian_sha256": hotjoin.APPROVED_GUARDIAN_SHA256,
+                "guardian_token_sha256": hashlib.sha256(
+                    guardian_token.encode("ascii")
+                ).hexdigest(),
+                "runner_token_sha256": hashlib.sha256(
+                    runner_token.encode("ascii")
+                ).hexdigest(),
+                "capability_revision": fence.capability_revision,
+                "boot_identity": boot_identity,
+                "registration_not_after_wall_epoch": now_wall + 20.0,
+                "registration_not_after_monotonic": now_monotonic + 20.0,
+            },
+            control_fence=fence,
+            inspector=inspector,
+            wall_epoch=now_wall,
+            monotonic_epoch=now_monotonic,
+            test_allow_unreleased_guardian=True,
+        )
+        registered = ledger.register_guardian(
+            "run-1",
+            launch_intent_sha256=prepared["launch_intent_sha256"],
+            daemon_identity=daemon_identity.as_dict(),
+            request={
+                "run_id": "run-1",
+                "generation_control_instance_id": "1" * 32,
+                "watchdog_id": watchdog_id,
+                "root_group": {"role": "root", "identity": leader.as_dict()},
+                "owner_uid": os.getuid(),
+                "policy_digest": hotjoin.REVIEW_CADENCE_POLICY_SHA256,
+                "boot_identity": boot_identity,
+                "command_sha256": group.command_sha256,
+                "lifeline_attached": True,
+            },
+            guardian_token=guardian_token,
+            inspector=inspector,
+            wall_epoch=now_wall,
+            monotonic_epoch=now_monotonic,
+            test_allow_unreleased_guardian=True,
+        )
+        assert registered["registration_ack"]["release_authorized"] is True
+
+        # The bypass launch intentionally omits the complete release manifest;
+        # add only the exact runtime-command digest consumed by this admission.
+        with ledger._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT payload_json FROM guardian_launch_intents "
+                "WHERE launch_intent_sha256 = ?",
+                (prepared["launch_intent_sha256"],),
+            ).fetchone()
+            assert row is not None
+            payload = json.loads(str(row["payload_json"]))
+            payload["launch_manifest"] = {
+                "worker_runtime_command_sha256": group.command_sha256
+            }
+            connection.execute(
+                "UPDATE guardian_launch_intents SET payload_json = ? "
+                "WHERE launch_intent_sha256 = ?",
+                (
+                    hotjoin._canonical_json(payload),
+                    prepared["launch_intent_sha256"],
+                ),
+            )
+            connection.commit()
+
+        group.release()
+        deadline = time.monotonic() + 5.0
+        while group.worker_returncode is None and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert group.worker_returncode == 0
+        observed = json.loads(result_path.read_text(encoding="utf-8"))
+        receipt = observed["receipt"]
+        assert observed["pid"] != group.leader_pid
+        assert observed["ppid"] == group.leader_pid
+        assert observed["pgid"] == leader.pgid
+        assert receipt["schema_version"] == "rethlas_released_runner_admission_v2"
+        assert receipt["root_pid"] == group.leader_pid
+        assert receipt["worker_pid"] == observed["pid"]
+        assert receipt["root_pgid"] == receipt["worker_pgid"] == leader.pgid
+        assert sum(
+            event["kind"] == "released_runner_admitted"
+            for event in ledger.events("run-1")
+        ) == 1
+        assert group.retire_after_empty(inspector) == 0
+        assert group.reap() == 0
+        retired = True
+    finally:
+        if not retired:
+            group.close_without_release()
+            try:
+                os.killpg(group.leader_pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            group.reap(timeout=1.0)
+        group.close()
+        try:
+            os.killpg(daemon.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        daemon.wait(timeout=5.0)
+
+
+@pytest.mark.parametrize(
+    "failure_mode",
+    [
+        "missing_ancestry",
+        "moving_ancestry",
+        "moving_leader_identity",
+        "moving_worker_identity",
+        "wrong_worker_pgid",
+        "wrong_worker_uid",
+        "reused_leader",
+    ],
+)
+def test_released_runner_admission_rejects_inexact_worker_topology(
+    ledger: hotjoin.ConversationLedger,
+    failure_mode: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registered = _arm_initial_guardian(
+        ledger, wall_epoch=1_000.0, monotonic_epoch=2_000.0
+    )
+    registration_id = registered["registration_ack"]["registration_id"]
+    boot_identity, leader, worker = _test_runner_admission_topology(
+        ledger,
+        registration_id=registration_id,
+    )
+    observed_leader = leader
+    observed_worker = worker
+    descendants = {leader.pid: [worker]}
+    if failure_mode == "missing_ancestry":
+        descendants = {}
+    elif failure_mode == "wrong_worker_pgid":
+        observed_worker = _GuardianIdentity(
+            pid=worker.pid,
+            uid=worker.uid,
+            pgid=leader.pgid + 1,
+            start_marker=worker.start_marker,
+        )
+        descendants = {leader.pid: [observed_worker]}
+    elif failure_mode == "wrong_worker_uid":
+        observed_worker = _GuardianIdentity(
+            pid=worker.pid,
+            uid=worker.uid + 1,
+            pgid=worker.pgid,
+            start_marker=worker.start_marker,
+        )
+        descendants = {leader.pid: [observed_worker]}
+    elif failure_mode == "reused_leader":
+        observed_leader = _GuardianIdentity(
+            pid=leader.pid,
+            uid=leader.uid,
+            pgid=leader.pgid,
+            start_marker="reused-root-marker",
+        )
+
+    if failure_mode == "moving_ancestry":
+
+        class _MovingRunnerInspector(_GuardianInspector):
+            def __init__(self) -> None:
+                super().__init__(
+                    boot_identity=boot_identity,
+                    identities=[observed_leader, observed_worker],
+                )
+                self.calls = 0
+
+            def descendants(self, pid: int) -> tuple[_GuardianIdentity, ...]:
+                self.calls += 1
+                return (observed_worker,) if self.calls == 1 else ()
+
+        inspector: _GuardianInspector = _MovingRunnerInspector()
+    elif failure_mode == "moving_leader_identity":
+
+        class _MovingLeaderInspector(_GuardianInspector):
+            def __init__(self) -> None:
+                super().__init__(
+                    boot_identity=boot_identity,
+                    identities=[observed_leader, observed_worker],
+                    descendants={observed_leader.pid: [observed_worker]},
+                )
+                self.leader_identity_calls = 0
+
+            def identity(self, pid: int) -> _GuardianIdentity | None:
+                if pid == observed_leader.pid:
+                    self.leader_identity_calls += 1
+                    if self.leader_identity_calls >= 3:
+                        return _GuardianIdentity(
+                            pid=observed_leader.pid,
+                            uid=observed_leader.uid,
+                            pgid=observed_leader.pgid,
+                            start_marker="replacement-root-marker",
+                        )
+                return super().identity(pid)
+
+        inspector = _MovingLeaderInspector()
+    elif failure_mode == "moving_worker_identity":
+
+        class _MovingWorkerInspector(_GuardianInspector):
+            def __init__(self) -> None:
+                super().__init__(
+                    boot_identity=boot_identity,
+                    identities=[observed_leader, observed_worker],
+                    descendants={observed_leader.pid: [observed_worker]},
+                )
+                self.worker_identity_calls = 0
+
+            def identity(self, pid: int) -> _GuardianIdentity | None:
+                if pid == observed_worker.pid:
+                    self.worker_identity_calls += 1
+                    if self.worker_identity_calls >= 3:
+                        return _GuardianIdentity(
+                            pid=observed_worker.pid,
+                            uid=observed_worker.uid,
+                            pgid=observed_worker.pgid,
+                            start_marker="replacement-worker-marker",
+                        )
+                return super().identity(pid)
+
+        inspector = _MovingWorkerInspector()
+    else:
+        inspector = _GuardianInspector(
+            boot_identity=boot_identity,
+            identities=[observed_leader, observed_worker],
+            descendants=descendants,
+        )
+    event_count = len(ledger.events("run-1"))
+    monkeypatch.setattr(hotjoin.os, "getpgrp", lambda: leader.pgid)
+    with pytest.raises(
+        hotjoin.HotJoinError,
+        match="outside its exact guarded root group",
+    ):
+        ledger.released_runner_admission(
+            "run-1",
+            runner_token="5" * 64,
+            inspector=inspector,
+        )
+    assert len(ledger.events("run-1")) == event_count
+    assert not any(
+        event["kind"] == "released_runner_admitted"
+        for event in ledger.events("run-1")
+    )
+
+
+def test_released_runner_admission_rejects_another_descendant_replay(
+    ledger: hotjoin.ConversationLedger,
+) -> None:
+    registered = _arm_initial_guardian(
+        ledger, wall_epoch=1_000.0, monotonic_epoch=2_000.0
+    )
+    registration_id = registered["registration_ack"]["registration_id"]
+    first_receipt = _admit_test_runner_identity(
+        ledger,
+        registration_id=registration_id,
+        runner_token="5" * 64,
+    )
+    boot_identity, leader, _first_worker = _test_runner_admission_topology(
+        ledger,
+        registration_id=registration_id,
+    )
+    second_worker = _GuardianIdentity(
+        pid=first_receipt["worker_pid"] + 100_000,
+        uid=leader.uid,
+        pgid=leader.pgid,
+        start_marker="second-guarded-descendant",
+    )
+    inspector = _GuardianInspector(
+        boot_identity=boot_identity,
+        identities=[leader, second_worker],
+        descendants={leader.pid: [second_worker]},
+    )
+    event_count = len(ledger.events("run-1"))
+    with (
+        mock.patch.object(hotjoin.os, "getpid", return_value=second_worker.pid),
+        mock.patch.object(hotjoin.os, "getpgrp", return_value=leader.pgid),
+        pytest.raises(
+            hotjoin.HotJoinError,
+            match="belongs to another root identity",
+        ),
+    ):
+        ledger.released_runner_admission(
+            "run-1",
+            runner_token="5" * 64,
+            inspector=inspector,
+        )
+    assert len(ledger.events("run-1")) == event_count
 
 
 def test_released_runner_admission_is_unique_per_sequential_guardian_root(

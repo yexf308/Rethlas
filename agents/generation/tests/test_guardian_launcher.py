@@ -655,6 +655,71 @@ def test_opaque_zero_codex_guardian_launch_uses_only_fifo_capabilities(
     assert all(entry["token_visible_in_ancestor_ps"] is False for entry in calls)
 
 
+def test_known_nonzero_worker_exit_is_durable_without_offline_recovery(
+    tmp_path: Path,
+) -> None:
+    contract, contract_sha256, policy_sha256 = _policy_contract()
+    generation = tmp_path / "agents" / "generation"
+    data = generation / "data"
+    data.mkdir(parents=True)
+    problem = data / "opaque-probe.md"
+    problem.write_text("Known nonzero Guardian terminal probe.\n", encoding="utf-8")
+    adapter = tmp_path / "agents" / "hotjoin_adapter.py"
+    adapter.write_text(
+        _FAKE_ADAPTER.replace("__CONTRACT__", repr(contract)), encoding="utf-8"
+    )
+    database = tmp_path / "guardian-state.json"
+    owner_token = hashlib.sha256(b"known-nonzero-owner").hexdigest()
+    database.write_text(
+        _canonical(
+            {
+                "owner_token_sha256": hashlib.sha256(
+                    owner_token.encode("ascii")
+                ).hexdigest()
+            }
+        ),
+        encoding="utf-8",
+    )
+    completed = _invoke_launcher(
+        generation=generation,
+        problem=problem,
+        adapter=adapter,
+        database=database,
+        owner_token=owner_token,
+        run_id="run-known-nonzero",
+        watchdog_id="watchdog-known-nonzero",
+        contract_sha256=contract_sha256,
+        policy_sha256=policy_sha256,
+        worker_mode="opaque_guarded_command",
+        worker_command=[
+            "/usr/bin/python3",
+            "-I",
+            "-B",
+            "-c",
+            "raise SystemExit(70)",
+        ],
+    )
+
+    assert completed.returncode == 70, completed.stdout + completed.stderr
+    result = json.loads(completed.stdout)
+    assert result["state"] == "completed"
+    assert result["report"]["state"] == "completed"
+    assert result["report"]["direct_returncode"] == 70
+    assert result["report"]["forced"] is False
+    assert result["report"]["reason"] == "paid_group_empty"
+    assert result["offline_finalize"] is None
+    state = json.loads(database.read_text(encoding="utf-8"))
+    assert state["terminal_report"] == result["report"]
+    calls = [
+        json.loads(line)["command"]
+        for line in database.with_suffix(".calls.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ]
+    assert calls.count("guardian-finalize") == 1
+    assert "guardian-offline-stop" not in calls
+
+
 def test_durable_terminal_report_wins_finalize_reply_and_status_state_race(
     tmp_path: Path,
 ) -> None:

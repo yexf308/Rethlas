@@ -14149,7 +14149,7 @@ class ConversationLedger:
             if state == "completed":
                 valid_terminal = bool(
                     report["forced"] is False
-                    and report["direct_returncode"] == 0
+                    and report["direct_returncode"] is not None
                     and not arrays["stopped_pgids"]
                     and not arrays["killed_pgids"]
                     and registered_pgids <= set(arrays["already_empty_pgids"])
@@ -14243,7 +14243,9 @@ class ConversationLedger:
                 sequence=sequence,
                 reason=f"guardian_{state}",
             )
-            if state == "execution_unknown":
+            if state == "execution_unknown" or (
+                state == "completed" and report["direct_returncode"] != 0
+            ):
                 connection.execute(
                     "UPDATE cadence_cycles SET state = 'operational_blocked', "
                     "allowed_action = 'close_only', updated_sequence = ? "
@@ -19601,23 +19603,54 @@ class ConversationLedger:
             if registration is None or launch is None or cycle is None:
                 raise HotJoinError("released runner lost its exact guardian admission")
             current_pid = os.getpid()
-            leader = inspector.identity(int(registration["leader_pid"]))
-            current_identity = inspector.identity(current_pid)
-            leader_exact = bool(
-                leader is not None
-                and current_identity is not None
-                and int(leader.pid) == int(registration["leader_pid"])
-                and int(leader.uid) == int(registration["leader_uid"])
-                and int(leader.pgid) == int(registration["leader_pgid"])
-                and str(leader.start_marker) == registration["leader_start_marker"]
-                and int(current_identity.pid) == int(registration["leader_pid"])
-                and int(current_identity.uid) == int(registration["leader_uid"])
-                and int(current_identity.pgid) == int(registration["leader_pgid"])
-                and str(current_identity.start_marker)
-                == registration["leader_start_marker"]
-            )
+            expected_leader = {
+                "pid": int(registration["leader_pid"]),
+                "uid": int(registration["leader_uid"]),
+                "pgid": int(registration["leader_pgid"]),
+                "start_marker": str(registration["leader_start_marker"]),
+            }
             current_uid = os.getuid() if hasattr(os, "getuid") else 0
             current_pgid = os.getpgrp() if hasattr(os, "getpgrp") else os.getpid()
+
+            def prove_runner_topology() -> tuple[dict[str, Any], dict[str, Any]]:
+                leader_before = inspector.identity(expected_leader["pid"])
+                current_before = inspector.identity(current_pid)
+                if leader_before is None or current_before is None:
+                    raise HotJoinError(
+                        "released run-generator is outside its exact guarded root group"
+                    )
+                leader_projection = leader_before.as_dict()
+                current_projection = current_before.as_dict()
+                descendants = tuple(inspector.descendants(expected_leader["pid"]))
+                leader_after = inspector.identity(expected_leader["pid"])
+                current_after = inspector.identity(current_pid)
+                if (
+                    leader_projection != expected_leader
+                    or leader_after is None
+                    or leader_after.as_dict() != leader_projection
+                    or expected_leader["pid"] != expected_leader["pgid"]
+                    or current_after is None
+                    or current_after.as_dict() != current_projection
+                    or int(current_projection["pid"]) != current_pid
+                    or current_pid == expected_leader["pid"]
+                    or int(current_projection["uid"]) != expected_leader["uid"]
+                    or int(current_projection["pgid"]) != expected_leader["pgid"]
+                    or current_uid != int(run["owner_uid"])
+                    or current_uid != int(registration["owner_uid"])
+                    or current_uid != expected_leader["uid"]
+                    or current_pgid != expected_leader["pgid"]
+                    or not any(
+                        descendant.as_dict() == current_projection
+                        for descendant in descendants
+                    )
+                ):
+                    raise HotJoinError(
+                        "released run-generator is outside its exact guarded root group"
+                    )
+                return leader_projection, current_projection
+
+            topology_before = prove_runner_topology()
+            current_projection = topology_before[1]
             observed_boot_identity = inspector.boot_identity()
             initial_exact = bool(
                 registration["admission_mode"] != "initial_new_cycle"
@@ -19639,11 +19672,7 @@ class ConversationLedger:
                 )
             )
             if (
-                not leader_exact
-                or current_uid != int(registration["owner_uid"])
-                or current_uid != int(registration["leader_uid"])
-                or current_pgid != int(registration["leader_pgid"])
-                or observed_boot_identity != registration["boot_identity"]
+                observed_boot_identity != registration["boot_identity"]
                 or registration["state"] not in {"active", "interrupting"}
                 or launch["state"] not in {"active", "armed"}
                 or launch["capabilities_state"] != "active"
@@ -19694,6 +19723,10 @@ class ConversationLedger:
                 "root_start_marker": registration["leader_start_marker"],
                 "root_uid": int(registration["leader_uid"]),
                 "run_id": run_id,
+                "worker_pgid": int(current_projection["pgid"]),
+                "worker_pid": int(current_projection["pid"]),
+                "worker_start_marker": str(current_projection["start_marker"]),
+                "worker_uid": int(current_projection["uid"]),
                 "worker_runtime_command_sha256": runtime_command_sha256,
             }
             event: sqlite3.Row | None = None
@@ -19778,7 +19811,7 @@ class ConversationLedger:
                 assert event is not None
             assert event_payload is not None
             receipt_material = {
-                "schema_version": "rethlas_released_runner_admission_v1",
+                "schema_version": "rethlas_released_runner_admission_v2",
                 **identity_material,
                 "admitted_sequence": int(event["sequence"]),
                 "admitted_at_utc": event["created_at_utc"],
@@ -19791,6 +19824,14 @@ class ConversationLedger:
                     _canonical_json(receipt_material).encode("utf-8")
                 ).hexdigest(),
             }
+            topology_after = prove_runner_topology()
+            if (
+                topology_after != topology_before
+                or inspector.boot_identity() != observed_boot_identity
+            ):
+                raise HotJoinError(
+                    "released run-generator topology changed before admission commit"
+                )
             connection.commit()
         return fence, dict(registration), receipt
 
