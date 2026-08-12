@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import py_compile
+import selectors
 import shutil
 import sqlite3
 import subprocess
@@ -28,6 +29,275 @@ REQUIRED_MODULES = (
     "mpmath",
     "gmpy2",
 )
+
+TRUSTED_MCP_LOGICAL_MODULES = (
+    "review.contracts",
+    "review.critic",
+    "mcp.proof_context",
+    "mcp.advisor_client",
+    "mcp.review_client",
+    "mcp.verification_client",
+    "mcp.server",
+)
+
+
+def _trusted_mcp_loader_source() -> str:
+    runner_source = RUNNER.read_text(encoding="utf-8")
+    opening = "TRUSTED_MCP_SECURE_LOADER=\"$(cat <<'PY'\n"
+    start = runner_source.index(opening) + len(opening)
+    end = runner_source.index("\nPY\n)\"", start)
+    return runner_source[start:end]
+
+
+def _trusted_mcp_snapshot(tmp_path: Path) -> tuple[Path, list[str]]:
+    snapshot = tmp_path / "trusted-runtime"
+    arguments: list[str] = []
+    for logical_name in TRUSTED_MCP_LOGICAL_MODULES:
+        relative = Path(*logical_name.split(".")).with_suffix(".py")
+        source = (
+            GENERATION_ROOT.parent / relative
+            if logical_name.startswith("review.")
+            else GENERATION_ROOT / relative
+        )
+        target = snapshot / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(source.read_bytes())
+        target.chmod(0o400)
+        arguments.extend(
+            [
+                logical_name,
+                str(target),
+                hashlib.sha256(target.read_bytes()).hexdigest(),
+            ]
+        )
+    return snapshot, arguments
+
+
+def _mcp_stdio_probe(
+    command: list[str],
+    *,
+    cwd: Path,
+    generation_root: Path,
+    python_executable: Path,
+) -> subprocess.CompletedProcess[str]:
+    home = cwd / "home"
+    home.mkdir(exist_ok=True)
+    initialize = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2025-11-25",
+            "capabilities": {},
+            "clientInfo": {"name": "rethlas-zero-model-probe", "version": "1"},
+        },
+    }
+    initialized = {
+        "jsonrpc": "2.0",
+        "method": "notifications/initialized",
+        "params": {},
+    }
+    tools_list = {
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "tools/list",
+        "params": {},
+    }
+    process = subprocess.Popen(
+        command,
+        cwd=cwd,
+        env={
+            "HOME": str(home),
+            "LANG": "C.UTF-8",
+            "LC_ALL": "C.UTF-8",
+            "PATH": f"{python_executable.parent}:/usr/bin:/bin",
+            "PYTHONDONTWRITEBYTECODE": "1",
+            "RETHLAS_GENERATION_ROOT": str(generation_root),
+        },
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        bufsize=1,
+    )
+    assert process.stdin is not None
+    assert process.stdout is not None
+    selector = selectors.DefaultSelector()
+    selector.register(process.stdout, selectors.EVENT_READ)
+    output_lines: list[str] = []
+    try:
+        process.stdin.write(json.dumps(initialize, separators=(",", ":")) + "\n")
+        process.stdin.flush()
+        if not selector.select(timeout=20):
+            raise AssertionError("timed out waiting for MCP initialize response")
+        first_line = process.stdout.readline()
+        output_lines.append(first_line)
+        if not first_line:
+            process.stdin.close()
+            process.stdin = None
+            stdout_tail, stderr = process.communicate(timeout=20)
+            output_lines.append(stdout_tail)
+            return subprocess.CompletedProcess(
+                command,
+                process.returncode,
+                "".join(output_lines),
+                stderr,
+            )
+
+        for request in (initialized, tools_list):
+            process.stdin.write(json.dumps(request, separators=(",", ":")) + "\n")
+        process.stdin.flush()
+        if not selector.select(timeout=20):
+            raise AssertionError("timed out waiting for MCP tools/list response")
+        output_lines.append(process.stdout.readline())
+
+        process.stdin.close()
+        process.stdin = None
+        stdout_tail, stderr = process.communicate(timeout=20)
+        output_lines.append(stdout_tail)
+    except BaseException:
+        process.kill()
+        process.wait(timeout=5)
+        raise
+    finally:
+        selector.close()
+    return subprocess.CompletedProcess(
+        command,
+        process.returncode,
+        "".join(output_lines),
+        stderr,
+    )
+
+
+def _real_mcp_python() -> Path:
+    configured = os.environ.get("RETHLAS_TEST_MCP_PYTHON")
+    executable = (
+        Path(configured).resolve(strict=True) if configured else Path(sys.executable)
+    )
+    probe = subprocess.run(
+        [
+            str(executable),
+            "-I",
+            "-B",
+            "-c",
+            "from fastmcp import FastMCP; import mcp.types",
+        ],
+        text=True,
+        capture_output=True,
+        check=False,
+        timeout=10,
+    )
+    if probe.returncode != 0:
+        if configured:
+            pytest.fail(
+                "RETHLAS_TEST_MCP_PYTHON lacks the real FastMCP/MCP SDK: "
+                + probe.stderr
+            )
+        pytest.skip("real FastMCP/MCP SDK unavailable; set RETHLAS_TEST_MCP_PYTHON")
+    return executable
+
+
+@pytest.mark.parametrize("entry", ["secure-loader", "direct-snapshot"])
+def test_trusted_reasoning_mcp_completes_real_stdio_handshake(
+    tmp_path: Path,
+    entry: str,
+) -> None:
+    mcp_python = _real_mcp_python()
+    snapshot, module_arguments = _trusted_mcp_snapshot(tmp_path)
+    generation_root = tmp_path / "generation"
+    generation_root.mkdir()
+    command = (
+        [
+            str(mcp_python),
+            "-I",
+            "-B",
+            "-c",
+            _trusted_mcp_loader_source(),
+            *module_arguments,
+        ]
+        if entry == "secure-loader"
+        else [str(mcp_python), "-I", "-B", str(snapshot / "mcp" / "server.py")]
+    )
+
+    completed = _mcp_stdio_probe(
+        command,
+        cwd=generation_root,
+        generation_root=generation_root,
+        python_executable=mcp_python,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    responses = [json.loads(line) for line in completed.stdout.splitlines()]
+    assert [item["id"] for item in responses] == [1, 2]
+    assert responses[0]["result"]["serverInfo"]["name"] == "reasoning-agent"
+    tools = responses[1]["result"]["tools"]
+    assert {item["name"] for item in tools} >= {
+        "memory_search",
+        "context_handoff_get",
+        "route_review_status",
+    }
+
+
+def test_trusted_reasoning_mcp_loader_rejects_changed_module_before_stdio(
+    tmp_path: Path,
+) -> None:
+    snapshot, module_arguments = _trusted_mcp_snapshot(tmp_path)
+    server_path = snapshot / "mcp" / "server.py"
+    server_path.chmod(0o600)
+    server_path.write_bytes(b"# changed after commitment\n")
+    server_path.chmod(0o400)
+    generation_root = tmp_path / "generation"
+    generation_root.mkdir()
+
+    completed = _mcp_stdio_probe(
+        [
+            sys.executable,
+            "-I",
+            "-B",
+            "-c",
+            _trusted_mcp_loader_source(),
+            *module_arguments,
+        ],
+        cwd=generation_root,
+        generation_root=generation_root,
+        python_executable=Path(sys.executable),
+    )
+
+    assert completed.returncode == 70
+    assert "module SHA-256 mismatch" in completed.stderr
+    assert completed.stdout == ""
+
+
+def test_trusted_reasoning_mcp_loader_rejects_preloaded_private_alias(
+    tmp_path: Path,
+) -> None:
+    snapshot, module_arguments = _trusted_mcp_snapshot(tmp_path)
+    generation_root = tmp_path / "generation"
+    generation_root.mkdir()
+    loader_source = (
+        "import sys, types\n"
+        "sys.modules['_rethlas_generation_mcp'] = "
+        "types.ModuleType('_rethlas_generation_mcp')\n"
+        + _trusted_mcp_loader_source()
+    )
+
+    completed = _mcp_stdio_probe(
+        [
+            sys.executable,
+            "-I",
+            "-B",
+            "-c",
+            loader_source,
+            *module_arguments,
+        ],
+        cwd=generation_root,
+        generation_root=generation_root,
+        python_executable=Path(sys.executable),
+    )
+
+    assert completed.returncode == 70
+    assert "trusted runtime package alias is already loaded" in completed.stderr
+    assert completed.stdout == ""
 
 
 _MOCK_GUARDIAN_LAUNCHER = r"""from __future__ import annotations
@@ -251,7 +521,24 @@ def _make_math_runtime(agents_dir: Path) -> Path:
         package = site_packages / module_name
         package.mkdir()
         module_source = ""
-        if module_name == "requests":
+        if module_name == "fastmcp":
+            # Most runner tests exercise transport/control behavior without a
+            # real MCP session.  This structural stub lets the trusted server
+            # register its decorators; the dedicated stdio tests above use the
+            # production FastMCP/MCP SDK and would catch namespace shadowing.
+            module_source = """class FastMCP:
+    def __init__(self, name):
+        self.name = name
+
+    def tool(self, *, name):
+        def register(function):
+            return function
+        return register
+
+    def run(self):
+        return None
+"""
+        elif module_name == "requests":
             # The trusted verification client subclasses the public requests
             # base exception at import time; network calls remain outside this
             # runner-only mock suite.

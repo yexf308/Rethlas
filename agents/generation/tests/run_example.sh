@@ -2574,6 +2574,8 @@ for index, expected_name in enumerate(EXPECTED):
 
 
 def install_package(name):
+    if name in sys.modules:
+        fail("trusted runtime package alias is already loaded")
     module = types.ModuleType(name)
     module.__package__ = name
     module.__path__ = []
@@ -2584,8 +2586,9 @@ def install_package(name):
     sys.modules[name] = module
 
 
-def execute_module(name):
-    path, raw = captured[name]
+def execute_module(source_name, runtime_name=None):
+    path, raw = captured[source_name]
+    name = source_name if runtime_name is None else runtime_name
     module = types.ModuleType(name)
     module.__file__ = path
     module.__package__ = name.rpartition(".")[0]
@@ -2602,10 +2605,16 @@ def execute_module(name):
 
 
 install_package("review")
-install_package("mcp")
+local_mcp_package = "_rethlas_generation_mcp"
+install_package(local_mcp_package)
 for module_name in EXPECTED[:-1]:
-    execute_module(module_name)
-server = execute_module("mcp.server")
+    runtime_name = (
+        local_mcp_package + module_name[len("mcp") :]
+        if module_name.startswith("mcp.")
+        else module_name
+    )
+    execute_module(module_name, runtime_name)
+server = execute_module("mcp.server", local_mcp_package + ".server")
 sys.argv = [captured["mcp.server"][0], *entry_arguments]
 server.main()
 PY

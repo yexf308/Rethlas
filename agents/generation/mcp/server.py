@@ -18,6 +18,18 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional
 
 import requests
 
+# Import FastMCP before exposing the trusted snapshot parent on ``sys.path``.
+# The local generation package is also named ``mcp`` on disk, while FastMCP
+# depends on the separately installed MCP SDK's top-level ``mcp`` package.
+# Loading the SDK first prevents direct execution from shadowing ``mcp.types``
+# with the trusted generation sources.
+try:
+    from fastmcp import FastMCP
+except ModuleNotFoundError as exc:  # pragma: no cover - dependency is required in prod
+    if exc.name != "fastmcp":
+        raise
+    FastMCP = None  # type: ignore[assignment]
+
 if __package__ in {None, ""}:
     # ``python -I /attested/snapshot/mcp/server.py`` intentionally removes the
     # script directory from sys.path. Re-add only this exact attested sibling
@@ -122,13 +134,6 @@ except ImportError:  # pragma: no cover - direct `python mcp/server.py` executio
         verify_targeted_claim_service,
         verify_blueprint_file,
     )
-
-try:
-    from fastmcp import FastMCP
-except (
-    ImportError
-):  # pragma: no cover - dependency should be installed via requirements
-    FastMCP = None  # type: ignore[assignment]
 
 _SOURCE_REPO_ROOT = Path(__file__).resolve().parents[1]
 # The example runner launches this module from a read-only trusted snapshot
