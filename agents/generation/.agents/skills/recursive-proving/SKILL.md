@@ -212,8 +212,9 @@ bottleneck as `source_context_sha256`. Set
 `owner_action_required=true`, `browser_dispatch_authorized=false`, and
 `advisor_request_id=null`. Derive a content-addressed checkpoint id from the
 canonical payload and do not repeat the same checkpoint until new mathematical
-evidence or a new advisor receipt exists. Update `branch_states` to
-`waiting_owner_advisor_decision`, retain both returned record ids, and call
+evidence or a new advisor receipt exists. Persist the event and a
+`branch_states` transition to `waiting_owner_advisor_decision` as two items in
+one `memory_append_batch`, bind both returned record ids by input order, and call
 `generation_yield(problem_id, state="waiting_owner_advisor_decision",
 reason=..., evidence_record_ids=[advisor_event_id, branch_state_id])` as the
 final tool action. Then end locally without polling the owner. A branch-state
@@ -297,15 +298,16 @@ Append an `events` record for the recursive round:
 }
 ```
 
-Update `branch_states` with the recursive round status and per-plan outcomes.
+Persist the recursive-round event and its `branch_states` status/per-plan
+outcomes as two items in one `memory_append_batch`.
 After four consecutive no-progress timeouts, use `status="liveness_stopped"`,
 persist the bounded reports and missing agent ids, issue no generation yield,
 and return control to the root or scheduled route review under the unchanged
 cycle clock.
 Only under `owner_gated`, if a cost threshold fires, use
 `status="waiting_cost_gate"`, keep unfinished plan IDs out of both outcome
-lists, and persist the same `orchestration_cost` object. Retain the
-recursive-round event and branch-state record ids, then call
+lists, and persist the same `orchestration_cost` object. Bind the batch
+receipt's event and branch-state record ids by input order, then call
 `generation_yield(problem_id, state="waiting_cost_gate", reason=...,
 evidence_record_ids=[recursive_event_id, branch_state_id])` as the final tool
 action. Do not issue another collaboration or reasoning call afterward. Under
@@ -316,9 +318,7 @@ preflight rejects such a call before any control record is written.
 ## Tools
 
 - `memory_search`
-- `memory_append`
 - `memory_append_batch`
-- `branch_update`
 - `generation_yield`
 - `search_matlas_theorems` (official Matlas published-journal/book search) and
   the distinct legacy `search_arxiv_theorems` Danus/LeanSearch arXiv provider;

@@ -834,7 +834,9 @@ def test_reasoning_phase_preflight_enforces_review_only_allowlist(
             "allowed_action": "independent_review_only",
             "active_review_id": None,
             "review_due_at_utc": "2026-08-10T23:00:00+00:00",
+            "review_due_monotonic": 20_000.0,
             "hard_stop_at_utc": "2026-08-11T00:00:00+00:00",
+            "hard_stop_monotonic": 23_600.0,
             "tool_permitted": permitted,
         }
 
@@ -846,6 +848,14 @@ def test_reasoning_phase_preflight_enforces_review_only_allowlist(
     assert review_client.reasoning_phase_preflight(
         tool_name="route_review_prepare"
     )["tool_permitted"] is True
+
+    invalid_clock = response("route_review_prepare", True)
+    invalid_clock["review_due_monotonic"] = None
+    monkeypatch.setattr(
+        review_client, "_invoke_adapter", lambda *args, **kwargs: invalid_clock
+    )
+    with pytest.raises(review_client.ReviewAdapterError, match="monotonic"):
+        review_client.reasoning_phase_preflight(tool_name="route_review_prepare")
 
     monkeypatch.setattr(
         review_client,
@@ -1436,6 +1446,11 @@ def test_red_fallback_projection_is_durable_and_becomes_next_review_active_route
     monkeypatch.setattr(server, "MEMORY_ROOT", tmp_path / "memory")
     clock = {"value": "2026-08-10T22:39:00+00:00"}
     monkeypatch.setattr(server, "_utc_now", lambda: clock["value"])
+    monkeypatch.setattr(
+        server.time,
+        "time",
+        lambda: server.datetime.fromisoformat(clock["value"]).timestamp(),
+    )
 
     evidence_receipt = server.memory_append_batch(
         problem_id,
@@ -1570,6 +1585,11 @@ def test_red_without_fallback_durably_freezes_old_route_and_leaves_no_active(
     monkeypatch.setattr(server, "MEMORY_ROOT", tmp_path / "memory")
     clock = {"value": "2026-08-10T22:40:00+00:00"}
     monkeypatch.setattr(server, "_utc_now", lambda: clock["value"])
+    monkeypatch.setattr(
+        server.time,
+        "time",
+        lambda: server.datetime.fromisoformat(clock["value"]).timestamp(),
+    )
     server.memory_append_batch(
         problem_id,
         [
@@ -2717,3 +2737,299 @@ def test_first_review_route_derivation_fails_closed_without_one_pre_due_commitme
         server._trusted_active_route_commitment(
             "frontier/example", due_at_utc="2026-08-10T23:00:00+00:00"
         )
+
+
+def _memory_publication_receipt(
+    *, batch_suffix: str = "a", accepted_at_utc: str = "2026-08-10T22:59:59+00:00"
+) -> dict[str, Any]:
+    seed: dict[str, Any] = {
+        "schema_version": review_client.MEMORY_BATCH_PUBLICATION_RECEIPT_SCHEMA,
+        "state": "accepted",
+        "run_id": "run-1",
+        "problem_id": "frontier/example",
+        "batch_id": "batch_" + batch_suffix * 64,
+        "checkpoint_sha256": "b" * 64,
+        "commit_sha256": "c" * 64,
+        "publication_class": "reasoning_checkpoint",
+        "cycle_id": "cycle_" + "d" * 32,
+        "cutoff_action_id": "cadact_" + "e" * 32,
+        "cutoff_kind": "review_1",
+        "cutoff_at_utc": "2026-08-10T23:00:00+00:00",
+        "cutoff_monotonic": 2_000.0,
+        "accepted_at_utc": accepted_at_utc,
+        "accepted_at_monotonic": 1_999.0,
+        "boot_identity": "boot-test",
+    }
+    return {
+        **seed,
+        "receipt_sha256": hashlib.sha256(
+            contracts.canonical_json_bytes(seed)
+        ).hexdigest(),
+    }
+
+
+def test_memory_batch_publication_snapshot_validator_is_pure_canonical_and_bound(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    status = {
+        "schema_version": review_client.MEMORY_BATCH_PUBLICATION_STATUS_SCHEMA,
+        "run_id": "run-1",
+        "problem_id": "frontier/example",
+        "receipts": [_memory_publication_receipt()],
+    }
+    canonical = contracts.canonical_json_bytes(status).decode("utf-8")
+    monkeypatch.setattr(
+        review_client,
+        "_invoke_adapter",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("snapshot validation must not invoke the adapter")
+        ),
+    )
+    assert review_client.validate_memory_batch_publication_status_snapshot(
+        canonical,
+        expected_run_id="run-1",
+        expected_problem_id="frontier/example",
+    ) == status
+
+    with pytest.raises(review_client.ReviewAdapterError, match="not canonical"):
+        review_client.validate_memory_batch_publication_status_snapshot(
+            json.dumps(status, sort_keys=True),
+            expected_run_id="run-1",
+            expected_problem_id="frontier/example",
+        )
+    with pytest.raises(review_client.ReviewAdapterError, match="invalid"):
+        review_client.validate_memory_batch_publication_status_snapshot(
+            '{"problem_id":"frontier/example","problem_id":"frontier/example"}',
+            expected_run_id="run-1",
+            expected_problem_id="frontier/example",
+        )
+    with pytest.raises(review_client.ReviewAdapterError, match="byte bound"):
+        review_client.validate_memory_batch_publication_status_snapshot(
+            "x" * (review_client.MAX_ADAPTER_RESPONSE_BYTES + 1),
+            expected_run_id="run-1",
+            expected_problem_id="frontier/example",
+        )
+    with pytest.raises(review_client.ReviewAdapterError, match="status is invalid"):
+        review_client.validate_memory_batch_publication_status_snapshot(
+            canonical,
+            expected_run_id="run-other",
+            expected_problem_id="frontier/example",
+        )
+
+
+def test_memory_batch_publication_client_commits_and_validates_exact_receipt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(review_client.EXPECTED_RUN_ENV, "run-1")
+    expected = _memory_publication_receipt()
+    calls: list[tuple[str, dict[str, Any], int]] = []
+
+    def invoke(
+        command: str, payload: dict[str, Any], *, timeout_seconds: int
+    ) -> dict[str, Any]:
+        calls.append((command, payload, timeout_seconds))
+        return deepcopy(expected)
+
+    monkeypatch.setattr(review_client, "_invoke_adapter", invoke)
+    observed = review_client.memory_batch_publication_commit(
+        problem_id="frontier/example",
+        batch_id="batch_" + "a" * 64,
+        checkpoint_sha256="b" * 64,
+        commit_sha256="c" * 64,
+        publication_class="reasoning_checkpoint",
+    )
+    assert observed == expected
+    assert calls == [
+        (
+            "review-status",
+            review_client._command(
+                "review_status",
+                {
+                    "operation": "memory_batch_publication_commit",
+                    "problem_id": "frontier/example",
+                    "batch_id": "batch_" + "a" * 64,
+                    "checkpoint_sha256": "b" * 64,
+                    "commit_sha256": "c" * 64,
+                    "publication_class": "reasoning_checkpoint",
+                },
+            ),
+            30,
+        )
+    ]
+
+
+def test_memory_batch_publication_client_rejects_crossed_or_unsorted_receipts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(review_client.EXPECTED_RUN_ENV, "run-1")
+    crossed = _memory_publication_receipt(
+        accepted_at_utc="2026-08-10T23:00:00+00:00"
+    )
+    crossed_seed = {
+        key: value for key, value in crossed.items() if key != "receipt_sha256"
+    }
+    crossed["receipt_sha256"] = hashlib.sha256(
+        contracts.canonical_json_bytes(crossed_seed)
+    ).hexdigest()
+    monkeypatch.setattr(
+        review_client, "_invoke_adapter", lambda *_args, **_kwargs: crossed
+    )
+    with pytest.raises(review_client.ReviewAdapterError, match="crossed its cutoff"):
+        review_client.memory_batch_publication_commit(
+            problem_id="frontier/example",
+            batch_id="batch_" + "a" * 64,
+            checkpoint_sha256="b" * 64,
+            commit_sha256="c" * 64,
+            publication_class="reasoning_checkpoint",
+        )
+
+    first = _memory_publication_receipt(batch_suffix="b")
+    second = _memory_publication_receipt(batch_suffix="a")
+    status = {
+        "schema_version": review_client.MEMORY_BATCH_PUBLICATION_STATUS_SCHEMA,
+        "run_id": "run-1",
+        "problem_id": "frontier/example",
+        "receipts": [first, second],
+    }
+    monkeypatch.setattr(
+        review_client, "_invoke_adapter", lambda *_args, **_kwargs: status
+    )
+    with pytest.raises(review_client.ReviewAdapterError, match="manifest is not exact"):
+        review_client.memory_batch_publication_status(problem_id="frontier/example")
+
+
+def test_memory_batch_publication_client_rejects_cross_bound_receipts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(review_client.EXPECTED_RUN_ENV, "run-1")
+    receipt = _memory_publication_receipt()
+    monkeypatch.setattr(
+        review_client, "_invoke_adapter", lambda *_args, **_kwargs: receipt
+    )
+    with pytest.raises(review_client.ReviewAdapterError, match="bind its request"):
+        review_client.memory_batch_publication_commit(
+            problem_id="other/problem",
+            batch_id="batch_" + "a" * 64,
+            checkpoint_sha256="b" * 64,
+            commit_sha256="c" * 64,
+            publication_class="reasoning_checkpoint",
+        )
+
+    cross_run = deepcopy(receipt)
+    cross_run["run_id"] = "run-other"
+    cross_run_seed = {
+        key: value for key, value in cross_run.items() if key != "receipt_sha256"
+    }
+    cross_run["receipt_sha256"] = hashlib.sha256(
+        contracts.canonical_json_bytes(cross_run_seed)
+    ).hexdigest()
+    status = {
+        "schema_version": review_client.MEMORY_BATCH_PUBLICATION_STATUS_SCHEMA,
+        "run_id": "run-1",
+        "problem_id": "frontier/example",
+        "receipts": [cross_run],
+    }
+    monkeypatch.setattr(
+        review_client, "_invoke_adapter", lambda *_args, **_kwargs: status
+    )
+    with pytest.raises(review_client.ReviewAdapterError, match="cross-bound"):
+        review_client.memory_batch_publication_status(problem_id="frontier/example")
+
+    hostile_problem = _memory_publication_receipt()
+    hostile_problem["problem_id"] = "frontier/evil\nproblem"
+    hostile_seed = {
+        key: value
+        for key, value in hostile_problem.items()
+        if key != "receipt_sha256"
+    }
+    hostile_problem["receipt_sha256"] = hashlib.sha256(
+        contracts.canonical_json_bytes(hostile_seed)
+    ).hexdigest()
+    monkeypatch.setattr(
+        review_client, "_invoke_adapter", lambda *_args, **_kwargs: hostile_problem
+    )
+    with pytest.raises(review_client.ReviewAdapterError, match="receipt is invalid"):
+        review_client.memory_batch_publication_commit(
+            problem_id="frontier/example",
+            batch_id="batch_" + "a" * 64,
+            checkpoint_sha256="b" * 64,
+            commit_sha256="c" * 64,
+            publication_class="reasoning_checkpoint",
+        )
+
+    hostile_clock = _memory_publication_receipt()
+    hostile_clock["cutoff_monotonic"] = 10**309
+    hostile_seed = {
+        key: value for key, value in hostile_clock.items() if key != "receipt_sha256"
+    }
+    hostile_clock["receipt_sha256"] = hashlib.sha256(
+        contracts.canonical_json_bytes(hostile_seed)
+    ).hexdigest()
+    monkeypatch.setattr(
+        review_client, "_invoke_adapter", lambda *_args, **_kwargs: hostile_clock
+    )
+    with pytest.raises(
+        review_client.ReviewAdapterError, match="cutoff monotonic time is invalid"
+    ):
+        review_client.memory_batch_publication_commit(
+            problem_id="frontier/example",
+            batch_id="batch_" + "a" * 64,
+            checkpoint_sha256="b" * 64,
+            commit_sha256="c" * 64,
+            publication_class="reasoning_checkpoint",
+        )
+
+
+def test_memory_batch_publication_max_manifest_fits_existing_adapter_bound(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run_id = "r" * 128
+    problem_id = "p" * 128
+    receipts: list[dict[str, Any]] = []
+    for index in range(review_client.MAX_ACCEPTED_MEMORY_BATCH_PUBLICATIONS):
+        seed: dict[str, Any] = {
+            "schema_version": review_client.MEMORY_BATCH_PUBLICATION_RECEIPT_SCHEMA,
+            "state": "accepted",
+            "run_id": run_id,
+            "problem_id": problem_id,
+            "batch_id": "batch_" + f"{index:064x}",
+            "checkpoint_sha256": "b" * 64,
+            "commit_sha256": "c" * 64,
+            "publication_class": "reasoning_checkpoint",
+            "cycle_id": "cycle_" + "d" * 32,
+            "cutoff_action_id": "cadact_" + "e" * 32,
+            "cutoff_kind": "hard_stop",
+            "cutoff_at_utc": "9999-12-31T23:59:59.999999+00:00",
+            "cutoff_monotonic": 1.0e308,
+            "accepted_at_utc": "9999-12-31T23:59:58.999999+00:00",
+            "accepted_at_monotonic": 9.0e307,
+            "boot_identity": '"' * 128,
+        }
+        receipts.append(
+            {
+                **seed,
+                "receipt_sha256": hashlib.sha256(
+                    contracts.canonical_json_bytes(seed)
+                ).hexdigest(),
+            }
+        )
+    status = {
+        "schema_version": review_client.MEMORY_BATCH_PUBLICATION_STATUS_SCHEMA,
+        "run_id": run_id,
+        "problem_id": problem_id,
+        "receipts": receipts,
+    }
+    assert len(contracts.canonical_json_bytes(status)) < (
+        review_client.MAX_ADAPTER_RESPONSE_BYTES
+    )
+    assert len(
+        (json.dumps(status, ensure_ascii=False, sort_keys=True) + "\n").encode()
+    ) < review_client.MAX_ADAPTER_RESPONSE_BYTES
+    monkeypatch.setenv(review_client.EXPECTED_RUN_ENV, run_id)
+    monkeypatch.setattr(
+        review_client, "_invoke_adapter", lambda *_args, **_kwargs: status
+    )
+    observed = review_client.memory_batch_publication_status(problem_id=problem_id)
+    assert len(observed["receipts"]) == (
+        review_client.MAX_ACCEPTED_MEMORY_BATCH_PUBLICATIONS
+    )

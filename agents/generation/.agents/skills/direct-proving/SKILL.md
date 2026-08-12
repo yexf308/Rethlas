@@ -73,9 +73,7 @@ mirror execution order.
 ## MCP Tools
 
 - `memory_search`
-- `memory_append`
 - `memory_append_batch`
-- `branch_update`
 - `search_matlas_theorems`
 
 ## Failure Logging

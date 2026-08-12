@@ -34,6 +34,21 @@ def control_runtime(
     monkeypatch.setenv("RETHLAS_EXPECTED_STATEMENT_SHA256", digest)
     monkeypatch.setenv("RETHLAS_EXPECTED_HOTJOIN_RUN_ID", "run-1")
     monkeypatch.setenv("RETHLAS_GENERATION_CONTROL_TOKEN", INSTANCE_A)
+    # These unit tests exercise the legacy/local generation-control store while
+    # mocking host yield admission.  Keep that local evidence lane explicit;
+    # dedicated tests below use the real released snapshot classifier.
+    released_registry_configured = server._released_memory_registry_configured
+    monkeypatch.setattr(
+        server,
+        "_released_memory_registry_configured",
+        lambda *, owner_manifest_snapshot_json=None: (
+            released_registry_configured(
+                owner_manifest_snapshot_json=owner_manifest_snapshot_json
+            )
+            if owner_manifest_snapshot_json is not None
+            else False
+        ),
+    )
     monkeypatch.setattr(
         server,
         "_adapter_generation_yield_prepare",
@@ -155,6 +170,44 @@ def test_generation_yield_rejects_phantom_or_mismatched_evidence_without_record(
             [event_only["record_id"], wrong_branch["record_id"]],
         )
     assert not server._generation_control_path("example", INSTANCE_A).exists()
+
+
+def test_owner_snapshot_excludes_forged_legacy_jsonl_wait_evidence(
+    control_runtime: tuple[str, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    evidence = _wait_evidence("example", "waiting_cost_gate")
+    server.generation_yield(
+        "example",
+        "waiting_cost_gate",
+        "legacy evidence is valid only offline",
+        evidence,
+    )
+    assert set(evidence).issubset(server._active_memory_records_by_id("example"))
+    assert server.generation_control_receipt("example", INSTANCE_A)["control"][
+        "state"
+    ] == "waiting_cost_gate"
+
+    snapshot = server.canonical_json_bytes(
+        {
+            "schema_version": "rethlas_memory_batch_publication_status_v1",
+            "run_id": "run-1",
+            "problem_id": "example",
+            "receipts": [],
+        }
+    ).decode("utf-8")
+    monkeypatch.setenv("RETHLAS_REVIEW_ADAPTER_PATH", "/trusted/hotjoin_adapter.py")
+    monkeypatch.setenv("RETHLAS_REVIEW_ADAPTER_SHA256", "a" * 64)
+    monkeypatch.setenv("RETHLAS_REVIEW_DB", "/trusted/hotjoin.sqlite3")
+
+    assert server._active_memory_records_by_id(
+        "example", owner_manifest_snapshot_json=snapshot
+    ) == {}
+    with pytest.raises(ValueError, match="not active memory"):
+        server.generation_control_receipt(
+            "example",
+            INSTANCE_A,
+            owner_manifest_snapshot_json=snapshot,
+        )
 
 
 def test_status_fails_closed_after_evidence_is_superseded_or_statement_changes(

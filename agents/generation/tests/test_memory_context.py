@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import signal
@@ -12,6 +13,7 @@ import time
 import types
 import unittest
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime
 from pathlib import Path
 from unittest import mock
 
@@ -83,6 +85,48 @@ class MemoryContextTests(unittest.TestCase):
         self.assertEqual(receipt["entry"]["record_id"], receipt["record_id"])
         self.assertEqual(receipt["entry"]["record"], {"example": "expanded response"})
 
+    def test_released_legacy_jsonl_writes_fail_before_any_filesystem_write(
+        self,
+    ) -> None:
+        with mock.patch.object(
+            server, "_released_memory_registry_configured", return_value=True
+        ):
+            with self.assertRaisesRegex(
+                ValueError, "memory_append is offline-only"
+            ):
+                server.memory_append(
+                    "released/problem",
+                    "events",
+                    {"event_type": "must-not-be-published"},
+                )
+            with self.assertRaisesRegex(
+                ValueError, "memory_append is offline-only"
+            ):
+                server.branch_update(
+                    "released/problem",
+                    "root",
+                    {"status": "must-not-be-published"},
+                )
+
+        self.assertFalse((server.MEMORY_ROOT / "released").exists())
+
+    def test_offline_branch_update_remains_legacy_compatible(self) -> None:
+        receipt = server.branch_update(
+            "offline/problem",
+            "root",
+            {"status": "active"},
+        )
+
+        self.assertEqual(receipt["status"], "ok")
+        self.assertEqual(receipt["channel"], "branch_states")
+        stored = list(
+            server._iter_jsonl(
+                server._channel_path("offline/problem", "branch_states")
+            )
+        )
+        self.assertEqual(stored[0]["record"]["branch_id"], "root")
+        self.assertEqual(stored[0]["record"]["state"], {"status": "active"})
+
     def test_memory_append_batch_persists_one_compact_phase_checkpoint(self) -> None:
         response = server.memory_append_batch(
             "sample/problem",
@@ -101,6 +145,28 @@ class MemoryContextTests(unittest.TestCase):
         )
 
         self.assertEqual(response["status"], "ok")
+        self.assertEqual(
+            response["schema_version"],
+            server.MEMORY_BATCH_LOCAL_COMMIT_RECEIPT_SCHEMA,
+        )
+        self.assertEqual(
+            set(response),
+            {
+                "schema_version",
+                "status",
+                "problem_id",
+                "batch_id",
+                "checkpoint_sha256",
+                "timestamp_utc",
+                "committed_at_utc",
+                "committed_at_monotonic",
+                "commit_sha256",
+                "count",
+                "records",
+                "checkpoint_path",
+            },
+        )
+        self.assertNotIn("publication_receipt", response)
         self.assertEqual(response["problem_id"], "sample/problem")
         self.assertEqual(response["count"], 2)
         self.assertTrue(response["batch_id"].startswith("batch_"))
@@ -132,12 +198,735 @@ class MemoryContextTests(unittest.TestCase):
         checkpoint = Path(response["checkpoint_path"])
         self.assertTrue(checkpoint.is_file())
         checkpoint_payload = json.loads(checkpoint.read_text(encoding="utf-8"))
-        self.assertEqual(checkpoint_payload["schema"], "rethlas_memory_batch_v2")
+        self.assertEqual(checkpoint_payload["schema"], "rethlas_memory_batch_v3")
         self.assertRegex(checkpoint_payload["checkpoint_sha256"], r"^[0-9a-f]{64}$")
         self.assertEqual(
-            [path.name for path in checkpoint.parent.glob("batch_*.json")],
+            [
+                path.name
+                for path in checkpoint.parent.glob("batch_*.json")
+                if not path.name.endswith(".commit.json")
+            ],
             [f"{response['batch_id']}.json"],
         )
+        marker = server._batch_commit_path(checkpoint)
+        self.assertTrue(marker.is_file())
+        self.assertEqual(
+            response["committed_at_utc"],
+            json.loads(marker.read_text())["committed_at_utc"],
+        )
+
+    def test_legacy_runner_common_env_gets_exact_durable_local_receipt(
+        self,
+    ) -> None:
+        legacy_common_env = {
+            "PYTHONDONTWRITEBYTECODE": "1",
+            "RETHLAS_GENERATION_CONTROL_TOKEN": "1" * 32,
+            "RETHLAS_EXPECTED_PROBLEM_ID": "legacy/common-env",
+            "RETHLAS_EXPECTED_STATEMENT_SHA256": "2" * 64,
+            "RETHLAS_GENERATION_ROOT": "/legacy/generation",
+            "RETHLAS_RECEIPTS_ROOT": "/legacy/receipts",
+            # This runtime attestation is intentionally common to released and
+            # legacy runs, so it must never be treated as a release sentinel.
+            "RETHLAS_TRUSTED_RUNTIME_SHA256": "3" * 64,
+            "VERIFY_PROOF_URL": "http://127.0.0.1:8091/verify",
+        }
+        items = [
+            {
+                "channel": "proof_steps",
+                "record": {"claim": "legacy local commit witness"},
+            }
+        ]
+        real_revalidate = server._durably_revalidate_memory_batch_artifacts
+        with (
+            mock.patch.dict(os.environ, legacy_common_env, clear=True),
+            mock.patch.object(
+                server,
+                "_durably_revalidate_memory_batch_artifacts",
+                wraps=real_revalidate,
+            ) as revalidate,
+        ):
+            self.assertFalse(server._released_memory_registry_configured())
+            self.assertIsNone(
+                server._reasoning_phase_preflight("memory_append_batch")
+            )
+            first = server.memory_append_batch("legacy/common-env", items)
+            replay = server.memory_append_batch("legacy/common-env", items)
+
+        self.assertEqual(replay, first)
+        self.assertEqual(revalidate.call_count, 2)
+        self.assertEqual(
+            first["schema_version"],
+            server.MEMORY_BATCH_LOCAL_COMMIT_RECEIPT_SCHEMA,
+        )
+        self.assertNotIn("publication_receipt", first)
+        checkpoint = Path(first["checkpoint_path"])
+        marker = server._batch_commit_path(checkpoint)
+        self.assertTrue(checkpoint.is_file())
+        self.assertTrue(marker.is_file())
+        marker_payload = json.loads(marker.read_text(encoding="utf-8"))
+        self.assertEqual(marker_payload["batch_id"], first["batch_id"])
+        self.assertEqual(
+            marker_payload["checkpoint_sha256"], first["checkpoint_sha256"]
+        )
+        self.assertEqual(marker_payload["commit_sha256"], first["commit_sha256"])
+
+    def test_any_released_env_sentinel_without_registry_fails_closed(self) -> None:
+        problem_id = "released-sentinel-no-registry"
+        items = [
+            {
+                "channel": "proof_steps",
+                "record": {"claim": "must not become a local receipt"},
+            }
+        ]
+        checkpoint_dir = server._batch_checkpoint_dir(problem_id)
+        for sentinel in sorted(server._RELEASED_REASONING_ENV_SENTINELS):
+            for value in ("released-binding", ""):
+                with self.subTest(sentinel=sentinel, value=value):
+                    with mock.patch.dict(
+                        os.environ, {sentinel: value}, clear=True
+                    ):
+                        with self.assertRaisesRegex(
+                            ValueError, "released reasoning registry is incomplete"
+                        ):
+                            server._released_memory_registry_configured()
+                        with self.assertRaisesRegex(
+                            ValueError, "released reasoning registry is incomplete"
+                        ):
+                            server._reasoning_phase_preflight(
+                                "memory_append_batch"
+                            )
+                        with self.assertRaisesRegex(
+                            ValueError, "released reasoning registry is incomplete"
+                        ):
+                            server.memory_append_batch(problem_id, items)
+                        with self.assertRaisesRegex(
+                            ValueError, "released reasoning registry is incomplete"
+                        ):
+                            server.memory_append(
+                                problem_id,
+                                "not-a-channel",
+                                [],  # type: ignore[arg-type]
+                            )
+                        with self.assertRaisesRegex(
+                            ValueError, "released reasoning registry is incomplete"
+                        ):
+                            server.branch_update(problem_id, "root", {})
+                    self.assertFalse(checkpoint_dir.exists())
+                    self.assertFalse((server.MEMORY_ROOT / problem_id).exists())
+
+    def test_complete_nonempty_released_registry_is_required_as_one_tuple(
+        self,
+    ) -> None:
+        complete = {
+            name: f"bound-{index}"
+            for index, name in enumerate(
+                server._RELEASED_MEMORY_REGISTRY_ENV_NAMES, start=1
+            )
+        }
+        with mock.patch.dict(os.environ, complete, clear=True):
+            self.assertTrue(server._released_memory_registry_configured())
+
+        for missing in server._RELEASED_MEMORY_REGISTRY_ENV_NAMES:
+            partial = dict(complete)
+            partial.pop(missing)
+            with self.subTest(missing=missing):
+                with mock.patch.dict(os.environ, partial, clear=True):
+                    with self.assertRaisesRegex(
+                        ValueError, "released reasoning registry is incomplete"
+                    ):
+                        server._released_memory_registry_configured()
+
+    def test_owner_manifest_snapshot_is_explicit_read_only_and_token_disjoint(
+        self,
+    ) -> None:
+        problem_id = "frontier/example"
+        run_id = "run-snapshot"
+        snapshot = json.dumps(
+            {
+                "schema_version": "rethlas_memory_batch_publication_status_v1",
+                "run_id": run_id,
+                "problem_id": problem_id,
+                "receipts": [],
+            },
+            allow_nan=False,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        static = {
+            "RETHLAS_REVIEW_ADAPTER_PATH": "/trusted/hotjoin_adapter.py",
+            "RETHLAS_REVIEW_ADAPTER_SHA256": "a" * 64,
+            "RETHLAS_REVIEW_DB": "/trusted/hotjoin.sqlite3",
+            server._REVIEW_RUN_ENV: run_id,
+        }
+        with mock.patch.dict(os.environ, static, clear=True):
+            self.assertEqual(
+                server._released_memory_registry_mode(
+                    owner_manifest_snapshot_json=snapshot
+                ),
+                "owner_read_only_snapshot",
+            )
+            with mock.patch.object(
+                server,
+                "_adapter_memory_batch_publication_status",
+                side_effect=AssertionError("snapshot mode must not call the adapter"),
+            ):
+                self.assertEqual(
+                    server._memory_batch_registry_manifest(
+                        problem_id,
+                        owner_manifest_snapshot_json=snapshot,
+                    ),
+                    {},
+                )
+
+        with mock.patch.dict(
+            os.environ,
+            {**static, "RETHLAS_REVIEW_CONTROL_TOKEN": "b" * 64},
+            clear=True,
+        ):
+            with self.assertRaisesRegex(ValueError, "forbids a raw review control"):
+                server._released_memory_registry_mode(
+                    owner_manifest_snapshot_json=snapshot
+                )
+
+    def test_owner_manifest_snapshot_env_cannot_authorize_app_or_mutation(
+        self,
+    ) -> None:
+        snapshot_env = {
+            server._OWNER_MEMORY_BATCH_MANIFEST_SNAPSHOT_ENV: "{}",
+        }
+        with mock.patch.dict(os.environ, snapshot_env, clear=True):
+            with self.assertRaisesRegex(
+                ValueError, "released reasoning registry is incomplete"
+            ):
+                server.memory_append_batch(
+                    "snapshot-mutation-rejected",
+                    [{"channel": "proof_steps", "record": {"claim": "no"}}],
+                )
+            with mock.patch.object(
+                sys,
+                "argv",
+                ["server.py", "--generation-control-state", "frontier/example"],
+            ):
+                with self.assertRaisesRegex(
+                    SystemExit, "valid only for the generation-control receipt CLI"
+                ):
+                    server.main()
+
+    def test_owner_snapshot_excludes_forged_legacy_wait_jsonl_but_offline_reads_it(
+        self,
+    ) -> None:
+        problem_id = "forged/wait"
+        run_id = "run-forged-wait"
+        event_id = "mem_forged_event"
+        branch_id = "mem_forged_branch"
+        server.memory_append(
+            problem_id,
+            "events",
+            {
+                "event_type": "recursive_proving_round",
+                "status": "waiting_cost_gate",
+            },
+        )
+        server.memory_append(
+            problem_id,
+            "branch_states",
+            {
+                "branch_id": "root",
+                "state": {"status": "waiting_cost_gate"},
+            },
+        )
+        # Use stable ids in the same legacy JSONL format a workspace writer can
+        # forge, independently of the append helper's generated ids.
+        event_path = server._channel_path(problem_id, "events")
+        branch_path = server._channel_path(problem_id, "branch_states")
+        event = json.loads(event_path.read_text(encoding="utf-8").splitlines()[0])
+        branch = json.loads(branch_path.read_text(encoding="utf-8").splitlines()[0])
+        event["record_id"] = event_id
+        branch["record_id"] = branch_id
+        event_path.write_text(json.dumps(event) + "\n", encoding="utf-8")
+        branch_path.write_text(json.dumps(branch) + "\n", encoding="utf-8")
+
+        offline = server._active_memory_records_by_id(problem_id)
+        self.assertEqual(set(offline), {event_id, branch_id})
+        server._validate_generation_wait_evidence(
+            problem_id, "waiting_cost_gate", [event_id, branch_id]
+        )
+
+        snapshot = server.canonical_json_bytes(
+            {
+                "schema_version": "rethlas_memory_batch_publication_status_v1",
+                "run_id": run_id,
+                "problem_id": problem_id,
+                "receipts": [],
+            }
+        ).decode("utf-8")
+        static = {
+            "RETHLAS_REVIEW_ADAPTER_PATH": "/trusted/hotjoin_adapter.py",
+            "RETHLAS_REVIEW_ADAPTER_SHA256": "a" * 64,
+            "RETHLAS_REVIEW_DB": "/trusted/hotjoin.sqlite3",
+            server._REVIEW_RUN_ENV: run_id,
+        }
+        with mock.patch.dict(os.environ, static, clear=True):
+            self.assertEqual(
+                server._active_memory_records_by_id(
+                    problem_id,
+                    owner_manifest_snapshot_json=snapshot,
+                ),
+                {},
+            )
+            with self.assertRaisesRegex(ValueError, "not active memory"):
+                server._validate_generation_wait_evidence(
+                    problem_id,
+                    "waiting_cost_gate",
+                    [event_id, branch_id],
+                    owner_manifest_snapshot_json=snapshot,
+                )
+
+    def test_memory_append_batch_cannot_publish_across_host_freeze(self) -> None:
+        items = [
+            {
+                "channel": "proof_steps",
+                "record": {"claim": "must remain before the review freeze"},
+            }
+        ]
+        phase = {
+            "review_due_at_utc": "2030-01-01T00:00:00+00:00",
+            "review_due_monotonic": 1.0e18,
+            "hard_stop_at_utc": "2030-01-01T01:00:00+00:00",
+            "hard_stop_monotonic": 2.0e18,
+        }
+        cutoff = datetime.fromisoformat(phase["review_due_at_utc"]).timestamp()
+
+        with (
+            mock.patch.object(
+                server.time, "time", side_effect=[cutoff - 1, cutoff + 1]
+            ),
+            mock.patch.object(server.time, "monotonic", side_effect=[1.0, 2.0]),
+        ):
+            with self.assertRaisesRegex(ValueError, "publication window is closed"):
+                server.memory_append_batch(
+                    "deadline/problem",
+                    items,
+                    _trusted_publication_preflight=lambda: phase,
+                )
+
+        checkpoint_dir = server._batch_checkpoint_dir("deadline/problem")
+        data = next(checkpoint_dir.glob("batch_*.json"))
+        self.assertFalse(data.name.endswith(".commit.json"))
+        self.assertFalse(server._batch_commit_path(data).exists())
+        self.assertEqual(
+            server._load_memory_entries("deadline/problem")["proof_steps"], []
+        )
+        with self.assertRaisesRegex(ValueError, "not logically committed"):
+            server._validate_memory_batch_checkpoint("deadline/problem", data)
+
+        with (
+            mock.patch.object(server.time, "time", return_value=cutoff - 1),
+            mock.patch.object(server.time, "monotonic", return_value=1.0),
+        ):
+            receipt = server.memory_append_batch(
+                "deadline/problem",
+                items,
+                _trusted_publication_preflight=lambda: phase,
+            )
+        self.assertEqual(receipt["status"], "ok")
+        self.assertTrue(server._batch_commit_path(data).is_file())
+
+    def test_memory_append_batch_prelink_witness_denial_is_never_visible(
+        self,
+    ) -> None:
+        problem_id = "blocked-prelink-witness"
+        items = [{"channel": "proof_steps", "record": {"claim": "fenced"}}]
+        phase = {
+            "review_due_at_utc": "2030-01-01T00:00:00+00:00",
+            "review_due_monotonic": 1.0e18,
+            "hard_stop_at_utc": "2030-01-01T01:00:00+00:00",
+            "hard_stop_monotonic": 2.0e18,
+        }
+        cutoff = datetime.fromisoformat(phase["review_due_at_utc"]).timestamp()
+        clock = {"wall": cutoff - 1.0}
+        prelink_ready = threading.Event()
+        release_prelink = threading.Event()
+        fsynced_inodes: set[int] = set()
+        witness = {"fsynced": False, "canonical": False}
+        failures: list[BaseException] = []
+        preflight_count = 0
+        real_fsync = server.os.fsync
+
+        def tracked_fsync(descriptor: int) -> None:
+            real_fsync(descriptor)
+            fsynced_inodes.add(server.os.fstat(descriptor).st_ino)
+
+        def preflight() -> dict[str, object]:
+            nonlocal preflight_count
+            preflight_count += 1
+            if preflight_count == 2:
+                checkpoint_dir = server._batch_checkpoint_dir(problem_id)
+                temporaries = list(checkpoint_dir.glob(".*.commit.*.tmp"))
+                if len(temporaries) == 1:
+                    temporary = temporaries[0]
+                    witness["fsynced"] = (
+                        temporary.stat().st_ino in fsynced_inodes
+                    )
+                    payload = json.loads(temporary.read_text(encoding="utf-8"))
+                    witness["canonical"] = (
+                        payload["schema"] == server.MEMORY_BATCH_COMMIT_SCHEMA
+                        and payload["commit_sha256"]
+                        == server._memory_batch_commit_sha256(payload)
+                    )
+                prelink_ready.set()
+                if not release_prelink.wait(timeout=5):
+                    raise TimeoutError("test did not release prelink witness")
+            return phase
+
+        def publish() -> None:
+            try:
+                server.memory_append_batch(
+                    problem_id,
+                    items,
+                    _trusted_publication_preflight=preflight,
+                )
+            except BaseException as exc:
+                failures.append(exc)
+
+        with (
+            mock.patch.object(server.os, "fsync", side_effect=tracked_fsync),
+            mock.patch.object(server.time, "time", side_effect=lambda: clock["wall"]),
+            mock.patch.object(server.time, "monotonic", return_value=1.0),
+        ):
+            publisher = threading.Thread(target=publish)
+            publisher.start()
+            self.assertTrue(prelink_ready.wait(timeout=5))
+            checkpoint_dir = server._batch_checkpoint_dir(problem_id)
+            data = next(checkpoint_dir.glob("batch_*.json"))
+            self.assertTrue(witness["fsynced"])
+            self.assertTrue(witness["canonical"])
+            self.assertFalse(server._batch_commit_path(data).exists())
+            self.assertEqual(
+                server._load_memory_entries(problem_id)["proof_steps"], []
+            )
+            clock["wall"] = cutoff + 1.0
+            release_prelink.set()
+            publisher.join(timeout=5)
+
+        self.assertFalse(publisher.is_alive())
+        self.assertEqual(len(failures), 1)
+        self.assertIsInstance(failures[0], ValueError)
+        self.assertIn("publication window is closed", str(failures[0]))
+        self.assertFalse(server._batch_commit_path(data).exists())
+        self.assertEqual(list(checkpoint_dir.glob(".*.commit.*.tmp")), [])
+        self.assertEqual(server._trusted_checkpoint_records(problem_id), {})
+
+    def test_memory_append_batch_second_preflight_denial_leaves_invisible_orphan(
+        self,
+    ) -> None:
+        allowed = {
+            "review_due_at_utc": "2030-01-01T00:00:00+00:00",
+            "review_due_monotonic": 1.0e18,
+            "hard_stop_at_utc": "2030-01-01T01:00:00+00:00",
+            "hard_stop_monotonic": 2.0e18,
+        }
+        denied = {**allowed, "review_due_at_utc": "2029-12-31T23:59:00+00:00"}
+        phases = iter((allowed, denied))
+        items = [{"channel": "proof_steps", "record": {"claim": "fenced"}}]
+
+        with self.assertRaisesRegex(ValueError, "cutoff changed"):
+            server.memory_append_batch(
+                "second-preflight",
+                items,
+                _trusted_publication_preflight=lambda: next(phases),
+            )
+        checkpoint_dir = server._batch_checkpoint_dir("second-preflight")
+        data = next(
+            path
+            for path in checkpoint_dir.glob("batch_*.json")
+            if not path.name.endswith(".commit.json")
+        )
+        self.assertFalse(server._batch_commit_path(data).exists())
+        self.assertEqual(server._trusted_checkpoint_records("second-preflight"), {})
+
+        receipt = server.memory_append_batch(
+            "second-preflight",
+            items,
+            _trusted_publication_preflight=lambda: allowed,
+        )
+        self.assertTrue(server._batch_commit_path(data).is_file())
+        self.assertEqual(receipt["status"], "ok")
+
+    def test_memory_append_batch_host_registry_rejection_keeps_marker_invisible(
+        self,
+    ) -> None:
+        problem_id = "registry-rejected-after-link"
+        items = [
+            {
+                "channel": "proof_steps",
+                "record": {"claim": "prepared marker is not a logical commit"},
+            }
+        ]
+        phase = {
+            "review_due_at_utc": "2030-01-01T00:00:00+00:00",
+            "review_due_monotonic": 1.0e18,
+            "hard_stop_at_utc": "2030-01-01T01:00:00+00:00",
+            "hard_stop_monotonic": 2.0e18,
+        }
+        rejected = {
+            "schema_version": server.MEMORY_BATCH_PUBLICATION_RECEIPT_SCHEMA,
+            "state": "rejected",
+        }
+        with (
+            mock.patch.dict(
+                os.environ, {server._REVIEW_RUN_ENV: "run-registry"}, clear=False
+            ),
+            mock.patch.object(
+                server, "_released_memory_registry_configured", return_value=True
+            ),
+            mock.patch.object(
+                server,
+                "_adapter_memory_batch_publication_commit",
+                return_value=rejected,
+            ) as commit,
+            mock.patch.object(
+                server, "_memory_batch_registry_manifest", return_value={}
+            ),
+        ):
+            with self.assertRaisesRegex(
+                ValueError, "memory checkpoint publication was rejected"
+            ):
+                server.memory_append_batch(
+                    problem_id,
+                    items,
+                    _trusted_publication_preflight=lambda: phase,
+                )
+            checkpoint = next(
+                path
+                for path in server._batch_checkpoint_dir(problem_id).glob(
+                    "batch_*.json"
+                )
+                if not path.name.endswith(".commit.json")
+            )
+            self.assertTrue(server._batch_commit_path(checkpoint).is_file())
+            self.assertEqual(server._trusted_checkpoint_records(problem_id), {})
+        self.assertEqual(commit.call_count, 1)
+
+    def test_memory_append_batch_host_acceptance_returns_bound_business_receipt(
+        self,
+    ) -> None:
+        problem_id = "registry-accepted-business-receipt"
+
+        def accept(**bindings: str) -> dict[str, object]:
+            seed: dict[str, object] = {
+                "schema_version": server.MEMORY_BATCH_PUBLICATION_RECEIPT_SCHEMA,
+                "state": "accepted",
+                "run_id": "run-registry",
+                "problem_id": bindings["problem_id"],
+                "batch_id": bindings["batch_id"],
+                "checkpoint_sha256": bindings["checkpoint_sha256"],
+                "commit_sha256": bindings["commit_sha256"],
+                "publication_class": bindings["publication_class"],
+                "cycle_id": "cycle_" + "1" * 32,
+                "cutoff_action_id": "cadact_" + "2" * 32,
+                "cutoff_kind": "review_1",
+                "cutoff_at_utc": "2030-01-01T00:00:00+00:00",
+                "cutoff_monotonic": 1.0e18,
+                "accepted_at_utc": "2029-12-31T23:59:59+00:00",
+                "accepted_at_monotonic": 1.0,
+                "boot_identity": "test-boot",
+            }
+            seed["receipt_sha256"] = hashlib.sha256(
+                json.dumps(seed, sort_keys=True, separators=(",", ":")).encode()
+            ).hexdigest()
+            return seed
+
+        with (
+            mock.patch.dict(
+                os.environ, {server._REVIEW_RUN_ENV: "run-registry"}, clear=False
+            ),
+            mock.patch.object(
+                server, "_released_memory_registry_configured", return_value=True
+            ),
+            mock.patch.object(
+                server,
+                "_adapter_memory_batch_publication_commit",
+                side_effect=accept,
+            ),
+        ):
+            receipt = server.memory_append_batch(
+                problem_id,
+                [{"channel": "proof_steps", "record": {"claim": "admitted"}}],
+            )
+        self.assertEqual(receipt["schema_version"], server.MEMORY_BATCH_RECEIPT_SCHEMA)
+        self.assertRegex(receipt["checkpoint_sha256"], r"^[0-9a-f]{64}$")
+        self.assertEqual(receipt["committed_at_utc"], "2029-12-31T23:59:59+00:00")
+        self.assertEqual(receipt["committed_at_monotonic"], 1.0)
+        self.assertEqual(receipt["publication_receipt"]["state"], "accepted")
+        self.assertEqual(
+            receipt["publication_receipt"]["checkpoint_sha256"],
+            receipt["checkpoint_sha256"],
+        )
+
+    def test_registry_commit_waits_for_successful_artifact_and_directory_fsync(
+        self,
+    ) -> None:
+        problem_id = "registry-retry-needs-durable-artifacts"
+        items = [
+            {"channel": "proof_steps", "record": {"claim": "durable before DB"}}
+        ]
+        prepared = server.memory_append_batch(problem_id, items)
+        adapter_calls: list[dict[str, str]] = []
+
+        def accepted(**bindings: str) -> dict[str, object]:
+            adapter_calls.append(dict(bindings))
+            seed: dict[str, object] = {
+                "schema_version": server.MEMORY_BATCH_PUBLICATION_RECEIPT_SCHEMA,
+                "state": "accepted",
+                "run_id": "run-durable",
+                "problem_id": bindings["problem_id"],
+                "batch_id": bindings["batch_id"],
+                "checkpoint_sha256": bindings["checkpoint_sha256"],
+                "commit_sha256": bindings["commit_sha256"],
+                "publication_class": bindings["publication_class"],
+                "cycle_id": "cycle_" + "1" * 32,
+                "cutoff_action_id": "cadact_" + "2" * 32,
+                "cutoff_kind": "review_1",
+                "cutoff_at_utc": "2030-01-01T00:00:00+00:00",
+                "cutoff_monotonic": 1.0e18,
+                "accepted_at_utc": "2029-12-31T23:59:59+00:00",
+                "accepted_at_monotonic": 1.0,
+                "boot_identity": "test-boot",
+            }
+            seed["receipt_sha256"] = hashlib.sha256(
+                json.dumps(seed, sort_keys=True, separators=(",", ":")).encode()
+            ).hexdigest()
+            return seed
+
+        with (
+            mock.patch.dict(
+                os.environ, {server._REVIEW_RUN_ENV: "run-durable"}, clear=False
+            ),
+            mock.patch.object(
+                server, "_released_memory_registry_configured", return_value=True
+            ),
+            mock.patch.object(
+                server,
+                "_adapter_memory_batch_publication_commit",
+                side_effect=accepted,
+            ),
+            mock.patch.object(
+                server,
+                "_fsync_directory_fd",
+                side_effect=OSError("persistent directory fsync failure"),
+            ),
+        ):
+            with self.assertRaisesRegex(OSError, "directory fsync failure"):
+                server.memory_append_batch(problem_id, items)
+        self.assertEqual(adapter_calls, [])
+        self.assertTrue(Path(prepared["checkpoint_path"]).is_file())
+        self.assertTrue(
+            server._batch_commit_path(Path(prepared["checkpoint_path"])).is_file()
+        )
+
+        with (
+            mock.patch.dict(
+                os.environ, {server._REVIEW_RUN_ENV: "run-durable"}, clear=False
+            ),
+            mock.patch.object(
+                server, "_released_memory_registry_configured", return_value=True
+            ),
+            mock.patch.object(
+                server,
+                "_adapter_memory_batch_publication_commit",
+                side_effect=accepted,
+            ),
+        ):
+            recovered = server.memory_append_batch(problem_id, items)
+        self.assertEqual(len(adapter_calls), 1)
+        self.assertEqual(recovered["publication_receipt"]["state"], "accepted")
+
+    def test_accepted_registry_manifest_fails_closed_on_missing_artifacts(self) -> None:
+        for missing in ("checkpoint", "marker"):
+            problem_id = f"registry-accepted-missing-{missing}"
+            prepared = server.memory_append_batch(
+                problem_id,
+                [
+                    {
+                        "channel": "proof_steps",
+                        "record": {"claim": f"official {missing} must exist"},
+                    }
+                ],
+            )
+            checkpoint = Path(prepared["checkpoint_path"])
+            target = (
+                checkpoint
+                if missing == "checkpoint"
+                else server._batch_commit_path(checkpoint)
+            )
+            target.unlink()
+            manifest = {prepared["batch_id"]: {"state": "accepted"}}
+            with (
+                mock.patch.object(
+                    server, "_released_memory_registry_configured", return_value=True
+                ),
+                mock.patch.object(
+                    server,
+                    "_memory_batch_registry_manifest",
+                    return_value=manifest,
+                ),
+            ):
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "missing checkpoint artifacts|lacks its commit marker",
+                ):
+                    server._trusted_checkpoint_records(problem_id)
+
+    def test_released_projection_ignores_corrupt_unregistered_artifacts(self) -> None:
+        problem_id = "registry-unregistered-corrupt-inert"
+        prepared = server.memory_append_batch(
+            problem_id,
+            [{"channel": "proof_steps", "record": {"claim": "official"}}],
+        )
+        corrupt = (
+            server._batch_checkpoint_dir(problem_id)
+            / ("batch_" + "f" * 64 + ".json")
+        )
+        corrupt.write_bytes(b"{not-json\n")
+        accepted = {
+            "schema_version": server.MEMORY_BATCH_PUBLICATION_RECEIPT_SCHEMA,
+            "state": "accepted",
+            "run_id": "run-inert",
+            "problem_id": problem_id,
+            "batch_id": prepared["batch_id"],
+            "checkpoint_sha256": prepared["checkpoint_sha256"],
+            "commit_sha256": prepared["commit_sha256"],
+            "publication_class": "reasoning_checkpoint",
+            "accepted_at_utc": "2026-08-10T00:00:01+00:00",
+            "accepted_at_monotonic": 1.0,
+        }
+        with (
+            mock.patch.dict(
+                os.environ, {server._REVIEW_RUN_ENV: "run-inert"}, clear=False
+            ),
+            mock.patch.object(
+                server, "_released_memory_registry_configured", return_value=True
+            ),
+            mock.patch.object(
+                server,
+                "_memory_batch_registry_manifest",
+                return_value={prepared["batch_id"]: accepted},
+            ),
+        ):
+            trusted = server._trusted_checkpoint_records(problem_id)
+            self.assertEqual(len(trusted), 1)
+            self.assertEqual(next(iter(trusted.values()))["record"], {"claim": "official"})
+        with (
+            mock.patch.object(
+                server, "_released_memory_registry_configured", return_value=True
+            ),
+            mock.patch.object(
+                server, "_memory_batch_registry_manifest", return_value={}
+            ),
+        ):
+            self.assertEqual(server._trusted_checkpoint_records(problem_id), {})
 
     def test_memory_append_batch_is_independent_of_partial_memory_init(self) -> None:
         problem_id = "partial-init"
@@ -767,8 +1556,8 @@ class MemoryContextTests(unittest.TestCase):
 
         logical = server._load_memory_entries(problem_id)
 
-        self.assertEqual(len(logical["proof_steps"]), 1)
-        self.assertEqual(len(logical["events"]), 1)
+        self.assertEqual(logical["proof_steps"], [])
+        self.assertEqual(logical["events"], [])
         self.assertEqual(checkpoint.stat().st_nlink, 1)
         self.assertEqual(list(checkpoint_dir.glob(".*.tmp")), [])
 
@@ -888,6 +1677,172 @@ class MemoryContextTests(unittest.TestCase):
         logical = server._load_memory_entries("exact-retry")
         self.assertEqual(len(logical["proof_steps"]), 1)
         self.assertEqual(len(logical["events"]), 1)
+
+    def test_memory_append_batch_exact_retry_replays_winner_without_clock_sampling(
+        self,
+    ) -> None:
+        items = [
+            {
+                "channel": "proof_steps",
+                "record": {"claim": "stable committed winner"},
+            }
+        ]
+        first = server.memory_append_batch("exact-winner-replay", items)
+
+        def unexpected_preflight() -> None:
+            raise AssertionError("a committed exact replay must not call the host")
+
+        with (
+            mock.patch.object(
+                server.time,
+                "time",
+                side_effect=AssertionError("exact replay sampled the wall clock"),
+            ),
+            mock.patch.object(
+                server.time,
+                "monotonic",
+                side_effect=AssertionError("exact replay sampled the monotonic clock"),
+            ),
+            mock.patch.object(
+                server,
+                "_utc_now",
+                side_effect=AssertionError("exact replay created a new timestamp"),
+            ),
+        ):
+            retry = server.memory_append_batch(
+                "exact-winner-replay",
+                items,
+                _trusted_publication_preflight=unexpected_preflight,
+            )
+
+        self.assertEqual(retry, first)
+        self.assertEqual(retry["committed_at_utc"], first["committed_at_utc"])
+        self.assertEqual(retry["commit_sha256"], first["commit_sha256"])
+
+    def test_mcp_exact_batch_replay_survives_phase_close_but_new_write_does_not(
+        self,
+    ) -> None:
+        items = [
+            {
+                "channel": "proof_steps",
+                "record": {"claim": "published before phase close"},
+            }
+        ]
+        first = server.memory_append_batch("mcp-winner-replay", items)
+        functions: dict[str, object] = {}
+
+        class FakeMCP:
+            def __init__(self, _name: str) -> None:
+                pass
+
+            def tool(self, *, name: str):
+                def register(function):
+                    functions[name] = function
+                    return function
+
+                return register
+
+        def closed(_tool_name: str) -> None:
+            raise ValueError("phase is closed")
+
+        with (
+            mock.patch.object(server, "FastMCP", FakeMCP),
+            mock.patch.object(server, "_context_rehydrate_preflight", return_value=None),
+            mock.patch.object(server, "_reasoning_phase_preflight", side_effect=closed),
+        ):
+            server.build_mcp_app()
+            batch_tool = functions["memory_append_batch"]
+            assert callable(batch_tool)
+            replay = batch_tool("mcp-winner-replay", items)
+            with self.assertRaisesRegex(ValueError, "phase is closed"):
+                batch_tool(
+                    "mcp-winner-replay",
+                    [
+                        {
+                            "channel": "proof_steps",
+                            "record": {"claim": "new write after phase close"},
+                        }
+                    ],
+                )
+
+        self.assertEqual(replay, first)
+
+    def test_control_publication_receipts_use_commit_witness_and_replay_exactly(
+        self,
+    ) -> None:
+        problem_id = "control-publication-time"
+        prepared = {
+            "review_id": "review_" + "a" * 32,
+            "request_sha256": "1" * 64,
+            "snapshot_sha256": "2" * 64,
+            "state": "completed_pending_close",
+        }
+        with mock.patch.object(
+            server,
+            "_utc_now",
+            return_value="2026-08-10T00:00:00+00:00",
+        ):
+            review_receipt = server._append_review_memory(
+                problem_id=problem_id,
+                body=prepared,
+            )
+        review_record = next(
+            record
+            for record in server._trusted_checkpoint_records(problem_id).values()
+            if record["channel"] == "route_reviews"
+        )
+        replay = server._publication_receipt_for_existing(
+            problem_id, review_record, prepared
+        )
+        checkpoint = server._validate_memory_batch_checkpoint(
+            problem_id,
+            server._batch_checkpoint_dir(problem_id)
+            / f"{review_record['batch_id']}.json",
+        )
+        self.assertEqual(review_receipt, replay)
+        self.assertEqual(
+            review_receipt["timestamp_utc"], checkpoint["committed_at_utc"]
+        )
+        self.assertNotEqual(
+            review_receipt["timestamp_utc"], checkpoint["timestamp_utc"]
+        )
+
+        targeted_body = {
+            **prepared,
+            "state": "official_published",
+            "run_id": "run-1",
+        }
+        ticket = {"ticket_id": "claim_" + "b" * 32}
+        targeted_receipt = server._append_targeted_result_memory(
+            problem_id=problem_id,
+            review_body=targeted_body,
+            ticket=ticket,
+            outcome_state="operational_blocked",
+            verification_receipt=None,
+            error_sha256="3" * 64,
+        )
+        found = server._find_targeted_result_memory(
+            problem_id,
+            review_id=prepared["review_id"],
+            request_sha256=prepared["request_sha256"],
+            snapshot_sha256=prepared["snapshot_sha256"],
+        )
+        self.assertIsNotNone(found)
+        assert found is not None
+        targeted_record, stored_body = found
+        targeted_replay = server._targeted_publication_receipt_for_existing(
+            problem_id, targeted_record, stored_body
+        )
+        targeted_checkpoint = server._validate_memory_batch_checkpoint(
+            problem_id,
+            server._batch_checkpoint_dir(problem_id)
+            / f"{targeted_record['batch_id']}.json",
+        )
+        self.assertEqual(targeted_receipt, targeted_replay)
+        self.assertEqual(
+            targeted_receipt["timestamp_utc"],
+            targeted_checkpoint["committed_at_utc"],
+        )
 
     def test_memory_append_batch_hash_collision_rejects_different_items(self) -> None:
         problem_id = "simulated-hash-collision"
@@ -1052,6 +2007,119 @@ class MemoryContextTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "duplicate JSON key 'problem_id'"):
             server.memory_init("duplicate-meta")
 
+    def test_legacy_v2_checkpoint_without_marker_remains_readable(self) -> None:
+        problem_id = "legacy-v2-readable"
+        server.memory_init(problem_id)
+        checkpoint_dir = server._batch_checkpoint_dir(problem_id)
+        server._ensure_memory_directory_durable(checkpoint_dir)
+        items = [
+            {
+                "channel": "proof_steps",
+                "record": {"claim": "legacy checkpoint remains visible"},
+                "active": True,
+                "supersedes": [],
+            }
+        ]
+        encoded_items = json.dumps(items, sort_keys=True, separators=(",", ":")).encode(
+            "utf-8"
+        )
+        batch_id = server._batch_id_for_items(
+            problem_id,
+            encoded_items,
+            schema=server.LEGACY_MEMORY_BATCH_SCHEMA,
+        )
+        timestamp = "2026-08-10T00:00:00+00:00"
+        record = {
+            "record_id": server._batch_record_id(batch_id, 0),
+            "timestamp_utc": timestamp,
+            "channel": "proof_steps",
+            "active": True,
+            "supersedes": [],
+            "batch_id": batch_id,
+            "record": items[0]["record"],
+        }
+        payload = {
+            "schema": server.LEGACY_MEMORY_BATCH_SCHEMA,
+            "batch_id": batch_id,
+            "timestamp_utc": timestamp,
+            "records": [record],
+            "event": {
+                "record_id": server._batch_event_id(batch_id),
+                "timestamp_utc": timestamp,
+                "event_type": "memory_append_batch",
+                "batch_id": batch_id,
+                "active": True,
+                "supersedes": [],
+                "appended_records": [
+                    {"record_id": record["record_id"], "channel": "proof_steps"}
+                ],
+            },
+        }
+        payload["checkpoint_sha256"] = server._memory_batch_checkpoint_sha256(payload)
+        checkpoint = checkpoint_dir / f"{batch_id}.json"
+        checkpoint.write_text(
+            json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n",
+            encoding="utf-8",
+        )
+
+        self.assertFalse(server._batch_commit_path(checkpoint).exists())
+        trusted = server._trusted_checkpoint_records(problem_id)
+        self.assertEqual(trusted[record["record_id"]]["timestamp_utc"], timestamp)
+        self.assertEqual(trusted[record["record_id"]]["record"], items[0]["record"])
+        with (
+            mock.patch.object(
+                server, "_released_memory_registry_configured", return_value=True
+            ),
+            mock.patch.object(
+                server, "_memory_batch_registry_manifest", return_value={}
+            ),
+        ):
+            self.assertEqual(server._trusted_checkpoint_records(problem_id), {})
+            self.assertEqual(
+                server._load_memory_entries(problem_id)["proof_steps"], []
+            )
+
+        validated = server._validate_memory_batch_checkpoint_data(
+            problem_id, checkpoint
+        )
+        commit = server._publish_memory_batch_commit_once(
+            checkpoint,
+            validated,
+            initial_cutoffs=None,
+            publication_preflight=None,
+        )
+        fake_receipt = {
+            "schema_version": server.MEMORY_BATCH_PUBLICATION_RECEIPT_SCHEMA,
+            "state": "accepted",
+            "run_id": "run-legacy-test",
+            "problem_id": problem_id,
+            "batch_id": batch_id,
+            "checkpoint_sha256": validated["checkpoint_sha256"],
+            "commit_sha256": commit["commit_sha256"],
+            "publication_class": "reasoning_checkpoint",
+            "accepted_at_utc": "2026-08-10T00:00:01+00:00",
+            "accepted_at_monotonic": 1.0,
+        }
+        with (
+            mock.patch.dict(
+                os.environ,
+                {server._REVIEW_RUN_ENV: "run-legacy-test"},
+                clear=False,
+            ),
+            mock.patch.object(
+                server, "_released_memory_registry_configured", return_value=True
+            ),
+            mock.patch.object(
+                server,
+                "_memory_batch_registry_manifest",
+                return_value={batch_id: fake_receipt},
+            ),
+        ):
+            with self.assertRaisesRegex(
+                ValueError, "does not bind its artifact"
+            ):
+                server._validate_memory_batch_checkpoint(problem_id, checkpoint)
+
     def test_v2_checkpoint_rejects_canonical_non_sha_batch_id(self) -> None:
         problem_id = "non-sha-checkpoint"
         server.memory_init(problem_id)
@@ -1069,7 +2137,7 @@ class MemoryContextTests(unittest.TestCase):
             "record": {"claim": "must not enter logical memory"},
         }
         payload = {
-            "schema": server.MEMORY_BATCH_SCHEMA,
+            "schema": server.LEGACY_MEMORY_BATCH_SCHEMA,
             "batch_id": batch_id,
             "timestamp_utc": timestamp,
             "records": [record],

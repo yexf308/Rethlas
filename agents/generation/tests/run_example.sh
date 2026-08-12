@@ -2660,9 +2660,96 @@ generation_control_resume() {
     --generation-control-resume "$problem_rel"
 }
 
+owner_memory_batch_publication_snapshot() {
+  local envelope response canonical
+  if [[ "$REVIEW_CADENCE_POLICY" != rethlas_route_review_90m_v1 ]]; then
+    echo "Owner memory publication snapshots require the released cadence." >&2
+    return 70
+  fi
+  envelope="$(
+    "$TRUSTED_PYTHON_BIN" -I -B - "$problem_rel" <<'PY'
+import json
+import sys
+
+value = {
+    "schema_version": "rethlas_review_adapter_command_v1",
+    "command": "review_status",
+    "payload": {
+        "operation": "memory_batch_publication_status",
+        "problem_id": sys.argv[1],
+    },
+}
+print(json.dumps(value, allow_nan=False, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
+PY
+  )" || return 70
+  if ! response="$(run_owner_control review-status "$envelope")"; then
+    echo "Could not read the owner-authenticated memory publication manifest." >&2
+    return 70
+  fi
+  if ! canonical="$(
+    RETHLAS_OWNER_MEMORY_BATCH_STATUS_RAW_JSON="$response" \
+      "$TRUSTED_PYTHON_BIN" -I -B - <<'PY'
+import json
+import os
+
+MAX_BYTES = 262_144
+
+
+def reject_duplicates(pairs):
+    value = {}
+    for key, item in pairs:
+        if key in value:
+            raise ValueError(f"duplicate JSON key: {key}")
+        value[key] = item
+    return value
+
+
+def reject_constant(value):
+    raise ValueError(f"non-finite JSON constant: {value}")
+
+
+raw = os.environ["RETHLAS_OWNER_MEMORY_BATCH_STATUS_RAW_JSON"]
+encoded = raw.encode("utf-8")
+if not encoded or len(encoded) > MAX_BYTES:
+    raise SystemExit("owner memory publication manifest exceeds its byte bound")
+value = json.loads(
+    raw,
+    object_pairs_hook=reject_duplicates,
+    parse_constant=reject_constant,
+)
+canonical = json.dumps(
+    value,
+    allow_nan=False,
+    ensure_ascii=False,
+    sort_keys=True,
+    separators=(",", ":"),
+)
+if len(canonical.encode("utf-8")) > MAX_BYTES:
+    raise SystemExit("canonical owner memory publication manifest exceeds its byte bound")
+print(canonical)
+PY
+  )"; then
+    echo "Owner memory publication manifest was not bounded strict JSON." >&2
+    return 70
+  fi
+  printf '%s' "$canonical"
+}
+
 generation_control_receipt() {
-  local receipt
-  if ! receipt="$(
+  local receipt owner_manifest_snapshot
+  if [[ "$REVIEW_CADENCE_POLICY" == rethlas_route_review_90m_v1 ]]; then
+    owner_manifest_snapshot="$(
+      owner_memory_batch_publication_snapshot
+    )" || return 70
+    if ! receipt="$(
+      RETHLAS_OWNER_MEMORY_BATCH_PUBLICATION_SNAPSHOT_JSON="$owner_manifest_snapshot" \
+        "$TRUSTED_PYTHON_BIN" "${TRUSTED_MCP_LOADER_ARGS[@]}" -- \
+          --generation-control-receipt "$problem_rel"
+    )"; then
+      echo "Could not read the trusted generation-control receipt." >&2
+      return 70
+    fi
+  elif ! receipt="$(
     "$TRUSTED_PYTHON_BIN" "${TRUSTED_MCP_LOADER_ARGS[@]}" -- \
       --generation-control-receipt "$problem_rel"
   )"; then
@@ -3456,7 +3543,11 @@ entries = [
 print("{" + ", ".join(entries) + "}")
 PY
 )"
-TRUSTED_REASONING_AGENT_MCP_TOML="{command=$TRUSTED_PYTHON_COMMAND_TOML,args=$TRUSTED_MCP_ARGS_TOML,cwd=$TRUSTED_MCP_CWD_TOML,env=$TRUSTED_MCP_ENV_TOML,required=true,tool_timeout_sec=3600,default_tools_approval_mode=\"approve\"}"
+TRUSTED_REASONING_MCP_BASE_TOML="{tool_timeout_sec=3600,command=$TRUSTED_PYTHON_COMMAND_TOML,args=$TRUSTED_MCP_ARGS_TOML,cwd=$TRUSTED_MCP_CWD_TOML,env=$TRUSTED_MCP_ENV_TOML,required=true,default_tools_approval_mode=\"approve\"}"
+TRUSTED_REASONING_AGENT_MCP_TOML="${TRUSTED_REASONING_MCP_BASE_TOML%?},disabled_tools=[\"memory_append_batch\"]}"
+TRUSTED_REASONING_CHECKPOINT_BASE_TOML="${TRUSTED_REASONING_MCP_BASE_TOML/tool_timeout_sec=3600/tool_timeout_sec=60}"
+TRUSTED_REASONING_CHECKPOINT_PRIMARY_MCP_TOML="${TRUSTED_REASONING_CHECKPOINT_BASE_TOML%?},enabled_tools=[\"memory_append_batch\"]}"
+TRUSTED_REASONING_CHECKPOINT_RECOVERY_MCP_TOML="${TRUSTED_REASONING_CHECKPOINT_BASE_TOML%?},enabled_tools=[\"memory_append_batch\"]}"
 
 validate_cadence_projection() {
   local projection="$1"
@@ -5041,7 +5132,7 @@ while true; do
       --model "$MODEL"
       --effort "$REASONING_EFFORT"
       --web-mode "$web_mode"
-      --mcp-config-toml "$TRUSTED_REASONING_AGENT_MCP_TOML"
+      --mcp-config-toml "$TRUSTED_REASONING_MCP_BASE_TOML"
       --shell-policy-toml "$TRUSTED_SHELL_ENVIRONMENT_POLICY_TOML"
       --codex-bin "$CODEX_BIN"
       --codex-bin-sha256 "$CODEX_BIN_SHA256"
@@ -5069,6 +5160,8 @@ while true; do
       --config "web_search=\"$web_mode\""
       --config "shell_environment_policy=$TRUSTED_SHELL_ENVIRONMENT_POLICY_TOML"
       --config "mcp_servers.reasoning_agent=$TRUSTED_REASONING_AGENT_MCP_TOML"
+      --config "mcp_servers.reasoning_checkpoint_primary=$TRUSTED_REASONING_CHECKPOINT_PRIMARY_MCP_TOML"
+      --config "mcp_servers.reasoning_checkpoint_recovery=$TRUSTED_REASONING_CHECKPOINT_RECOVERY_MCP_TOML"
       --sandbox workspace-write
       --ephemeral
       "$prompt"

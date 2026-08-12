@@ -643,20 +643,28 @@ reasoning_mcp_configs = [
     for index, value in enumerate(sys.argv)
     if index > 0
     and sys.argv[index - 1] == "--config"
-    and value.startswith("mcp_servers.reasoning_agent")
+    and value.startswith("mcp_servers.reasoning_")
 ]
-assert len(reasoning_mcp_configs) == 1
-assert reasoning_mcp_configs[0].startswith("mcp_servers.reasoning_agent=")
-reasoning_mcp = tomllib.loads(
-    "value=" + reasoning_mcp_configs[0].split("=", 1)[1]
-)["value"]
+assert len(reasoning_mcp_configs) == 3
+reasoning_mcp_servers = {
+    raw.split("=", 1)[0].removeprefix("mcp_servers."): tomllib.loads(
+        "value=" + raw.split("=", 1)[1]
+    )["value"]
+    for raw in reasoning_mcp_configs
+}
+assert set(reasoning_mcp_servers) == {
+    "reasoning_agent",
+    "reasoning_checkpoint_primary",
+    "reasoning_checkpoint_recovery",
+}
+reasoning_mcp = reasoning_mcp_servers["reasoning_agent"]
 if os.environ.get("MOCK_EXPECT_NO_ADVISOR_ENV"):
     for name in (
         "RETHLAS_ADVISOR_RECEIPTS_ROOT",
         "RETHLAS_EXPECTED_HOTJOIN_RUN_ID",
     ):
         assert name not in os.environ
-        assert name not in reasoning_mcp["env"]
+        assert all(name not in server["env"] for server in reasoning_mcp_servers.values())
 assert set(reasoning_mcp) == {
     "command",
     "args",
@@ -665,7 +673,50 @@ assert set(reasoning_mcp) == {
     "required",
     "tool_timeout_sec",
     "default_tools_approval_mode",
+    "disabled_tools",
 }
+for checkpoint_id in (
+    "reasoning_checkpoint_primary",
+    "reasoning_checkpoint_recovery",
+):
+    assert set(reasoning_mcp_servers[checkpoint_id]) == {
+        "command",
+        "args",
+        "cwd",
+        "env",
+        "required",
+        "tool_timeout_sec",
+        "default_tools_approval_mode",
+        "enabled_tools",
+    }
+common_keys = {
+    "command",
+    "args",
+    "cwd",
+    "env",
+    "required",
+    "default_tools_approval_mode",
+}
+assert len(
+    {
+        json.dumps(
+            {key: server[key] for key in common_keys},
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        for server in reasoning_mcp_servers.values()
+    }
+) == 1
+assert reasoning_mcp["disabled_tools"] == ["memory_append_batch"]
+for checkpoint_id in (
+    "reasoning_checkpoint_primary",
+    "reasoning_checkpoint_recovery",
+):
+    checkpoint = reasoning_mcp_servers[checkpoint_id]
+    assert checkpoint["enabled_tools"] == ["memory_append_batch"]
+    assert checkpoint["tool_timeout_sec"] == 60
+    assert checkpoint["required"] is True
+    assert checkpoint["default_tools_approval_mode"] == "approve"
 assert pathlib.Path(reasoning_mcp["command"]).is_absolute()
 assert pathlib.Path(reasoning_mcp["command"]).resolve() == pathlib.Path(
     sys.executable
@@ -696,13 +747,15 @@ for index in range(0, len(module_arguments), 3):
 assert pathlib.Path(reasoning_mcp["cwd"]).resolve() == pathlib.Path.cwd().resolve()
 assert reasoning_mcp["tool_timeout_sec"] == 3600
 assert reasoning_mcp["required"] is True
-# The trusted MCP's memory_init/memory_append tools are writes. "approve" makes
-# every tool on this server noninteractive; approval_policy=never cannot cancel
-# the call while waiting for an unavailable prompt.
+# Every trusted MCP role is noninteractive; approval_policy=never cannot cancel
+# a call while waiting for an unavailable prompt.
 assert reasoning_mcp["default_tools_approval_mode"] == "approve"
 assert "NumPy, SciPy, SymPy, mpmath, and gmpy2" in sys.argv[-1]
 (pathlib.Path.cwd() / "reasoning_mcp_config_seen.json").write_text(
     json.dumps(reasoning_mcp), encoding="utf-8"
+)
+(pathlib.Path.cwd() / "reasoning_mcp_server_map_seen.json").write_text(
+    json.dumps(reasoning_mcp_servers), encoding="utf-8"
 )
 if os.environ.get("MOCK_EXPECT_VERIFY_PROOF_URL"):
     assert os.environ["VERIFY_PROOF_URL"] == os.environ["MOCK_EXPECT_VERIFY_PROOF_URL"]
@@ -1214,6 +1267,7 @@ if command == "init":
                 "guardian_clock_sha256": None,
                 "helper_digests": [],
                 "helper_paths": [],
+                "memory_batch_publications": {},
                 "review_driver_digests": [],
                 "review_driver_package_digests": [],
                 "review_driver_paths": [],
@@ -1927,6 +1981,107 @@ if command == "review-status":
     assert control_envelope["schema_version"] == "rethlas_review_adapter_command_v1"
     assert control_envelope["command"] == "review_status"
     payload = control_envelope["payload"]
+    operation = payload.get("operation")
+    if operation == "memory_batch_publication_commit":
+        assert set(payload) == {
+            "operation", "problem_id", "batch_id", "checkpoint_sha256",
+            "commit_sha256", "publication_class",
+        }
+        assert payload["problem_id"] == state["problem_id"]
+        assert payload["batch_id"].startswith("batch_")
+        assert len(payload["batch_id"]) == 70
+        assert all(
+            character in "0123456789abcdef"
+            for character in payload["batch_id"][6:]
+        )
+        for digest_name in ("checkpoint_sha256", "commit_sha256"):
+            assert len(payload[digest_name]) == 64
+            assert all(
+                character in "0123456789abcdef"
+                for character in payload[digest_name]
+            )
+        assert payload["publication_class"] in {
+            "reasoning_checkpoint", "control_only"
+        }
+        publications = state.setdefault("memory_batch_publications", {})
+        existing = publications.get(payload["batch_id"])
+        request_bindings = {
+            key: payload[key]
+            for key in (
+                "problem_id", "batch_id", "checkpoint_sha256",
+                "commit_sha256", "publication_class",
+            )
+        }
+        if existing is not None:
+            assert all(
+                existing[key] == value
+                for key, value in request_bindings.items()
+            )
+            receipt = existing
+        else:
+            receipt_seed = {
+                "schema_version":
+                    "rethlas_memory_batch_publication_receipt_v1",
+                "state": "accepted",
+                "run_id": run_id,
+                **request_bindings,
+                "cycle_id": active_cycle_id(),
+                "cutoff_action_id": "cadact_" + "a" * 32,
+                "cutoff_kind": "review_1",
+                "cutoff_at_utc": "2030-01-01T00:30:00+00:00",
+                "cutoff_monotonic": 2.0e18,
+                "accepted_at_utc": "2030-01-01T00:00:00+00:00",
+                "accepted_at_monotonic": 1.0,
+                "boot_identity": "mock-cadence-boot",
+            }
+            receipt = {
+                **receipt_seed,
+                "receipt_sha256": hashlib.sha256(
+                    canonical(receipt_seed).encode("utf-8")
+                ).hexdigest(),
+            }
+            # The fake adapter is invoked concurrently by three independent
+            # MCP processes.  Merge under a sidecar lock so a later process
+            # cannot overwrite a receipt committed by an earlier snapshot.
+            lock_path = state_path.with_suffix(state_path.suffix + ".lock")
+            lock_path.touch(exist_ok=True)
+            with lock_path.open("r+") as lock_handle:
+                import fcntl
+
+                fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
+                latest = json.loads(state_path.read_text(encoding="utf-8"))
+                latest_publications = latest.setdefault(
+                    "memory_batch_publications", {}
+                )
+                winner = latest_publications.get(payload["batch_id"])
+                if winner is not None:
+                    assert all(
+                        winner[key] == value
+                        for key, value in request_bindings.items()
+                    )
+                    receipt = winner
+                else:
+                    latest_publications[payload["batch_id"]] = receipt
+                    state_path.write_text(canonical(latest), encoding="utf-8")
+        print(canonical(receipt))
+        raise SystemExit(0)
+    if operation == "memory_batch_publication_status":
+        assert set(payload) == {"operation", "problem_id"}
+        assert payload["problem_id"] == state["problem_id"]
+        latest = json.loads(state_path.read_text(encoding="utf-8"))
+        publications = latest.setdefault("memory_batch_publications", {})
+        receipts = [
+            publications[batch_id]
+            for batch_id in sorted(publications)
+            if publications[batch_id]["state"] == "accepted"
+        ]
+        print(canonical({
+            "schema_version": "rethlas_memory_batch_publication_status_v1",
+            "run_id": run_id,
+            "problem_id": payload["problem_id"],
+            "receipts": receipts,
+        }))
+        raise SystemExit(0)
     assert set(payload) == {
         "operation", "state", "reason_sha256", "evidence_record_ids"
     }
@@ -2027,6 +2182,18 @@ assert hashlib.sha256(runner_token.encode("ascii")).hexdigest() != owner_token_s
 mcp = tomllib.loads(
     "value=" + arguments[arguments.index("--mcp-config-toml") + 1]
 )["value"]
+assert set(mcp) == {
+    "command",
+    "args",
+    "cwd",
+    "env",
+    "required",
+    "tool_timeout_sec",
+    "default_tools_approval_mode",
+}
+assert mcp["tool_timeout_sec"] == 3600
+assert mcp["required"] is True
+assert mcp["default_tools_approval_mode"] == "approve"
 for key, expected in (
     ("RETHLAS_REVIEW_CADENCE_POLICY", REVIEW["policy_id"]),
     ("RETHLAS_CONTEXT_GUARD_POLICY", CONTEXT["policy_id"]),
@@ -2155,6 +2322,10 @@ if os.environ.get("MOCK_HOTJOIN_LEGAL_YIELD"):
         if yield_state == "waiting_owner_advisor_decision"
         else None
     )
+    latest_publications = json.loads(
+        state_path.read_text(encoding="utf-8")
+    ).get("memory_batch_publications", {})
+    state["memory_batch_publications"] = latest_publications
     state_path.write_text(canonical(state), encoding="utf-8")
     trusted_generation_server.context_handoff_prepare(
         purpose="owner_yield",
@@ -2351,6 +2522,26 @@ def _assert_cadence_capabilities_are_fd_only(
         capability = call["control_capability"]
         assert isinstance(arguments, list)
         assert isinstance(capability, dict)
+        assert "--control-token-fd" in arguments
+        assert arguments[arguments.index("--control-token-domain") + 1] == "owner"
+        assert capability["domain"] == "owner"
+        assert capability["sha256"] in owner_digests
+        assert call["runner_capability_sha256"] is None
+        assert call["capability_env_present"] is False
+
+    owner_manifest_calls = [
+        call
+        for call in calls
+        if call["command"] == "review-status"
+        and isinstance(call.get("control_envelope"), dict)
+        and call["control_envelope"].get("payload", {}).get("operation")
+        == "memory_batch_publication_status"
+        and call["control_capability"] is not None
+    ]
+    assert owner_manifest_calls
+    for call in owner_manifest_calls:
+        arguments = call["argv"]
+        capability = call["control_capability"]
         assert "--control-token-fd" in arguments
         assert arguments[arguments.index("--control-token-domain") + 1] == "owner"
         assert capability["domain"] == "owner"
@@ -4928,16 +5119,24 @@ def test_legacy_runner_drops_inherited_advisor_and_hotjoin_bindings(
     assert completed.returncode == 0, completed.stdout + completed.stderr
 
 
-def test_runner_injects_complete_mcp_and_auto_approves_memory_tools(
+def test_runner_derives_exact_three_server_checkpoint_split_from_one_base(
     tmp_path: Path,
 ) -> None:
     completed = _run_mock(tmp_path, mode="trusted")
     assert completed.returncode == 0, completed.stdout + completed.stderr
     generation_root = tmp_path / "agents" / "generation"
-    config = json.loads(
-        (generation_root / "reasoning_mcp_config_seen.json").read_text(encoding="utf-8")
+    servers = json.loads(
+        (generation_root / "reasoning_mcp_server_map_seen.json").read_text(
+            encoding="utf-8"
+        )
     )
-    assert set(config) == {
+    assert list(servers) == [
+        "reasoning_agent",
+        "reasoning_checkpoint_primary",
+        "reasoning_checkpoint_recovery",
+    ]
+    reasoning = servers["reasoning_agent"]
+    assert set(reasoning) == {
         "command",
         "args",
         "cwd",
@@ -4945,12 +5144,41 @@ def test_runner_injects_complete_mcp_and_auto_approves_memory_tools(
         "required",
         "tool_timeout_sec",
         "default_tools_approval_mode",
+        "disabled_tools",
     }
-    assert config["default_tools_approval_mode"] == "approve"
-    assert config["required"] is True
-    assert config["tool_timeout_sec"] == 3600
-    assert config["args"][:3] == ["-I", "-B", "-c"]
-    commitments = config["args"][4:]
+    assert reasoning["default_tools_approval_mode"] == "approve"
+    assert reasoning["required"] is True
+    assert reasoning["tool_timeout_sec"] == 3600
+    assert reasoning["disabled_tools"] == ["memory_append_batch"]
+    for checkpoint_id in (
+        "reasoning_checkpoint_primary",
+        "reasoning_checkpoint_recovery",
+    ):
+        checkpoint = servers[checkpoint_id]
+        assert checkpoint["default_tools_approval_mode"] == "approve"
+        assert checkpoint["required"] is True
+        assert checkpoint["tool_timeout_sec"] == 60
+        assert checkpoint["enabled_tools"] == ["memory_append_batch"]
+    common_keys = {
+        "command",
+        "args",
+        "cwd",
+        "env",
+        "required",
+        "default_tools_approval_mode",
+    }
+    assert len(
+        {
+            json.dumps(
+                {key: server[key] for key in common_keys},
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            for server in servers.values()
+        }
+    ) == 1
+    assert reasoning["args"][:3] == ["-I", "-B", "-c"]
+    commitments = reasoning["args"][4:]
     assert len(commitments) == 21
     for offset in range(0, len(commitments), 3):
         module_name, module_path, module_sha256 = commitments[offset : offset + 3]

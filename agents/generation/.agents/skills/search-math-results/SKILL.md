@@ -121,7 +121,7 @@ result remains a lead rather than mathematical evidence.
 
 - `search_matlas_theorems`
 - `search_arxiv_theorems` (distinct legacy arXiv provider; never implicit)
-- `memory_append`
+- `memory_append_batch`
 - `memory_search`
 
 ## Failure Logging

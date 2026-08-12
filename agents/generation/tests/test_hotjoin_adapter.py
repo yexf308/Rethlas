@@ -249,12 +249,31 @@ def _thread_params() -> dict[str, Any]:
     return {
         "allowProviderModelFallback": False,
         "approvalPolicy": "never",
-        "config": {"model_reasoning_effort": "max"},
+        "config": {
+            "mcp_servers": _mcp_server_env_map(),
+            "model_reasoning_effort": "max",
+        },
         "cwd": TEST_GENERATION_CWD,
         "ephemeral": False,
         "model": "gpt-5.6-sol",
         "sandbox": "workspace-write",
     }
+
+
+def _mcp_server_env_map(
+    environment: Mapping[str, str] | None = None,
+) -> dict[str, dict[str, Any]]:
+    return hotjoin._derive_reasoning_mcp_server_map(
+        {
+            "args": [],
+            "command": sys.executable,
+            "cwd": TEST_GENERATION_CWD,
+            "default_tools_approval_mode": "approve",
+            "env": dict(environment or {}),
+            "required": True,
+            "tool_timeout_sec": 3600,
+        }
+    )
 
 
 def _model_entry(
@@ -670,6 +689,121 @@ def _bind_continuation_capability(
         monotonic_epoch=monotonic_epoch,
     )
     return token
+
+
+def _admit_test_memory_batch_before_review(
+    ledger: hotjoin.ConversationLedger,
+    receipt: Mapping[str, Any],
+    *,
+    accepted_at: float,
+) -> None:
+    """Install a host-admission fixture for review tests unrelated to registry races."""
+
+    with ledger._connect() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        cycle = connection.execute(
+            "SELECT * FROM cadence_cycles WHERE run_id = 'run-1' "
+            "ORDER BY started_at_epoch DESC LIMIT 1"
+        ).fetchone()
+        assert cycle is not None
+        cutoff = connection.execute(
+            "SELECT * FROM cadence_actions WHERE cycle_id = ? "
+            "AND kind = 'review_1'",
+            (cycle["cycle_id"],),
+        ).fetchone()
+        assert cutoff is not None
+        observed_wall = time.time()
+        observed_monotonic = time.monotonic()
+        boot_identity = hotjoin._current_boot_identity()
+        connection.execute(
+            "UPDATE cadence_cycles SET boot_identity = ? WHERE cycle_id = ?",
+            (boot_identity, cycle["cycle_id"]),
+        )
+        cutoff_monotonic: float | None = None
+        actions = connection.execute(
+            "SELECT action_id, due_at, due_monotonic FROM cadence_actions "
+            "WHERE cycle_id = ?",
+            (cycle["cycle_id"],),
+        ).fetchall()
+        for action in actions:
+            if action["due_monotonic"] is None:
+                mapped_due = observed_monotonic + (
+                    float(action["due_at"]) - observed_wall
+                )
+                if mapped_due <= 1.0:
+                    raise AssertionError("test cadence monotonic mapping is invalid")
+                connection.execute(
+                    "UPDATE cadence_actions SET due_monotonic = ? "
+                    "WHERE action_id = ?",
+                    (mapped_due, action["action_id"]),
+                )
+                if action["action_id"] == cutoff["action_id"]:
+                    cutoff_monotonic = mapped_due
+            elif action["action_id"] == cutoff["action_id"]:
+                cutoff_monotonic = float(action["due_monotonic"])
+        if cutoff_monotonic is None:
+            raise AssertionError("review cutoff lacks a monotonic fixture")
+        accepted_monotonic = max(1.0, cutoff_monotonic - 1.0)
+        publication = hotjoin._memory_batch_publication_receipt(
+            state="accepted",
+            run_id="run-1",
+            problem_id="problem/example",
+            batch_id=str(receipt["batch_id"]),
+            checkpoint_sha256=str(receipt["checkpoint_sha256"]),
+            commit_sha256=str(receipt["commit_sha256"]),
+            publication_class="reasoning_checkpoint",
+            cycle_id=str(cycle["cycle_id"]),
+            cutoff_action_id=str(cutoff["action_id"]),
+            cutoff_kind="review_1",
+            cutoff_at=float(cutoff["due_at"]),
+            cutoff_monotonic=cutoff_monotonic,
+            accepted_at=float(accepted_at),
+            accepted_at_monotonic=accepted_monotonic,
+            boot_identity=boot_identity,
+        )
+        sequence, _, _ = ledger._append_event(
+            connection,
+            run_id="run-1",
+            kind="memory_batch_publication_accepted",
+            actor="test_fixture",
+            payload={
+                "batch_id": receipt["batch_id"],
+                "checkpoint_sha256": receipt["checkpoint_sha256"],
+                "commit_sha256": receipt["commit_sha256"],
+                "publication_class": "reasoning_checkpoint",
+                "receipt_sha256": publication["receipt_sha256"],
+            },
+        )
+        publication_id = "membatchpub_" + hashlib.sha256(
+            f"run-1\0{receipt['batch_id']}".encode()
+        ).hexdigest()[:32]
+        connection.execute(
+            "INSERT INTO memory_batch_publications("
+            "publication_id, run_id, problem_id, batch_id, checkpoint_sha256, "
+            "commit_sha256, publication_class, state, cycle_id, cutoff_action_id, "
+            "cutoff_kind, cutoff_at, cutoff_monotonic, accepted_at, "
+            "accepted_at_monotonic, boot_identity, receipt_json, receipt_sha256, "
+            "created_sequence) VALUES (?, 'run-1', 'problem/example', ?, ?, ?, "
+            "'reasoning_checkpoint', 'accepted', ?, ?, 'review_1', ?, ?, ?, ?, ?, "
+            "?, ?, ?)",
+            (
+                publication_id,
+                receipt["batch_id"],
+                receipt["checkpoint_sha256"],
+                receipt["commit_sha256"],
+                cycle["cycle_id"],
+                cutoff["action_id"],
+                float(cutoff["due_at"]),
+                cutoff_monotonic,
+                float(accepted_at),
+                accepted_monotonic,
+                boot_identity,
+                hotjoin._canonical_json(publication),
+                publication["receipt_sha256"],
+                sequence,
+            ),
+        )
+        connection.commit()
 
 
 class _GuardianIdentity:
@@ -3194,7 +3328,7 @@ def test_owner_yield_two_phase_close_is_idempotent_and_never_paid(
     rpc.add("turn/start", {"turn": _turn("turn-2", "inProgress")})
     adapter = _leased_adapter(ledger, rpc)
     fresh_thread_params = _thread_params()
-    fresh_thread_params["config"]["mcp_servers"] = {"reasoning_agent": {"env": {}}}
+    fresh_thread_params["config"]["mcp_servers"] = _mcp_server_env_map()
     assert adapter._ensure_thread(fresh_thread_params) == "thread-2"
     assert adapter.pending_handoff_binding is not None
     assert adapter.pending_handoff_binding["purpose"] == "owner_yield"
@@ -3893,7 +4027,7 @@ def test_t87_cycle_close_becomes_continue_next_cycle_only_after_t90_terminal(
     rpc.add("turn/start", {"turn": _turn("turn-2", "inProgress")})
     adapter = _leased_adapter(ledger, rpc)
     fresh_thread_params = _thread_params()
-    fresh_thread_params["config"]["mcp_servers"] = {"reasoning_agent": {"env": {}}}
+    fresh_thread_params["config"]["mcp_servers"] = _mcp_server_env_map()
     original_bind_fresh = ledger.bind_fresh_thread_epoch
 
     def fail_next_bind(*args: Any, **kwargs: Any) -> dict[str, Any]:
@@ -4109,6 +4243,29 @@ def test_review_due_and_reasoning_phase_preflights_bind_host_state(
         lease=lease,
     )[0]
     terminal_sha256 = _terminalize_due_review_action(ledger, lease=lease, action=due)
+    observed_boot_identity = (
+        hotjoin._system_guardian_process_inspector().boot_identity()
+    )
+    observed_monotonic = time.monotonic()
+    action_monotonic = {
+        "review_1": observed_monotonic - 1.0,
+        "review_2": observed_monotonic + 1_800.0,
+        "close_notice": observed_monotonic + 3_420.0,
+        "hard_stop": observed_monotonic + 3_600.0,
+    }
+    with ledger._connect() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        connection.execute(
+            "UPDATE cadence_cycles SET boot_identity = ? WHERE cycle_id = ?",
+            (observed_boot_identity, cycle["cycle_id"]),
+        )
+        for kind, due_monotonic in action_monotonic.items():
+            connection.execute(
+                "UPDATE cadence_actions SET due_monotonic = ? "
+                "WHERE cycle_id = ? AND kind = ?",
+                (due_monotonic, cycle["cycle_id"], kind),
+            )
+        connection.commit()
     token = _bind_continuation_capability(ledger)
     environment = {
         **os.environ,
@@ -4161,13 +4318,668 @@ def test_review_due_and_reasoning_phase_preflights_bind_host_state(
     denied = json.loads(denied_process.stdout)
     assert allowed["tool_permitted"] is False
     assert denied["tool_permitted"] is False
-    assert allowed["review_due_at_utc"] == boundary["due_at_utc"]
+    next_review_due_at_utc = datetime.fromtimestamp(
+        float(cycle["started_at_epoch"]) + 3_600, timezone.utc
+    ).isoformat()
+    assert allowed["review_due_at_utc"] == next_review_due_at_utc
+    assert denied["review_due_at_utc"] == next_review_due_at_utc
+    assert allowed["review_due_monotonic"] == action_monotonic["review_2"]
+    assert denied["review_due_monotonic"] == action_monotonic["review_2"]
     assert (
         allowed["hard_stop_at_utc"]
         == datetime.fromtimestamp(
             float(cycle["hard_stop_due"]), timezone.utc
         ).isoformat()
     )
+    assert allowed["hard_stop_monotonic"] == action_monotonic["hard_stop"]
+    assert denied["hard_stop_monotonic"] == action_monotonic["hard_stop"]
+
+
+def test_active_checkpoint_preflight_uses_earliest_same_boot_review_clock(
+    ledger: hotjoin.ConversationLedger,
+) -> None:
+    now = time.time()
+    lease, cycle = _materialize_cadence_turn(ledger, started_at=now)
+    observed_boot_identity = (
+        hotjoin._system_guardian_process_inspector().boot_identity()
+    )
+    observed_monotonic = time.monotonic()
+    with ledger._connect() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        connection.execute(
+            "UPDATE cadence_cycles SET boot_identity = ? WHERE cycle_id = ?",
+            (observed_boot_identity, cycle["cycle_id"]),
+        )
+        for kind, offset in {
+            "review_1": 1_800.0,
+            "review_2": 3_600.0,
+            "close_notice": 5_220.0,
+            "hard_stop": 5_400.0,
+        }.items():
+            connection.execute(
+                "UPDATE cadence_actions SET due_monotonic = ? "
+                "WHERE cycle_id = ? AND kind = ?",
+                (observed_monotonic + offset, cycle["cycle_id"], kind),
+            )
+        connection.commit()
+    token = _bind_continuation_capability(ledger)
+    environment = {
+        **os.environ,
+        hotjoin.REVIEW_CONTROL_TOKEN_ENV: token,
+        hotjoin.REVIEW_DATABASE_ENV: str(ledger.path),
+    }
+
+    allowed_process = _invoke_control_subprocess(
+        "review-status",
+        {"operation": "reasoning_phase_preflight", "tool_name": "memory_append_batch"},
+        environment,
+    )
+    assert allowed_process.returncode == 0, allowed_process.stderr
+    allowed = json.loads(allowed_process.stdout)
+    assert allowed["tool_permitted"] is True
+    assert allowed["review_due_at_utc"] == datetime.fromtimestamp(
+        float(cycle["started_at_epoch"]) + 1_800.0, timezone.utc
+    ).isoformat()
+    assert allowed["review_due_monotonic"] == observed_monotonic + 1_800.0
+
+    with ledger._connect() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        connection.execute(
+            "UPDATE cadence_actions SET due_monotonic = ? "
+            "WHERE cycle_id = ? AND kind = 'review_1'",
+            (observed_monotonic - 1.0, cycle["cycle_id"]),
+        )
+        connection.commit()
+    denied_process = _invoke_control_subprocess(
+        "review-status",
+        {"operation": "reasoning_phase_preflight", "tool_name": "memory_append_batch"},
+        environment,
+    )
+    assert denied_process.returncode == 0, denied_process.stderr
+    assert json.loads(denied_process.stdout)["tool_permitted"] is False
+    ledger.release_lease("run-1", lease)
+
+
+def _registry_publication_payload(
+    *, suffix: str, publication_class: str
+) -> dict[str, Any]:
+    return {
+        "operation": "memory_batch_publication_commit",
+        "problem_id": "problem/example",
+        "batch_id": "batch_" + suffix * 64,
+        "checkpoint_sha256": ("a" if suffix != "a" else "b") * 64,
+        "commit_sha256": ("c" if suffix != "c" else "d") * 64,
+        "publication_class": publication_class,
+    }
+
+
+def _materialize_registry_capabilities(
+    ledger: hotjoin.ConversationLedger,
+) -> tuple[hotjoin.GeneratorHotJoin, dict[str, Any], str, str]:
+    now_wall = time.time()
+    now_monotonic = time.monotonic()
+    adapter, cycle = _materialize_guardian_clock_turn(
+        ledger,
+        wall_epoch=now_wall,
+        monotonic_epoch=now_monotonic,
+    )
+    ledger.ensure_initial_thread_epoch(
+        "run-1",
+        thread_id="thread-1",
+        turn_id="turn-1",
+        lease=adapter._lease(),
+    )
+    owner_token = _bind_continuation_capability(ledger)
+    reasoning = ledger.activate_reasoning_epoch_capability(
+        "run-1", owner_token=owner_token
+    )
+    return adapter, cycle, owner_token, str(reasoning["token"])
+
+
+def test_memory_batch_registry_accepts_before_due_and_replays_after_due(
+    ledger: hotjoin.ConversationLedger,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter, cycle, _owner_token, reasoning_token = (
+        _materialize_registry_capabilities(ledger)
+    )
+    monkeypatch.setattr(
+        hotjoin, "_current_boot_identity", lambda: str(cycle["boot_identity"])
+    )
+    monkeypatch.setattr(hotjoin, "_review_control_token", lambda: reasoning_token)
+    payload = _registry_publication_payload(
+        suffix="1", publication_class="reasoning_checkpoint"
+    )
+    accepted = hotjoin._memory_batch_publication_control(ledger, payload)
+    assert accepted["state"] == "accepted"
+    assert accepted["cutoff_kind"] == "review_1"
+    assert datetime.fromisoformat(accepted["accepted_at_utc"]).timestamp() < float(
+        cycle["r1_due"]
+    )
+    assert float(accepted["accepted_at_monotonic"]) < float(
+        accepted["cutoff_monotonic"]
+    )
+
+    due = ledger.cadence_tick(
+        "run-1",
+        now_epoch=float(cycle["r1_due"]),
+        now_monotonic=float(accepted["cutoff_monotonic"]),
+        boot_identity=str(cycle["boot_identity"]),
+        thread_id="thread-1",
+        turn_id="turn-1",
+        lease=adapter._lease(),
+    )
+    assert [action.kind for action in due] == ["review_1"]
+    assert hotjoin._memory_batch_publication_control(ledger, payload) == accepted
+    events = ledger.events("run-1")
+    accepted_sequence = next(
+        event["sequence"]
+        for event in events
+        if event["kind"] == "memory_batch_publication_accepted"
+    )
+    due_sequence = next(
+        event["sequence"] for event in events if event["kind"] == "cadence_action_due"
+    )
+    assert sum(
+        event["kind"] == "memory_batch_publication_accepted" for event in events
+    ) == 1
+    assert accepted_sequence < due_sequence
+
+
+def test_linked_marker_rejected_after_due_is_absent_from_trusted_projection(
+    ledger: hotjoin.ConversationLedger,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from agents.generation.mcp import server as memory_server
+
+    adapter, cycle, _owner_token, reasoning_token = (
+        _materialize_registry_capabilities(ledger)
+    )
+    monkeypatch.setattr(
+        hotjoin, "_current_boot_identity", lambda: str(cycle["boot_identity"])
+    )
+    monkeypatch.setattr(hotjoin, "_review_control_token", lambda: reasoning_token)
+    monkeypatch.setattr(memory_server, "MEMORY_ROOT", tmp_path / "memory")
+    monkeypatch.setattr(
+        memory_server,
+        "_released_memory_registry_configured",
+        lambda **_kwargs: False,
+    )
+    prepared = memory_server.memory_append_batch(
+        "problem/example",
+        [{"channel": "proof_steps", "record": {"claim": "prepared before T30"}}],
+    )
+    checkpoint = Path(prepared["checkpoint_path"])
+    assert memory_server._batch_commit_path(checkpoint).is_file()
+
+    with ledger._connect() as connection:
+        review_1 = dict(
+            connection.execute(
+                "SELECT * FROM cadence_actions WHERE cycle_id = ? AND kind = 'review_1'",
+                (cycle["cycle_id"],),
+            ).fetchone()
+        )
+    ledger.cadence_tick(
+        "run-1",
+        now_epoch=float(review_1["due_at"]),
+        now_monotonic=float(review_1["due_monotonic"]),
+        boot_identity=str(cycle["boot_identity"]),
+        thread_id="thread-1",
+        turn_id="turn-1",
+        lease=adapter._lease(),
+    )
+    rejected = hotjoin._memory_batch_publication_control(
+        ledger,
+        {
+            "operation": "memory_batch_publication_commit",
+            "problem_id": "problem/example",
+            "batch_id": prepared["batch_id"],
+            "checkpoint_sha256": prepared["checkpoint_sha256"],
+            "commit_sha256": prepared["commit_sha256"],
+            "publication_class": "reasoning_checkpoint",
+        },
+    )
+    assert rejected["state"] == "rejected"
+    status = hotjoin._memory_batch_publication_status_control(
+        ledger,
+        {
+            "operation": "memory_batch_publication_status",
+            "problem_id": "problem/example",
+        },
+    )
+    assert status["receipts"] == []
+
+    monkeypatch.setattr(
+        memory_server,
+        "_released_memory_registry_configured",
+        lambda **_kwargs: True,
+    )
+    monkeypatch.setattr(
+        memory_server,
+        "_memory_batch_registry_manifest",
+        lambda _problem, **_kwargs: {},
+    )
+    assert memory_server._trusted_checkpoint_records("problem/example") == {}
+
+
+def test_memory_batch_registry_rejects_after_due_and_replays_rejection(
+    ledger: hotjoin.ConversationLedger,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter, cycle, owner_token, reasoning_token = (
+        _materialize_registry_capabilities(ledger)
+    )
+    monkeypatch.setattr(
+        hotjoin, "_current_boot_identity", lambda: str(cycle["boot_identity"])
+    )
+    with ledger._connect() as connection:
+        review_1 = dict(
+            connection.execute(
+                "SELECT * FROM cadence_actions WHERE cycle_id = ? "
+                "AND kind = 'review_1'",
+                (cycle["cycle_id"],),
+            ).fetchone()
+        )
+    due = ledger.cadence_tick(
+        "run-1",
+        now_epoch=float(review_1["due_at"]),
+        now_monotonic=float(review_1["due_monotonic"]),
+        boot_identity=str(cycle["boot_identity"]),
+        thread_id="thread-1",
+        turn_id="turn-1",
+        lease=adapter._lease(),
+    )
+    assert [action.kind for action in due] == ["review_1"]
+    monkeypatch.setattr(hotjoin, "_review_control_token", lambda: reasoning_token)
+    payload = _registry_publication_payload(
+        suffix="2", publication_class="reasoning_checkpoint"
+    )
+    rejected = hotjoin._memory_batch_publication_control(ledger, payload)
+    assert rejected["state"] == "rejected"
+    assert rejected["accepted_at_utc"] is None
+    assert rejected["accepted_at_monotonic"] is None
+    assert hotjoin._memory_batch_publication_control(ledger, payload) == rejected
+
+    with pytest.raises(
+        hotjoin.HotJoinError, match="class does not match its capability authority"
+    ):
+        hotjoin._memory_batch_publication_control(
+            ledger,
+            _registry_publication_payload(
+                suffix="3", publication_class="control_only"
+            ),
+        )
+    monkeypatch.setattr(hotjoin, "_review_control_token", lambda: owner_token)
+    with pytest.raises(
+        hotjoin.HotJoinError, match="class does not match its capability authority"
+    ):
+        hotjoin._memory_batch_publication_control(
+            ledger,
+            _registry_publication_payload(
+                suffix="4", publication_class="reasoning_checkpoint"
+            ),
+        )
+    control = hotjoin._memory_batch_publication_control(
+        ledger,
+        _registry_publication_payload(suffix="5", publication_class="control_only"),
+    )
+    assert control["state"] == "accepted"
+    assert control["cutoff_kind"] == "hard_stop"
+    hostile = _registry_publication_payload(
+        suffix="7", publication_class="control_only"
+    )
+    hostile["problem_id"] = "problem/evil\ncontrol"
+    with pytest.raises(ValueError, match="bindings are invalid"):
+        hotjoin._memory_batch_publication_control(ledger, hostile)
+
+
+def test_memory_batch_registry_status_is_sorted_bounded_and_exact(
+    ledger: hotjoin.ConversationLedger,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _adapter, cycle, _owner_token, reasoning_token = (
+        _materialize_registry_capabilities(ledger)
+    )
+    monkeypatch.setattr(
+        hotjoin, "_current_boot_identity", lambda: str(cycle["boot_identity"])
+    )
+    monkeypatch.setattr(hotjoin, "_review_control_token", lambda: reasoning_token)
+    for suffix in ("b", "1", "a"):
+        receipt = hotjoin._memory_batch_publication_control(
+            ledger,
+            _registry_publication_payload(
+                suffix=suffix, publication_class="reasoning_checkpoint"
+            ),
+        )
+        assert receipt["state"] == "accepted"
+    status = hotjoin._memory_batch_publication_status_control(
+        ledger,
+        {
+            "operation": "memory_batch_publication_status",
+            "problem_id": "problem/example",
+        },
+    )
+    assert [receipt["batch_id"] for receipt in status["receipts"]] == sorted(
+        receipt["batch_id"] for receipt in status["receipts"]
+    )
+    assert len(status["receipts"]) == 3
+
+
+def test_owner_fd_memory_manifest_is_exact_read_only_and_reasoning_lane_survives(
+    ledger: hotjoin.ConversationLedger,
+) -> None:
+    _adapter, cycle, owner_token, reasoning_token = (
+        _materialize_registry_capabilities(ledger)
+    )
+    with ledger._connect() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        connection.execute(
+            "UPDATE cadence_cycles SET boot_identity = ? WHERE cycle_id = ?",
+            (hotjoin._current_boot_identity(), cycle["cycle_id"]),
+        )
+        connection.commit()
+    payload = {
+        "operation": "memory_batch_publication_status",
+        "problem_id": "problem/example",
+    }
+    base_environment = {
+        **os.environ,
+        hotjoin.REVIEW_DATABASE_ENV: str(ledger.path),
+    }
+
+    def invoke_reasoning_env(body: dict[str, Any]) -> subprocess.CompletedProcess[str]:
+        envelope = {
+            "schema_version": hotjoin.REVIEW_ADAPTER_COMMAND_SCHEMA,
+            "command": "review_status",
+            "payload": body,
+        }
+        return subprocess.run(
+            [
+                sys.executable,
+                "-I",
+                "-B",
+                str(Path(hotjoin.__file__).resolve()),
+                "review-status",
+            ],
+            input=hotjoin._canonical_json(envelope),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env={
+                **base_environment,
+                hotjoin.REVIEW_CONTROL_TOKEN_ENV: reasoning_token,
+            },
+            timeout=30,
+            check=False,
+        )
+
+    owner = _invoke_control_subprocess(
+        "review-status",
+        payload,
+        {
+            **base_environment,
+            hotjoin.REVIEW_CONTROL_TOKEN_ENV: owner_token,
+        },
+        allow_unreleased_paid_work=False,
+    )
+    assert owner.returncode == 0, owner.stderr
+    assert json.loads(owner.stdout) == {
+        "schema_version": hotjoin.MEMORY_BATCH_PUBLICATION_STATUS_SCHEMA,
+        "run_id": "run-1",
+        "problem_id": "problem/example",
+        "receipts": [],
+    }
+
+    # The pre-existing model capability remains an env-scoped adapter lane;
+    # adding the owner FD domain must not force it through owner transport.
+    reasoning = invoke_reasoning_env(payload)
+    assert reasoning.returncode == 0, reasoning.stderr
+    assert json.loads(reasoning.stdout) == json.loads(owner.stdout)
+
+    reasoning_preflight = invoke_reasoning_env(
+        {
+            "operation": "reasoning_phase_preflight",
+            "tool_name": "memory_search",
+        }
+    )
+    assert reasoning_preflight.returncode == 0, reasoning_preflight.stderr
+    assert json.loads(reasoning_preflight.stdout)["tool_permitted"] is True
+
+    reasoning_commit = invoke_reasoning_env(
+        _registry_publication_payload(
+            suffix="e", publication_class="reasoning_checkpoint"
+        )
+    )
+    assert reasoning_commit.returncode == 0, reasoning_commit.stderr
+    assert json.loads(reasoning_commit.stdout)["state"] == "accepted"
+
+    mutable = _invoke_control_subprocess(
+        "review-status",
+        _registry_publication_payload(
+            suffix="f", publication_class="control_only"
+        ),
+        {
+            **base_environment,
+            hotjoin.REVIEW_CONTROL_TOKEN_ENV: owner_token,
+        },
+        allow_unreleased_paid_work=False,
+    )
+    assert mutable.returncode == 2
+    assert "restricted to the read-only memory batch publication manifest" in (
+        mutable.stderr
+    )
+
+    malformed = _invoke_control_subprocess(
+        "review-status",
+        {**payload, "extra": "not exact"},
+        {
+            **base_environment,
+            hotjoin.REVIEW_CONTROL_TOKEN_ENV: owner_token,
+        },
+        allow_unreleased_paid_work=False,
+    )
+    assert malformed.returncode == 2
+    assert "unsupported shape" in malformed.stderr
+    with ledger._connect() as connection:
+        rows = connection.execute(
+            "SELECT publication_class, state FROM memory_batch_publications"
+        ).fetchall()
+    assert [tuple(row) for row in rows] == [("reasoning_checkpoint", "accepted")]
+
+
+def test_memory_batch_registry_reserves_control_slots_and_rejects_after_128(
+    ledger: hotjoin.ConversationLedger,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _adapter, cycle, owner_token, reasoning_token = (
+        _materialize_registry_capabilities(ledger)
+    )
+    monkeypatch.setattr(
+        hotjoin, "_current_boot_identity", lambda: str(cycle["boot_identity"])
+    )
+    monkeypatch.setattr(hotjoin, "_review_control_token", lambda: reasoning_token)
+    assert hotjoin.MIN_RESERVED_CONTROL_MEMORY_BATCH_PUBLICATIONS == 32
+    reasoning_rejected_payload: dict[str, Any] | None = None
+    reasoning_rejected_receipt: dict[str, Any] | None = None
+    for index in range(
+        hotjoin.MAX_ACCEPTED_REASONING_MEMORY_BATCH_PUBLICATIONS + 1
+    ):
+        payload = {
+            "operation": "memory_batch_publication_commit",
+            "problem_id": "problem/example",
+            "batch_id": "batch_" + f"{index:064x}",
+            "checkpoint_sha256": hashlib.sha256(
+                f"checkpoint:{index}".encode()
+            ).hexdigest(),
+            "commit_sha256": hashlib.sha256(
+                f"commit:{index}".encode()
+            ).hexdigest(),
+            "publication_class": "reasoning_checkpoint",
+        }
+        receipt = hotjoin._memory_batch_publication_control(ledger, payload)
+        assert receipt["state"] == (
+            "accepted"
+            if index < hotjoin.MAX_ACCEPTED_REASONING_MEMORY_BATCH_PUBLICATIONS
+            else "rejected"
+        )
+        if receipt["state"] == "rejected":
+            reasoning_rejected_payload, reasoning_rejected_receipt = payload, receipt
+    assert reasoning_rejected_payload is not None
+    assert reasoning_rejected_receipt is not None
+    assert (
+        hotjoin._memory_batch_publication_control(
+            ledger, reasoning_rejected_payload
+        )
+        == reasoning_rejected_receipt
+    )
+
+    monkeypatch.setattr(hotjoin, "_review_control_token", lambda: owner_token)
+    control_rejected_payload: dict[str, Any] | None = None
+    control_rejected_receipt: dict[str, Any] | None = None
+    for index in range(hotjoin.MIN_RESERVED_CONTROL_MEMORY_BATCH_PUBLICATIONS + 1):
+        ordinal = 1_000 + index
+        payload = {
+            "operation": "memory_batch_publication_commit",
+            "problem_id": "problem/example",
+            "batch_id": "batch_" + f"{ordinal:064x}",
+            "checkpoint_sha256": hashlib.sha256(
+                f"control-checkpoint:{index}".encode()
+            ).hexdigest(),
+            "commit_sha256": hashlib.sha256(
+                f"control-commit:{index}".encode()
+            ).hexdigest(),
+            "publication_class": "control_only",
+        }
+        receipt = hotjoin._memory_batch_publication_control(ledger, payload)
+        assert receipt["state"] == (
+            "accepted"
+            if index < hotjoin.MIN_RESERVED_CONTROL_MEMORY_BATCH_PUBLICATIONS
+            else "rejected"
+        )
+        if receipt["state"] == "rejected":
+            control_rejected_payload, control_rejected_receipt = payload, receipt
+    assert control_rejected_payload is not None
+    assert control_rejected_receipt is not None
+    assert (
+        hotjoin._memory_batch_publication_control(ledger, control_rejected_payload)
+        == control_rejected_receipt
+    )
+
+    status = hotjoin._memory_batch_publication_status_control(
+        ledger,
+        {
+            "operation": "memory_batch_publication_status",
+            "problem_id": "problem/example",
+        },
+    )
+    assert len(status["receipts"]) == hotjoin.MAX_ACCEPTED_MEMORY_BATCH_PUBLICATIONS
+    assert sum(
+        receipt["publication_class"] == "reasoning_checkpoint"
+        for receipt in status["receipts"]
+    ) == hotjoin.MAX_ACCEPTED_REASONING_MEMORY_BATCH_PUBLICATIONS
+    assert sum(
+        receipt["publication_class"] == "control_only"
+        for receipt in status["receipts"]
+    ) == hotjoin.MIN_RESERVED_CONTROL_MEMORY_BATCH_PUBLICATIONS
+    with ledger._connect() as connection:
+        counts = {
+            (str(row["publication_class"]), str(row["state"])): int(row["count"])
+            for row in connection.execute(
+                "SELECT publication_class, state, COUNT(*) AS count "
+                "FROM memory_batch_publications GROUP BY publication_class, state"
+            ).fetchall()
+        }
+    assert counts == {
+        ("reasoning_checkpoint", "accepted"): (
+            hotjoin.MAX_ACCEPTED_REASONING_MEMORY_BATCH_PUBLICATIONS
+        ),
+        ("reasoning_checkpoint", "rejected"): 1,
+        ("control_only", "accepted"): (
+            hotjoin.MIN_RESERVED_CONTROL_MEMORY_BATCH_PUBLICATIONS
+        ),
+        ("control_only", "rejected"): 1,
+    }
+
+
+def test_memory_batch_registry_and_cadence_tick_have_one_sqlite_order(
+    ledger: hotjoin.ConversationLedger,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter, cycle, _owner_token, reasoning_token = (
+        _materialize_registry_capabilities(ledger)
+    )
+    monkeypatch.setattr(
+        hotjoin, "_current_boot_identity", lambda: str(cycle["boot_identity"])
+    )
+    monkeypatch.setattr(hotjoin, "_review_control_token", lambda: reasoning_token)
+    with ledger._connect() as connection:
+        review_1 = dict(
+            connection.execute(
+                "SELECT * FROM cadence_actions WHERE cycle_id = ? "
+                "AND kind = 'review_1'",
+                (cycle["cycle_id"],),
+            ).fetchone()
+        )
+    barrier = threading.Barrier(2)
+    outcomes: list[dict[str, Any]] = []
+    errors: list[BaseException] = []
+
+    def publish() -> None:
+        try:
+            barrier.wait(timeout=5)
+            outcomes.append(
+                hotjoin._memory_batch_publication_control(
+                    ledger,
+                    _registry_publication_payload(
+                        suffix="6", publication_class="reasoning_checkpoint"
+                    ),
+                )
+            )
+        except BaseException as exc:
+            errors.append(exc)
+
+    def tick() -> None:
+        try:
+            barrier.wait(timeout=5)
+            ledger.cadence_tick(
+                "run-1",
+                now_epoch=float(review_1["due_at"]),
+                now_monotonic=float(review_1["due_monotonic"]),
+                boot_identity=str(cycle["boot_identity"]),
+                thread_id="thread-1",
+                turn_id="turn-1",
+                lease=adapter._lease(),
+            )
+        except BaseException as exc:
+            errors.append(exc)
+
+    threads = [threading.Thread(target=publish), threading.Thread(target=tick)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=10)
+    assert all(not thread.is_alive() for thread in threads)
+    assert errors == []
+    assert len(outcomes) == 1
+    events = ledger.events("run-1")
+    publication_event = next(
+        event
+        for event in events
+        if event["kind"].startswith("memory_batch_publication_")
+    )
+    due_event = next(
+        event for event in events if event["kind"] == "cadence_action_due"
+    )
+    if outcomes[0]["state"] == "accepted":
+        assert publication_event["kind"] == "memory_batch_publication_accepted"
+        assert publication_event["sequence"] < due_event["sequence"]
+    else:
+        assert outcomes[0]["state"] == "rejected"
+        assert publication_event["kind"] == "memory_batch_publication_rejected"
+        # cadence_tick may sample its caller-supplied clock before BEGIN.  The
+        # registry's fresh in-transaction clocks still reject a late writer;
+        # event order need not claim that the tick sampled after publication.
 
 
 def test_retrieval_providers_share_external_retrieval_phase_fence(
@@ -4175,6 +4987,28 @@ def test_retrieval_providers_share_external_retrieval_phase_fence(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     lease, cycle = _materialize_cadence_turn(ledger, started_at=time.time() - 1.0)
+    observed_boot_identity = (
+        hotjoin._system_guardian_process_inspector().boot_identity()
+    )
+    observed_monotonic = time.monotonic()
+    with ledger._connect() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        connection.execute(
+            "UPDATE cadence_cycles SET boot_identity = ? WHERE cycle_id = ?",
+            (observed_boot_identity, cycle["cycle_id"]),
+        )
+        for kind, offset in {
+            "review_1": 1_799.0,
+            "review_2": 3_599.0,
+            "close_notice": 5_219.0,
+            "hard_stop": 5_399.0,
+        }.items():
+            connection.execute(
+                "UPDATE cadence_actions SET due_monotonic = ? "
+                "WHERE cycle_id = ? AND kind = ?",
+                (observed_monotonic + offset, cycle["cycle_id"], kind),
+            )
+        connection.commit()
     token = _bind_continuation_capability(ledger)
     ledger.release_lease("run-1", lease)
     monkeypatch.setenv(hotjoin.REVIEW_CONTROL_TOKEN_ENV, token)
@@ -4198,6 +5032,9 @@ def test_retrieval_providers_share_external_retrieval_phase_fence(
             {"operation": "reasoning_phase_preflight", "tool_name": tool_name},
         )
         assert active["tool_permitted"] is True
+        assert active["review_due_at_utc"] == datetime.fromtimestamp(
+            float(cycle["started_at_epoch"]) + 1_800, timezone.utc
+        ).isoformat()
 
     # Retrieved Matlas records are leads/telemetry, not writes or verification
     # receipts and therefore cannot independently become proof evidence.
@@ -4602,6 +5439,12 @@ def _invoke_control_subprocess(
                 encoding="utf-8",
             )
             test_adapter.chmod(0o600)
+            generation = test_adapter.parent / "generation"
+            generation.mkdir(mode=0o700)
+            guardian_source = Path(hotjoin.__file__).resolve().parent / "generation" / "guardian.py"
+            guardian = generation / "guardian.py"
+            guardian.write_bytes(guardian_source.read_bytes())
+            guardian.chmod(0o400)
             return subprocess.run(
                 [sys.executable, "-I", "-B", str(test_adapter), command],
                 input=hotjoin._canonical_json(envelope),
@@ -4899,41 +5742,67 @@ def test_owner_review_drive_real_isolated_subprocess_is_terminal_bound_and_idemp
     monkeypatch.setattr(review_server, "MEMORY_ROOT", generation_root / "memory")
     pre_due = datetime.fromtimestamp(float(due_at) - 60, timezone.utc).isoformat()
     monkeypatch.setattr(review_server, "_utc_now", lambda: pre_due)
-    review_server.memory_append_batch(
-        "problem/example",
-        [
-            {
-                "channel": "proof_steps",
-                "record": {
-                    "review_progress_kind": "new_lemma",
-                    "statement": "A bounded bridge candidate was derived.",
-                },
-            },
-            {
-                "channel": "branch_states",
-                "record": {
-                    "branch_id": "route-a",
-                    "state": {
-                        "schema_version": "rethlas_active_route_commitment_v1",
-                        "route_id": "route-a",
-                        "status": "active",
-                        "core_bridge": "one exact quantitative estimate",
-                        "obligations": [
-                            "Prove the estimate without hidden assumptions."
-                        ],
+    with mock.patch.object(review_server.time, "time", return_value=float(due_at) - 60):
+        seed_receipt = review_server.memory_append_batch(
+            "problem/example",
+            [
+                {
+                    "channel": "proof_steps",
+                    "record": {
+                        "review_progress_kind": "new_lemma",
+                        "statement": "A bounded bridge candidate was derived.",
                     },
                 },
-            },
-        ],
+                {
+                    "channel": "branch_states",
+                    "record": {
+                        "branch_id": "route-a",
+                        "state": {
+                            "schema_version": "rethlas_active_route_commitment_v1",
+                            "route_id": "route-a",
+                            "status": "active",
+                            "core_bridge": "one exact quantitative estimate",
+                            "obligations": [
+                                "Prove the estimate without hidden assumptions."
+                            ],
+                        },
+                    },
+                },
+            ],
+        )
+    _admit_test_memory_batch_before_review(
+        ledger, seed_receipt, accepted_at=float(due_at) - 60
     )
+    manifest_process = _invoke_control_subprocess(
+        "review-status",
+        {
+            "operation": "memory_batch_publication_status",
+            "problem_id": "problem/example",
+        },
+        environment,
+    )
+    assert manifest_process.returncode == 0, manifest_process.stderr
+    assert len(json.loads(manifest_process.stdout)["receipts"]) == 1
     environment = {
         **environment,
+        hotjoin.REVIEW_ADAPTER_PATH_ENV: str(Path(hotjoin.__file__).resolve()),
+        hotjoin.REVIEW_ADAPTER_SHA256_ENV: hashlib.sha256(
+            Path(hotjoin.__file__).read_bytes()
+        ).hexdigest(),
         "RETHLAS_GENERATION_ROOT": str(generation_root),
+        "RETHLAS_EXPECTED_HOTJOIN_RUN_ID": "run-1",
         "RETHLAS_EXPECTED_PROBLEM_ID": "problem/example",
         "RETHLAS_EXPECTED_STATEMENT_SHA256": hashlib.sha256(
             statement.encode()
         ).hexdigest(),
     }
+    with mock.patch.dict(os.environ, environment, clear=True):
+        frontier_probe = review_server.review_frontier_status(
+            cycle_id=cycle_id,
+            cycle="minute30",
+            review_ordinal=1,
+        )
+    assert frontier_probe["frontier_record_ids"]
     payload = {
         "operation": "drive_due_review",
         "run_id": "run-1",
@@ -5027,7 +5896,7 @@ def test_owner_review_drive_real_isolated_subprocess_is_terminal_bound_and_idemp
     rpc.add("turn/start", {"turn": _turn("turn-2", "inProgress")})
     adapter = _leased_adapter(ledger, rpc)
     params = _thread_params()
-    params["config"]["mcp_servers"] = {"reasoning_agent": {"env": {}}}
+    params["config"]["mcp_servers"] = _mcp_server_env_map()
 
     original_bind = ledger.bind_fresh_thread_epoch
 
@@ -5039,6 +5908,21 @@ def test_owner_review_drive_real_isolated_subprocess_is_terminal_bound_and_idemp
     with pytest.raises(hotjoin.HotJoinError, match="injected host handoff consume"):
         adapter._ensure_thread(params)
     assert [method for method, _params in rpc.calls] == ["thread/start"]
+    rollover_environments = [
+        rpc.calls[0][1]["config"]["mcp_servers"][server_id]["env"]
+        for server_id in hotjoin.REASONING_MCP_SERVER_IDS
+    ]
+    assert rollover_environments[0] == rollover_environments[1]
+    assert rollover_environments[1] == rollover_environments[2]
+    assert rollover_environments[0] == {
+        hotjoin.CONTEXT_HANDOFF_REQUIRED_ID_ENV: str(rollover["handoff_id"]),
+        hotjoin.CONTEXT_HANDOFF_REQUIRED_SHA256_ENV: str(
+            rollover["content_sha256"]
+        ),
+        hotjoin.CONTEXT_THREAD_EPOCH_ENV: str(rollover["thread_epoch"]),
+        hotjoin.CONTEXT_CYCLE_ID_ENV: str(rollover["cycle_id"] or ""),
+        hotjoin.CONTEXT_RUN_ID_ENV: "run-1",
+    }
     assert ledger.status("run-1")["active_turn_id"] is None
     with ledger._connect() as connection:
         unconsumed = connection.execute(
@@ -5186,33 +6070,47 @@ def test_owner_review_drive_runs_one_real_targeted_verifier_and_never_retries(
     monkeypatch.setattr(review_server, "MEMORY_ROOT", generation_root / "memory")
     pre_due = datetime.fromtimestamp(float(due_at) - 60, timezone.utc).isoformat()
     monkeypatch.setattr(review_server, "_utc_now", lambda: pre_due)
-    review_server.memory_append_batch(
-        "problem/example",
-        [
-            {
-                "channel": "proof_steps",
-                "record": {
-                    "review_progress_kind": "new_lemma",
-                    "statement": "A bounded bridge candidate was derived.",
-                },
-            },
-            {
-                "channel": "branch_states",
-                "record": {
-                    "branch_id": "route-a",
-                    "state": {
-                        "schema_version": "rethlas_active_route_commitment_v1",
-                        "route_id": "route-a",
-                        "status": "active",
-                        "core_bridge": "one exact quantitative estimate",
-                        "obligations": [
-                            "Prove the estimate without hidden assumptions."
-                        ],
+    with mock.patch.object(review_server.time, "time", return_value=float(due_at) - 60):
+        seed_receipt = review_server.memory_append_batch(
+            "problem/example",
+            [
+                {
+                    "channel": "proof_steps",
+                    "record": {
+                        "review_progress_kind": "new_lemma",
+                        "statement": "A bounded bridge candidate was derived.",
                     },
                 },
-            },
-        ],
+                {
+                    "channel": "branch_states",
+                    "record": {
+                        "branch_id": "route-a",
+                        "state": {
+                            "schema_version": "rethlas_active_route_commitment_v1",
+                            "route_id": "route-a",
+                            "status": "active",
+                            "core_bridge": "one exact quantitative estimate",
+                            "obligations": [
+                                "Prove the estimate without hidden assumptions."
+                            ],
+                        },
+                    },
+                },
+            ],
+        )
+    _admit_test_memory_batch_before_review(
+        ledger, seed_receipt, accepted_at=float(due_at) - 60
     )
+    manifest_process = _invoke_control_subprocess(
+        "review-status",
+        {
+            "operation": "memory_batch_publication_status",
+            "problem_id": "problem/example",
+        },
+        environment,
+    )
+    assert manifest_process.returncode == 0, manifest_process.stderr
+    assert len(json.loads(manifest_process.stdout)["receipts"]) == 1
     service_calls: list[dict[str, Any]] = []
 
     class TargetedVerifierHandler(BaseHTTPRequestHandler):
@@ -7634,7 +8532,7 @@ def test_persistent_run_rejects_changed_hotjoin_control_plane(
         + json.dumps(sys.executable)
         + ",args=[],cwd="
         + json.dumps(str(tmp_path))
-        + ',env={},required=true,tool_timeout_sec=1,default_tools_approval_mode="approve"}'
+        + ',env={},required=true,tool_timeout_sec=3600,default_tools_approval_mode="approve"}'
     )
     args = hotjoin._build_parser().parse_args(
         [
@@ -7660,6 +8558,43 @@ def test_persistent_run_rejects_changed_hotjoin_control_plane(
 
     with pytest.raises(RuntimeError, match="durable binding"):
         hotjoin._run_generator_command(args)
+    rebound_ledger = hotjoin.ConversationLedger(args.db)
+    bound_event = next(
+        event
+        for event in rebound_ledger.events("same-run")
+        if event["kind"] == "generator_configuration_bound"
+    )
+    descriptor = bound_event["payload"]["descriptor"]
+    assert descriptor["mcp_server_ids"] == list(hotjoin.REASONING_MCP_SERVER_IDS)
+    assert list(descriptor["mcp_servers"]) == list(
+        hotjoin.REASONING_MCP_SERVER_IDS
+    )
+    assert descriptor["mcp_servers"]["reasoning_agent"]["disabled_tools"] == [
+        "memory_append_batch"
+    ]
+    assert descriptor["mcp_servers"]["reasoning_checkpoint_primary"][
+        "enabled_tools"
+    ] == ["memory_append_batch"]
+    assert descriptor["mcp_servers"]["reasoning_checkpoint_recovery"][
+        "tool_timeout_sec"
+    ] == 60
+    committed = descriptor["mcp_servers"]
+    for server_id in hotjoin.REASONING_MCP_SERVER_IDS:
+        assert committed[server_id]["command"] == sys.executable
+        assert committed[server_id]["cwd"] == str(tmp_path)
+        assert committed[server_id]["required"] is True
+        assert committed[server_id]["default_tools_approval_mode"] == "approve"
+        assert committed[server_id]["args"] == []
+        assert committed[server_id]["env"] == {}
+    common_keys = hotjoin._PINNED_MCP_BASE_KEYS - {"tool_timeout_sec"}
+    assert len(
+        {
+            hotjoin._canonical_json(
+                {key: committed[server_id][key] for key in common_keys}
+            )
+            for server_id in hotjoin.REASONING_MCP_SERVER_IDS
+        }
+    ) == 1
     with pytest.raises(hotjoin.IdempotencyConflict):
         hotjoin._run_generator_command(args)
     assert client_creations == 1
@@ -8199,6 +9134,23 @@ def _minimal_schema(methods: list[str]) -> dict[str, Any]:
                 },
                 "required": ["data"],
             },
+            "McpServerToolCallParams": {
+                "properties": {
+                    "arguments": {},
+                    "server": {"type": "string"},
+                    "threadId": {"type": "string"},
+                    "tool": {"type": "string"},
+                },
+                "required": ["server", "threadId", "tool"],
+            },
+            "McpServerToolCallResponse": {
+                "properties": {
+                    "content": {"items": {}, "type": "array"},
+                    "isError": {"type": ["boolean", "null"]},
+                    "structuredContent": {},
+                },
+                "required": ["content"],
+            },
             "ModelReroutedNotification": {
                 "properties": {
                     "fromModel": {"type": "string"},
@@ -8404,10 +9356,35 @@ def test_capability_preflight_uses_generated_schema_without_starting_server(
     assert all("app-server --listen" not in " ".join(call) for call in calls)
 
 
+def test_capability_preflight_requires_zero_model_mcp_tool_call_rpc(
+    tmp_path: Path,
+) -> None:
+    def runner(
+        command: list[str], **_kwargs: object
+    ) -> subprocess.CompletedProcess[str]:
+        if command[-1] == "--version":
+            return subprocess.CompletedProcess(command, 0, "codex-cli mock", "")
+        output = Path(command[command.index("--out") + 1])
+        methods = list(hotjoin.REQUIRED_APP_SERVER_METHODS)
+        methods.remove("mcpServer/tool/call")
+        (output / "codex_app_server_protocol.v2.schemas.json").write_text(
+            json.dumps(_minimal_schema(methods)), encoding="utf-8"
+        )
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    with pytest.raises(
+        hotjoin.CapabilityError, match=r"lacks required hot-join RPCs.*mcpServer/tool/call"
+    ):
+        hotjoin.preflight_app_server("fake-codex", runner=runner)
+
+
 @pytest.mark.parametrize(
     ("definition", "field"),
     [
         ("InitializeParams", "clientInfo"),
+        ("McpServerToolCallParams", "arguments"),
+        ("McpServerToolCallResponse", "isError"),
+        ("McpServerToolCallResponse", "structuredContent"),
         ("ModelListResponse", "data"),
         ("Thread", "cwd"),
         ("Thread", "ephemeral"),
@@ -8437,6 +9414,67 @@ def test_capability_preflight_rejects_missing_contract_field(
         return subprocess.CompletedProcess(command, 0, "", "")
 
     with pytest.raises(hotjoin.CapabilityError):
+        hotjoin.preflight_app_server("fake-codex", runner=runner)
+
+
+@pytest.mark.parametrize(
+    ("definition", "field"),
+    [
+        ("McpServerToolCallParams", "server"),
+        ("McpServerToolCallParams", "threadId"),
+        ("McpServerToolCallParams", "tool"),
+        ("McpServerToolCallResponse", "content"),
+    ],
+)
+def test_capability_preflight_rejects_missing_mcp_tool_call_required_field(
+    tmp_path: Path, definition: str, field: str
+) -> None:
+    def runner(
+        command: list[str], **_kwargs: object
+    ) -> subprocess.CompletedProcess[str]:
+        if command[-1] == "--version":
+            return subprocess.CompletedProcess(command, 0, "codex-cli mock", "")
+        output = Path(command[command.index("--out") + 1])
+        schema = _minimal_schema(list(hotjoin.REQUIRED_APP_SERVER_METHODS))
+        schema["definitions"][definition]["required"].remove(field)
+        (output / "codex_app_server_protocol.v2.schemas.json").write_text(
+            json.dumps(schema), encoding="utf-8"
+        )
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    with pytest.raises(hotjoin.CapabilityError, match=definition):
+        hotjoin.preflight_app_server("fake-codex", runner=runner)
+
+
+@pytest.mark.parametrize(
+    ("definition", "field"),
+    [
+        ("McpServerToolCallParams", "server"),
+        ("McpServerToolCallParams", "threadId"),
+        ("McpServerToolCallParams", "tool"),
+        ("McpServerToolCallResponse", "content"),
+        ("McpServerToolCallResponse", "isError"),
+    ],
+)
+def test_capability_preflight_rejects_wrong_mcp_tool_call_field_type(
+    tmp_path: Path, definition: str, field: str
+) -> None:
+    def runner(
+        command: list[str], **_kwargs: object
+    ) -> subprocess.CompletedProcess[str]:
+        if command[-1] == "--version":
+            return subprocess.CompletedProcess(command, 0, "codex-cli mock", "")
+        output = Path(command[command.index("--out") + 1])
+        schema = _minimal_schema(list(hotjoin.REQUIRED_APP_SERVER_METHODS))
+        schema["definitions"][definition]["properties"][field] = {
+            "type": "integer"
+        }
+        (output / "codex_app_server_protocol.v2.schemas.json").write_text(
+            json.dumps(schema), encoding="utf-8"
+        )
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    with pytest.raises(hotjoin.CapabilityError, match="wrong type"):
         hotjoin.preflight_app_server("fake-codex", runner=runner)
 
 
@@ -8491,7 +9529,7 @@ def test_failed_preflight_precedes_ledger_and_app_server(
         + json.dumps(hotjoin.sys.executable)
         + ",args=[],cwd="
         + json.dumps(str(tmp_path))
-        + ',env={},required=true,tool_timeout_sec=1,default_tools_approval_mode="approve"}'
+        + ',env={},required=true,tool_timeout_sec=3600,default_tools_approval_mode="approve"}'
     )
     code = hotjoin.main(
         [
@@ -8530,7 +9568,7 @@ def test_reasoning_agent_mcp_must_be_complete_and_required(
         "cwd": str(tmp_path),
         "default_tools_approval_mode": "approve",
         "env": {},
-        "tool_timeout_sec": 1,
+        "tool_timeout_sec": 3600,
     }
     if required_value is not None:
         mcp["required"] = required_value
@@ -8545,6 +9583,255 @@ def test_reasoning_agent_mcp_must_be_complete_and_required(
             max_runtime_seconds=1,
             idle_grace_seconds=0,
         )
+
+
+def test_exact_three_server_map_and_fingerprint_commitment_are_derived_from_base(
+    tmp_path: Path,
+) -> None:
+    base = {
+        "args": [],
+        "command": sys.executable,
+        "cwd": str(tmp_path),
+        "default_tools_approval_mode": "approve",
+        "env": {"STATIC_BINDING": "exact"},
+        "required": True,
+        "tool_timeout_sec": 3600,
+    }
+    servers = hotjoin._derive_reasoning_mcp_server_map(base)
+
+    assert list(servers) == list(hotjoin.REASONING_MCP_SERVER_IDS)
+    assert servers["reasoning_agent"]["disabled_tools"] == [
+        "memory_append_batch"
+    ]
+    assert servers["reasoning_agent"]["tool_timeout_sec"] == 3600
+    for checkpoint_id in (
+        "reasoning_checkpoint_primary",
+        "reasoning_checkpoint_recovery",
+    ):
+        assert servers[checkpoint_id]["enabled_tools"] == ["memory_append_batch"]
+        assert servers[checkpoint_id]["tool_timeout_sec"] == 60
+    common_keys = hotjoin._PINNED_MCP_BASE_KEYS - {"tool_timeout_sec"}
+    assert len(
+        {
+            hotjoin._canonical_json(
+                {key: server[key] for key in common_keys}
+            )
+            for server in servers.values()
+        }
+    ) == 1
+
+    committed, rotatable = hotjoin._mcp_server_map_commitment(
+        servers, policies_enabled=True
+    )
+    assert list(committed) == list(hotjoin.REASONING_MCP_SERVER_IDS)
+    assert hotjoin.REVIEW_CONTROL_TOKEN_ENV in rotatable
+    for server_id in hotjoin.REASONING_MCP_SERVER_IDS:
+        assert committed[server_id]["env"]["STATIC_BINDING"] == "exact"
+        assert committed[server_id]["env"][hotjoin.REVIEW_CONTROL_TOKEN_ENV] == (
+            "<rotatable-secret>"
+        )
+        assert committed[server_id]["env"][hotjoin.CONTEXT_THREAD_EPOCH_ENV] == (
+            "<runtime-thread-epoch>"
+        )
+        assert committed[server_id]["env"][
+            hotjoin.CONTEXT_HANDOFF_REQUIRED_ID_ENV
+        ] == "<runtime-rollover-handoff-id>"
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    [
+        (
+            lambda base: base.update({"enabled_tools": ["memory_append_batch"]}),
+            "unexpected enabled_tools",
+        ),
+        (
+            lambda base: base.update({"tool_timeout_sec": 60}),
+            "tool_timeout_sec must equal 3600",
+        ),
+    ],
+)
+def test_reasoning_mcp_base_rejects_role_filters_and_short_timeout(
+    tmp_path: Path,
+    mutation: Callable[[dict[str, object]], None],
+    message: str,
+) -> None:
+    base: dict[str, object] = {
+        "args": [],
+        "command": sys.executable,
+        "cwd": str(tmp_path),
+        "default_tools_approval_mode": "approve",
+        "env": {},
+        "required": True,
+        "tool_timeout_sec": 3600,
+    }
+    mutation(base)
+    with pytest.raises(ValueError, match=message):
+        hotjoin._validate_generator_config(
+            mcp=base,
+            shell_policy={"inherit": "none", "set": {"PATH": "/usr/bin"}},
+            prompt="proof search",
+            model="gpt-5.6-sol",
+            effort="max",
+            max_runtime_seconds=1,
+            idle_grace_seconds=0,
+        )
+
+
+@pytest.mark.parametrize(
+    "forbidden_name",
+    sorted(hotjoin._RUNTIME_INJECTED_REASONING_MCP_ENV_KEYS),
+)
+def test_reasoning_mcp_base_rejects_every_host_runtime_binding(
+    tmp_path: Path,
+    forbidden_name: str,
+) -> None:
+    base: dict[str, object] = {
+        "args": [],
+        "command": sys.executable,
+        "cwd": str(tmp_path),
+        "default_tools_approval_mode": "approve",
+        "env": {forbidden_name: "attacker-controlled-stale-binding"},
+        "required": True,
+        "tool_timeout_sec": 3600,
+    }
+    with pytest.raises(ValueError, match="host-runtime bindings"):
+        hotjoin._validate_generator_config(
+            mcp=base,
+            shell_policy={"inherit": "none", "set": {"PATH": "/usr/bin"}},
+            prompt="proof search",
+            model="gpt-5.6-sol",
+            effort="max",
+            max_runtime_seconds=1,
+            idle_grace_seconds=0,
+        )
+    with pytest.raises(ValueError, match="host-runtime bindings"):
+        hotjoin._derive_reasoning_mcp_server_map(base)
+
+
+def test_reasoning_capability_rejects_nonexact_or_nonparity_server_map(
+    ledger: hotjoin.ConversationLedger,
+) -> None:
+    owner_token = _bind_continuation_capability(ledger)
+    adapter = hotjoin.GeneratorHotJoin(
+        ledger,
+        "run-1",
+        _RpcStub(),  # type: ignore[arg-type]
+        review_cadence_policy=hotjoin.REVIEW_CADENCE_POLICY_ID,
+        context_guard_policy=hotjoin.CONTEXT_GUARD_POLICY_ID,
+        review_control_token=owner_token,
+        _test_allow_unreleased_guardian=True,
+    )
+    incomplete = {
+        "config": {
+            "mcp_servers": {
+                "reasoning_agent": {"env": {}},
+                "reasoning_checkpoint_primary": {"env": {}},
+            }
+        }
+    }
+    with pytest.raises(hotjoin.HotJoinError, match="exact MCP server IDs"):
+        adapter._thread_params_with_reasoning_capability(incomplete)
+
+    drifted = {
+        "config": {
+            "mcp_servers": _mcp_server_env_map(),
+        }
+    }
+    drifted["config"]["mcp_servers"]["reasoning_checkpoint_recovery"]["env"][
+        "STATIC_BINDING"
+    ] = "drifted"
+    with pytest.raises(hotjoin.HotJoinError, match="common-field parity"):
+        adapter._thread_params_with_reasoning_capability(drifted)
+
+    stale_runtime = {
+        "config": {
+            "mcp_servers": _mcp_server_env_map(),
+        }
+    }
+    for server in stale_runtime["config"]["mcp_servers"].values():
+        server["env"][hotjoin.CONTEXT_HANDOFF_REQUIRED_ID_ENV] = "stale-handoff"
+    with pytest.raises(hotjoin.HotJoinError, match="host-runtime bindings"):
+        adapter._thread_params_with_reasoning_capability(stale_runtime)
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "long_filter",
+        "long_timeout",
+        "primary_filter",
+        "recovery_timeout",
+        "command",
+        "args",
+        "cwd",
+        "required",
+        "approval",
+        "extra_key",
+    ],
+)
+def test_reasoning_capability_revalidates_complete_role_map_before_thread_start(
+    ledger: hotjoin.ConversationLedger,
+    case: str,
+) -> None:
+    owner_token = _bind_continuation_capability(ledger)
+    rpc = _RpcStub()
+    adapter = hotjoin.GeneratorHotJoin(
+        ledger,
+        "run-1",
+        rpc,
+        review_cadence_policy=hotjoin.REVIEW_CADENCE_POLICY_ID,
+        context_guard_policy=hotjoin.CONTEXT_GUARD_POLICY_ID,
+        review_control_token=owner_token,
+        _test_allow_unreleased_guardian=True,
+    )
+    servers = _mcp_server_env_map()
+    if case == "long_filter":
+        servers["reasoning_agent"]["disabled_tools"] = []
+    elif case == "long_timeout":
+        servers["reasoning_agent"]["tool_timeout_sec"] = 60
+    elif case == "primary_filter":
+        servers["reasoning_checkpoint_primary"]["enabled_tools"].append(
+            "memory_search"
+        )
+    elif case == "recovery_timeout":
+        servers["reasoning_checkpoint_recovery"]["tool_timeout_sec"] = 61
+    elif case == "command":
+        servers["reasoning_checkpoint_recovery"]["command"] = "/different/python"
+    elif case == "args":
+        servers["reasoning_checkpoint_primary"]["args"].append("--drift")
+    elif case == "cwd":
+        servers["reasoning_checkpoint_primary"]["cwd"] = "/different/cwd"
+    elif case == "required":
+        servers["reasoning_checkpoint_primary"]["required"] = False
+    elif case == "approval":
+        servers["reasoning_checkpoint_recovery"][
+            "default_tools_approval_mode"
+        ] = "prompt"
+    elif case == "extra_key":
+        servers["reasoning_agent"]["enabled_tools"] = []
+    else:  # pragma: no cover - parametrization is exhaustive
+        raise AssertionError(case)
+
+    params = {
+        "config": {"mcp_servers": servers},
+    }
+    with pytest.raises(hotjoin.HotJoinError):
+        adapter._thread_params_with_reasoning_capability(params)
+    assert rpc.calls == []
+
+
+def test_unscoped_thread_start_still_rejects_mutated_reasoning_role_map(
+    ledger: hotjoin.ConversationLedger,
+) -> None:
+    rpc = _RpcStub()
+    adapter = _leased_adapter(ledger, rpc)
+    params = _thread_params()
+    params["config"]["mcp_servers"]["reasoning_agent"]["disabled_tools"] = []
+
+    with pytest.raises(hotjoin.HotJoinError, match="reasoning_agent role contract"):
+        adapter._ensure_thread(params)
+    assert rpc.calls == []
 
 
 def test_fingerprint_failure_precedes_ledger_and_app_server(
@@ -8575,7 +9862,7 @@ def test_fingerprint_failure_precedes_ledger_and_app_server(
         + json.dumps(hotjoin.sys.executable)
         + ",args=[],cwd="
         + json.dumps(str(tmp_path))
-        + ',env={},required=true,tool_timeout_sec=1,default_tools_approval_mode="approve"}'
+        + ',env={},required=true,tool_timeout_sec=3600,default_tools_approval_mode="approve"}'
     )
 
     code = hotjoin.main(
@@ -9253,7 +10540,7 @@ def test_reasoning_bandwidth_aggregates_safe_root_trace_without_content(
         "durationMs": 100,
         "id": "memory-batch-1",
         "result": {"secret": secret},
-        "server": "reasoning_agent",
+        "server": "reasoning_checkpoint_primary",
         "status": "completed",
         "tool": "memory_append_batch",
         "type": "mcpToolCall",
@@ -9441,6 +10728,28 @@ def test_reasoning_bandwidth_aggregates_safe_root_trace_without_content(
     assert adapter.reasoning_bandwidth_by_turn == {}
 
 
+@pytest.mark.parametrize(
+    "server",
+    [
+        "reasoning_checkpoint_primary",
+        "reasoning-checkpoint-primary",
+        "reasoning_checkpoint_recovery",
+        "reasoning-checkpoint-recovery",
+    ],
+)
+def test_checkpoint_servers_are_reasoning_bandwidth_memory_writes(
+    server: str,
+) -> None:
+    assert (
+        hotjoin._telemetry_item_category(
+            {
+                "server": server,
+                "tool": "memory_append_batch",
+                "type": "mcpToolCall",
+            }
+        )
+        == "memory_write_batch"
+    )
 def test_missing_item_telemetry_degrades_only_diagnostics_and_turn_completes(
     ledger: hotjoin.ConversationLedger,
 ) -> None:
@@ -11584,7 +12893,7 @@ def test_schema_v9_migrates_guardian_discovery_tables_and_source_constraint(
             connection.execute(
                 "SELECT value FROM metadata WHERE key = 'schema_version'"
             ).fetchone()["value"]
-            == "10"
+            == "11"
         )
         table_sql = connection.execute(
             "SELECT sql FROM sqlite_master "
@@ -11600,10 +12909,11 @@ def test_schema_v9_migrates_guardian_discovery_tables_and_source_constraint(
         assert {
             "guardian_discovered_empty_receipts",
             "guardian_poll_request_receipts",
+            "memory_batch_publications",
         } <= tables
-    assert "guardian_discovery_schema_installed" in {
-        event["kind"] for event in migrated.events("migration-run")
-    }
+    migration_events = {event["kind"] for event in migrated.events("migration-run")}
+    assert "guardian_discovery_schema_installed" in migration_events
+    assert "memory_batch_publication_registry_installed" in migration_events
 
 
 def test_guardian_status_expires_unregistered_launch_once_and_revokes_tokens(
@@ -14055,7 +15365,7 @@ def test_reasoning_epoch_token_never_exposes_master_and_old_call_loses_rotation(
         {
             "approvalPolicy": "never",
             "config": {
-                "mcp_servers": {"reasoning_agent": {"env": {}}},
+                "mcp_servers": _mcp_server_env_map(),
                 "model_reasoning_effort": "max",
             },
             "cwd": TEST_GENERATION_CWD,
@@ -14063,9 +15373,14 @@ def test_reasoning_epoch_token_never_exposes_master_and_old_call_loses_rotation(
             "sandbox": "workspace-write",
         }
     )
-    reasoning_token = materialized["config"]["mcp_servers"]["reasoning_agent"]["env"][
-        hotjoin.REVIEW_CONTROL_TOKEN_ENV
+    materialized_environments = [
+        materialized["config"]["mcp_servers"][server_id]["env"]
+        for server_id in hotjoin.REASONING_MCP_SERVER_IDS
     ]
+    assert materialized_environments[0] == materialized_environments[1]
+    assert materialized_environments[1] == materialized_environments[2]
+    reasoning_token = materialized_environments[0][hotjoin.REVIEW_CONTROL_TOKEN_ENV]
+    assert materialized_environments[0][hotjoin.CONTEXT_THREAD_EPOCH_ENV] == "1"
     assert reasoning_token != owner_token
     assert owner_token not in hotjoin._canonical_json(materialized)
     lease, _cycle = _materialize_cadence_turn(ledger, started_at=1_000.0)
@@ -14165,19 +15480,21 @@ def test_reasoning_epoch_token_never_exposes_master_and_old_call_loses_rotation(
 def test_app_server_environment_never_inherits_privileged_control_tokens(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setenv(hotjoin.REVIEW_CONTROL_TOKEN_ENV, "1" * 64)
-    monkeypatch.setenv(hotjoin.GUARDIAN_CYCLE_TOKEN_ENV, "2" * 64)
-    monkeypatch.setenv(hotjoin.RUNNER_CYCLE_TOKEN_ENV, "3" * 64)
+    for index, name in enumerate(
+        sorted(hotjoin._RUNTIME_INJECTED_REASONING_MCP_ENV_KEYS), start=1
+    ):
+        monkeypatch.setenv(name, str(index) * 64)
     monkeypatch.setenv("RETHLAS_SAFE_NON_SECRET", "retained")
     scrubbed = hotjoin._app_server_process_env(policies_enabled=True)
     assert scrubbed is not None
     assert scrubbed["RETHLAS_SAFE_NON_SECRET"] == "retained"
-    assert not {
-        hotjoin.REVIEW_CONTROL_TOKEN_ENV,
-        hotjoin.GUARDIAN_CYCLE_TOKEN_ENV,
-        hotjoin.RUNNER_CYCLE_TOKEN_ENV,
-    } & set(scrubbed)
-    assert hotjoin._app_server_process_env(policies_enabled=False) is None
+    assert not hotjoin._RUNTIME_INJECTED_REASONING_MCP_ENV_KEYS & set(scrubbed)
+    legacy_scrubbed = hotjoin._app_server_process_env(policies_enabled=False)
+    assert legacy_scrubbed is not None
+    assert legacy_scrubbed["RETHLAS_SAFE_NON_SECRET"] == "retained"
+    assert not hotjoin._RUNTIME_INJECTED_REASONING_MCP_ENV_KEYS & set(
+        legacy_scrubbed
+    )
 
 
 def test_rehydration_prompt_quotes_malicious_handoff_text_as_untrusted_data(
@@ -14539,7 +15856,10 @@ def test_resume_reapplies_generator_config_and_ignores_other_thread_events(
     ledger.bind_thread("run-1", "thread-1", lease=adapter._lease())
     params = {
         "approvalPolicy": "never",
-        "config": {"web_search": "disabled", "mcp_servers": {"reasoning_agent": {}}},
+        "config": {
+            "web_search": "disabled",
+            "mcp_servers": _mcp_server_env_map(),
+        },
         "cwd": TEST_GENERATION_CWD,
         "ephemeral": False,
         "model": "gpt-5.6-sol",
@@ -17334,7 +18654,7 @@ You may use local read-only shell/Python for the `q=7` arithmetic. Do not use th
     private_adapter.write_text(private_source, encoding="utf-8")
     private_adapter_sha256 = hashlib.sha256(private_adapter.read_bytes()).hexdigest()
     assert private_adapter_sha256 == (
-        "6a9c7e6a9df5c3f873ed95100808b6723f4e1f5ba000516dd95ab61aacef1010"
+        "fb15802a5e6394be92b7b45bf36c714bc436037d9b38f54b2db1d786ffd6cd0b"
     )
 
     monkeypatch.setattr(hotjoin, "__file__", str(private_adapter))

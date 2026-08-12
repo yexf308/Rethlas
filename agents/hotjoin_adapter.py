@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import ast
 import contextlib
+import ctypes
 import errno
 import fcntl
 import hashlib
@@ -40,7 +41,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
 
-SCHEMA_VERSION = 10
+SCHEMA_VERSION = 11
 HOTJOIN_CONTROL_PLANE_VERSION = 3
 ZERO_DIGEST = "0" * 64
 MESSAGE_MODES = frozenset({"steer", "queue", "interrupt"})
@@ -184,7 +185,7 @@ APPROVED_GUARDIAN_LAUNCHER_SHA256 = (
     "933a43056aba0cd7d3247ebc8dcc9ae03922784a1347ad3ab64049bd1f00d5dc"
 )
 APPROVED_GUARDIAN_RUNNER_SHA256 = (
-    "28c54dbbdd96ed5cf5e6572363fc8e2629b1dfe42be9bcfb7a889c2c9023e0e0"
+    "4796a38c9b6ac3eaf4a55e87d38a73c245d5c194c0d2faa5e2111fe8d2f4c0b5"
 )
 APPROVED_GUARDIAN_SHA256 = (
     "475ccd703e6a3c601f3ee5000bdcc6f6fe5a2659e033b561ba31d09653334b9b"
@@ -440,6 +441,9 @@ REVIEW_CONTROL_TOKEN_ENV = "RETHLAS_REVIEW_CONTROL_TOKEN"
 GUARDIAN_CYCLE_TOKEN_ENV = "RETHLAS_GUARDIAN_CYCLE_TOKEN"
 RUNNER_CYCLE_TOKEN_ENV = "RETHLAS_RUNNER_CYCLE_TOKEN"
 STALE_RECOVERY_TOKEN_ENV = "RETHLAS_STALE_RECOVERY_TOKEN"
+OWNER_MEMORY_BATCH_PUBLICATION_SNAPSHOT_ENV = (
+    "RETHLAS_OWNER_MEMORY_BATCH_PUBLICATION_SNAPSHOT_JSON"
+)
 _CONTROL_TOKEN_OVERRIDE: tuple[str, str] | None = None
 GUARDIAN_ALLOWED_OPS = (
     "guardian_finalize",
@@ -466,6 +470,8 @@ REASONING_EPOCH_ALLOWED_OPS = (
     "context_handoff_prepare",
     "context_handoff_status",
     "generation_yield_prepare",
+    "memory_batch_publication_commit",
+    "memory_batch_publication_status",
     "reasoning_phase_preflight",
     "route_cycle_close",
 )
@@ -479,8 +485,61 @@ CONTEXT_HANDOFF_REQUIRED_SHA256_ENV = "RETHLAS_CONTEXT_HANDOFF_REQUIRED_SHA256"
 CONTEXT_THREAD_EPOCH_ENV = "RETHLAS_CONTEXT_THREAD_EPOCH"
 CONTEXT_CYCLE_ID_ENV = "RETHLAS_CONTEXT_CYCLE_ID"
 CONTEXT_RUN_ID_ENV = "RETHLAS_CONTEXT_RUN_ID"
+_RUNTIME_INJECTED_REASONING_MCP_ENV_KEYS = frozenset(
+    {
+        REVIEW_CONTROL_TOKEN_ENV,
+        GUARDIAN_CYCLE_TOKEN_ENV,
+        RUNNER_CYCLE_TOKEN_ENV,
+        STALE_RECOVERY_TOKEN_ENV,
+        CONTEXT_HANDOFF_REQUIRED_ID_ENV,
+        CONTEXT_HANDOFF_REQUIRED_SHA256_ENV,
+        CONTEXT_THREAD_EPOCH_ENV,
+        CONTEXT_CYCLE_ID_ENV,
+        CONTEXT_RUN_ID_ENV,
+        OWNER_MEMORY_BATCH_PUBLICATION_SNAPSHOT_ENV,
+    }
+)
 REVIEW_ADAPTER_COMMAND_SCHEMA = "rethlas_review_adapter_command_v1"
 REVIEW_ADAPTER_RESPONSE_SCHEMA = "rethlas_review_adapter_response_v1"
+MEMORY_BATCH_PUBLICATION_RECEIPT_SCHEMA = (
+    "rethlas_memory_batch_publication_receipt_v1"
+)
+MEMORY_BATCH_PUBLICATION_STATUS_SCHEMA = (
+    "rethlas_memory_batch_publication_status_v1"
+)
+MAX_ACCEPTED_MEMORY_BATCH_PUBLICATIONS = 128
+MAX_ACCEPTED_REASONING_MEMORY_BATCH_PUBLICATIONS = 96
+# Keep host-only capacity for owner review, targeted verification, and route
+# transition publications after model-visible reasoning reaches its quota.
+MIN_RESERVED_CONTROL_MEMORY_BATCH_PUBLICATIONS = (
+    MAX_ACCEPTED_MEMORY_BATCH_PUBLICATIONS
+    - MAX_ACCEPTED_REASONING_MEMORY_BATCH_PUBLICATIONS
+)
+MEMORY_BATCH_PROBLEM_COMPONENT_RE = re.compile(
+    r"^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9-])?$"
+)
+MEMORY_BATCH_BOOT_IDENTITY_RE = re.compile(r"^[ -~]{1,128}$")
+MEMORY_BATCH_PUBLICATION_RECEIPT_KEYS = frozenset(
+    {
+        "schema_version",
+        "state",
+        "run_id",
+        "problem_id",
+        "batch_id",
+        "checkpoint_sha256",
+        "commit_sha256",
+        "publication_class",
+        "cycle_id",
+        "cutoff_action_id",
+        "cutoff_kind",
+        "cutoff_at_utc",
+        "cutoff_monotonic",
+        "accepted_at_utc",
+        "accepted_at_monotonic",
+        "boot_identity",
+        "receipt_sha256",
+    }
+)
 ROUTE_TRANSITION_PUBLICATION_RECEIPT_SCHEMA = (
     "rethlas_route_transition_publication_receipt_v1"
 )
@@ -509,6 +568,7 @@ REVIEW_DRIVER_PACKAGE_FILES = (
 REQUIRED_APP_SERVER_METHODS = (
     "initialize",
     "item/completed",
+    "mcpServer/tool/call",
     "model/list",
     "model/rerouted",
     "thread/read",
@@ -559,7 +619,17 @@ _SAFE_ITEM_TYPES = frozenset(
     }
 )
 _SAFE_ITEM_STATUSES = frozenset({"completed", "declined", "failed", "inProgress"})
-_REASONING_MCP_SERVERS = frozenset({"reasoning-agent", "reasoning_agent"})
+REASONING_MCP_SERVER_IDS = (
+    "reasoning_agent",
+    "reasoning_checkpoint_primary",
+    "reasoning_checkpoint_recovery",
+)
+_REASONING_MCP_SERVERS = frozenset(
+    {
+        *REASONING_MCP_SERVER_IDS,
+        *(server_id.replace("_", "-") for server_id in REASONING_MCP_SERVER_IDS),
+    }
+)
 _REASONING_MCP_CATEGORIES = {
     "advisor_report_get": "advisor_retrieval",
     "branch_update": "branch_update",
@@ -714,6 +784,53 @@ def _utc_from_epoch(epoch: float) -> str:
     if not isinstance(epoch, (int, float)) or isinstance(epoch, bool):
         raise ValueError("epoch must be numeric")
     return datetime.fromtimestamp(float(epoch), timezone.utc).isoformat()
+
+
+def _current_boot_identity() -> str:
+    """Read the host boot identity without relying on mutable import paths."""
+
+    linux_boot = Path("/proc/sys/kernel/random/boot_id")
+    if linux_boot.is_file():
+        value = linux_boot.read_text(encoding="ascii").strip()
+        if value:
+            return value
+    if sys.platform != "darwin":
+        raise HotJoinError("cannot establish host boot identity")
+
+    class DarwinTimeval(ctypes.Structure):
+        _fields_ = [("tv_sec", ctypes.c_long), ("tv_usec", ctypes.c_int)]
+
+    try:
+        system = ctypes.CDLL("/usr/lib/libSystem.B.dylib", use_errno=True)
+        sysctlbyname = system.sysctlbyname
+        sysctlbyname.argtypes = [
+            ctypes.c_char_p,
+            ctypes.c_void_p,
+            ctypes.POINTER(ctypes.c_size_t),
+            ctypes.c_void_p,
+            ctypes.c_size_t,
+        ]
+        sysctlbyname.restype = ctypes.c_int
+        boot_time = DarwinTimeval()
+        size = ctypes.c_size_t(ctypes.sizeof(boot_time))
+        result = sysctlbyname(
+            b"kern.boottime",
+            ctypes.byref(boot_time),
+            ctypes.byref(size),
+            None,
+            0,
+        )
+    except (AttributeError, OSError) as exc:
+        raise HotJoinError("cannot establish native Darwin boot identity") from exc
+    if (
+        result != 0
+        or size.value != ctypes.sizeof(boot_time)
+        or boot_time.tv_sec <= 0
+        or not 0 <= boot_time.tv_usec < 1_000_000
+    ):
+        raise HotJoinError("cannot establish native Darwin boot identity")
+    marker = f"{boot_time.tv_sec}:{boot_time.tv_usec}".encode("ascii")
+    return hashlib.sha256(marker).hexdigest()
 
 
 def _canonical_json(value: object) -> str:
@@ -1717,19 +1834,92 @@ def _mcp_env_commitment(env: Mapping[str, str]) -> tuple[dict[str, str], list[st
     return committed, rotatable
 
 
-def _app_server_process_env(*, policies_enabled: bool) -> dict[str, str] | None:
-    if not policies_enabled:
-        return None
-    privileged_control_env = {
-        REVIEW_CONTROL_TOKEN_ENV,
-        GUARDIAN_CYCLE_TOKEN_ENV,
-        RUNNER_CYCLE_TOKEN_ENV,
-        STALE_RECOVERY_TOKEN_ENV,
+def _mcp_server_map_commitment(
+    servers: Mapping[str, Mapping[str, Any]], *, policies_enabled: bool
+) -> tuple[dict[str, dict[str, Any]], list[str]]:
+    _validate_exact_reasoning_mcp_server_map(
+        servers,
+        context="generator fingerprint",
+        allow_runtime_injected_environment=False,
+    )
+    expected_keys = {
+        "reasoning_agent": _PINNED_MCP_BASE_KEYS | {"disabled_tools"},
+        "reasoning_checkpoint_primary": _PINNED_MCP_BASE_KEYS | {"enabled_tools"},
+        "reasoning_checkpoint_recovery": _PINNED_MCP_BASE_KEYS
+        | {"enabled_tools"},
     }
+    expected_tools = {
+        "reasoning_agent": ("disabled_tools", ["memory_append_batch"], 3600),
+        "reasoning_checkpoint_primary": (
+            "enabled_tools",
+            ["memory_append_batch"],
+            60,
+        ),
+        "reasoning_checkpoint_recovery": (
+            "enabled_tools",
+            ["memory_append_batch"],
+            60,
+        ),
+    }
+    committed_servers: dict[str, dict[str, Any]] = {}
+    rotatable: set[str] = set()
+    runtime_env_commitments = {
+        CONTEXT_HANDOFF_REQUIRED_ID_ENV: "<runtime-rollover-handoff-id>",
+        CONTEXT_HANDOFF_REQUIRED_SHA256_ENV: "<runtime-rollover-handoff-sha256>",
+        CONTEXT_THREAD_EPOCH_ENV: "<runtime-thread-epoch>",
+        CONTEXT_CYCLE_ID_ENV: "<runtime-cycle-id>",
+        CONTEXT_RUN_ID_ENV: "<runtime-run-id>",
+    }
+    for server_id in REASONING_MCP_SERVER_IDS:
+        server = servers[server_id]
+        if set(server) != expected_keys[server_id]:
+            raise ValueError(f"{server_id} has a non-exact MCP configuration")
+        tool_key, tool_value, timeout = expected_tools[server_id]
+        if (
+            server.get(tool_key) != tool_value
+            or server.get("tool_timeout_sec") != timeout
+            or server.get("required") is not True
+            or server.get("default_tools_approval_mode") != "approve"
+        ):
+            raise ValueError(f"{server_id} violates its exact MCP role contract")
+        environment = server.get("env")
+        if not isinstance(environment, dict) or not all(
+            isinstance(key, str) and isinstance(value, str)
+            for key, value in environment.items()
+        ):
+            raise ValueError(f"{server_id} environment is not an exact string map")
+        commitment_environment = dict(environment)
+        if policies_enabled:
+            commitment_environment[REVIEW_CONTROL_TOKEN_ENV] = "0" * 64
+            commitment_environment.update(runtime_env_commitments)
+        environment_commitment, server_rotatable = _mcp_env_commitment(
+            commitment_environment
+        )
+        for runtime_path_key in (
+            REVIEW_ADAPTER_PATH_ENV,
+            REVIEW_DATABASE_ENV,
+            "RETHLAS_REVIEW_CONTRACT_CLI_PATH",
+        ):
+            if runtime_path_key in environment_commitment:
+                environment_commitment[runtime_path_key] = "<runtime-bound-path>"
+        committed = dict(server)
+        committed["args"] = _mcp_args_commitment(server["args"], server["cwd"])
+        committed["env"] = environment_commitment
+        committed_servers[server_id] = committed
+        rotatable.update(server_rotatable)
+    return committed_servers, sorted(rotatable)
+
+
+def _app_server_process_env(*, policies_enabled: bool) -> dict[str, str] | None:
+    inherited_runtime_bindings = (
+        _RUNTIME_INJECTED_REASONING_MCP_ENV_KEYS & set(os.environ)
+    )
+    if not policies_enabled and not inherited_runtime_bindings:
+        return None
     return {
         key: value
         for key, value in os.environ.items()
-        if key not in privileged_control_env
+        if key not in _RUNTIME_INJECTED_REASONING_MCP_ENV_KEYS
     }
 
 
@@ -3187,7 +3377,7 @@ class ConversationLedger:
                     value TEXT NOT NULL
                 );
                 INSERT OR IGNORE INTO metadata(key, value)
-                    VALUES ('schema_version', '10');
+                    VALUES ('schema_version', '11');
 
                 CREATE TABLE IF NOT EXISTS runs (
                     run_id TEXT PRIMARY KEY,
@@ -4045,6 +4235,47 @@ class ConversationLedger:
                 CREATE UNIQUE INDEX IF NOT EXISTS reasoning_epoch_one_active
                     ON reasoning_epoch_capabilities(run_id)
                     WHERE state = 'active';
+
+                CREATE TABLE IF NOT EXISTS memory_batch_publications (
+                    publication_id TEXT PRIMARY KEY,
+                    run_id TEXT NOT NULL REFERENCES runs(run_id),
+                    problem_id TEXT NOT NULL,
+                    batch_id TEXT NOT NULL,
+                    checkpoint_sha256 TEXT NOT NULL,
+                    commit_sha256 TEXT NOT NULL,
+                    publication_class TEXT NOT NULL CHECK(publication_class IN
+                        ('reasoning_checkpoint', 'control_only')),
+                    state TEXT NOT NULL CHECK(state IN ('accepted', 'rejected')),
+                    cycle_id TEXT NOT NULL REFERENCES cadence_cycles(cycle_id),
+                    cutoff_action_id TEXT NOT NULL
+                        REFERENCES cadence_actions(action_id),
+                    cutoff_kind TEXT NOT NULL CHECK(cutoff_kind IN
+                        ('review_1', 'review_2', 'hard_stop')),
+                    cutoff_at REAL NOT NULL,
+                    cutoff_monotonic REAL NOT NULL,
+                    accepted_at REAL,
+                    accepted_at_monotonic REAL,
+                    boot_identity TEXT NOT NULL,
+                    receipt_json TEXT NOT NULL,
+                    receipt_sha256 TEXT NOT NULL,
+                    created_sequence INTEGER NOT NULL REFERENCES events(sequence),
+                    CHECK(
+                        (state = 'accepted' AND accepted_at IS NOT NULL
+                            AND accepted_at_monotonic IS NOT NULL)
+                        OR
+                        (state = 'rejected' AND accepted_at IS NULL
+                            AND accepted_at_monotonic IS NULL)
+                    ),
+                    UNIQUE(run_id, batch_id)
+                );
+                CREATE TRIGGER IF NOT EXISTS memory_batch_publications_are_immutable_update
+                BEFORE UPDATE ON memory_batch_publications BEGIN
+                    SELECT RAISE(ABORT, 'memory batch publications are immutable');
+                END;
+                CREATE TRIGGER IF NOT EXISTS memory_batch_publications_are_immutable_delete
+                BEFORE DELETE ON memory_batch_publications BEGIN
+                    SELECT RAISE(ABORT, 'memory batch publications are immutable');
+                END;
                 """
             )
             version = str(
@@ -4383,6 +4614,42 @@ class ConversationLedger:
                         "SELECT value FROM metadata WHERE key = 'schema_version'"
                     ).fetchone()["value"]
                 )
+            if version == "10":
+                connection.execute("BEGIN IMMEDIATE")
+                current = str(
+                    connection.execute(
+                        "SELECT value FROM metadata WHERE key = 'schema_version'"
+                    ).fetchone()["value"]
+                )
+                if current == "10":
+                    for run_row in connection.execute(
+                        "SELECT run_id FROM runs ORDER BY run_id"
+                    ).fetchall():
+                        self._append_event(
+                            connection,
+                            run_id=str(run_row["run_id"]),
+                            kind="memory_batch_publication_registry_installed",
+                            actor="adapter",
+                            payload={
+                                "from_schema_version": 10,
+                                "to_schema_version": 11,
+                            },
+                        )
+                    connection.execute(
+                        "UPDATE metadata SET value = '11' "
+                        "WHERE key = 'schema_version'"
+                    )
+                elif current != str(SCHEMA_VERSION):
+                    raise HotJoinError(
+                        f"unsupported hot-join database schema {current}; "
+                        f"expected {SCHEMA_VERSION}"
+                    )
+                connection.commit()
+                version = str(
+                    connection.execute(
+                        "SELECT value FROM metadata WHERE key = 'schema_version'"
+                    ).fetchone()["value"]
+                )
             route_review_columns = {
                 str(row["name"])
                 for row in connection.execute(
@@ -4628,6 +4895,7 @@ class ConversationLedger:
                     "review_control_capabilities",
                     "reasoning_epoch_capabilities",
                     "initial_seed_imports",
+                    "memory_batch_publications",
                     "stale_recovery_capabilities",
                     "stale_turn_reconciliations",
                     "guardian_launch_intents",
@@ -21181,6 +21449,20 @@ def preflight_app_server(
         "ModelListResponse", properties={"data", "nextCursor"}, required_fields={"data"}
     )
     require_definition(
+        "McpServerToolCallParams",
+        properties={"arguments", "server", "threadId", "tool"},
+        required_fields={"server", "threadId", "tool"},
+    )
+    require_definition(
+        "McpServerToolCallResponse",
+        properties={"content", "isError", "structuredContent"},
+        required_fields={"content"},
+    )
+    for field_name in ("server", "threadId", "tool"):
+        require_property_type("McpServerToolCallParams", field_name, "string")
+    require_property_type("McpServerToolCallResponse", "content", "array")
+    require_property_type("McpServerToolCallResponse", "isError", "boolean")
+    require_definition(
         "Model",
         properties={"id", "model", "supportedReasoningEfforts"},
         required_fields={"id", "model", "supportedReasoningEfforts"},
@@ -22399,6 +22681,11 @@ class GeneratorHotJoin:
         self, thread_params: Mapping[str, Any]
     ) -> dict[str, Any]:
         materialized = _json_loads_strict(_canonical_json(dict(thread_params)))
+        environments = _exact_reasoning_mcp_environments(
+            materialized,
+            context="reasoning MCP thread configuration",
+            allow_runtime_injected_environment=False,
+        )
         owner_token = self._owner_review_control_token
         runner_token = self._runner_cycle_token
         policies_enabled = (
@@ -22421,26 +22708,27 @@ class GeneratorHotJoin:
             owner_token=owner_token,
             runner_token=runner_token,
         )
-        config = materialized.get("config")
-        servers = config.get("mcp_servers") if isinstance(config, dict) else None
-        reasoning = (
-            servers.get("reasoning_agent") if isinstance(servers, dict) else None
-        )
-        environment = reasoning.get("env") if isinstance(reasoning, dict) else None
-        if not isinstance(environment, dict):
-            raise HotJoinError(
-                "reasoning epoch capability lacks its exact MCP environment"
-            )
         if any(
             key in environment
+            for environment in environments
             for key in (GUARDIAN_CYCLE_TOKEN_ENV, RUNNER_CYCLE_TOKEN_ENV)
         ):
             raise HotJoinError("cycle capabilities must not enter reasoning MCP")
-        existing = environment.get(REVIEW_CONTROL_TOKEN_ENV)
-        if existing is not None and existing in {owner_token, runner_token}:
+        existing = {
+            environment.get(REVIEW_CONTROL_TOKEN_ENV)
+            for environment in environments
+            if REVIEW_CONTROL_TOKEN_ENV in environment
+        }
+        if existing & {owner_token, runner_token}:
             raise HotJoinError("owner master capability must not enter reasoning MCP")
-        environment[REVIEW_CONTROL_TOKEN_ENV] = str(binding["token"])
-        environment[CONTEXT_THREAD_EPOCH_ENV] = str(binding["thread_epoch"])
+        _update_reasoning_mcp_environment_parity(
+            materialized,
+            {
+                REVIEW_CONTROL_TOKEN_ENV: str(binding["token"]),
+                CONTEXT_THREAD_EPOCH_ENV: str(binding["thread_epoch"]),
+            },
+            context="reasoning epoch capability",
+        )
         return materialized
 
     def _renew_lease_if_due(self, *, force: bool = False) -> None:
@@ -23399,23 +23687,8 @@ class GeneratorHotJoin:
             rollover = self.ledger.pending_context_rollover(self.run_id)
             if rollover is not None:
                 fresh_params = _json_loads_strict(_canonical_json(dict(thread_params)))
-                config = fresh_params.get("config")
-                servers = (
-                    config.get("mcp_servers") if isinstance(config, dict) else None
-                )
-                reasoning = (
-                    servers.get("reasoning_agent")
-                    if isinstance(servers, dict)
-                    else None
-                )
-                environment = (
-                    reasoning.get("env") if isinstance(reasoning, dict) else None
-                )
-                if not isinstance(environment, dict):
-                    raise HotJoinError(
-                        "fresh context epoch lacks the trusted reasoning MCP environment"
-                    )
-                environment.update(
+                _update_reasoning_mcp_environment_parity(
+                    fresh_params,
                     {
                         CONTEXT_HANDOFF_REQUIRED_ID_ENV: str(rollover["handoff_id"]),
                         CONTEXT_HANDOFF_REQUIRED_SHA256_ENV: str(
@@ -23424,7 +23697,8 @@ class GeneratorHotJoin:
                         CONTEXT_THREAD_EPOCH_ENV: str(rollover["thread_epoch"]),
                         CONTEXT_CYCLE_ID_ENV: str(rollover["cycle_id"] or ""),
                         CONTEXT_RUN_ID_ENV: self.run_id,
-                    }
+                    },
+                    context="fresh context epoch",
                 )
                 if rollover.get("host_consumed") is True:
                     thread_id = rollover.get("thread_id")
@@ -25248,6 +25522,170 @@ def _read_encouragement(args: argparse.Namespace) -> str:
     return DEFAULT_ENCOURAGEMENT_NOTE
 
 
+_PINNED_MCP_BASE_KEYS = frozenset(
+    {
+        "args",
+        "command",
+        "cwd",
+        "default_tools_approval_mode",
+        "env",
+        "required",
+        "tool_timeout_sec",
+    }
+)
+
+
+def _reject_runtime_injected_reasoning_mcp_base_environment(
+    environment: Mapping[str, Any],
+) -> None:
+    forbidden = set(environment) & _RUNTIME_INJECTED_REASONING_MCP_ENV_KEYS
+    if forbidden:
+        raise ValueError(
+            "pinned MCP base env contains host-runtime bindings: "
+            + ", ".join(sorted(forbidden))
+        )
+
+
+def _validate_exact_reasoning_mcp_server_map(
+    servers: Mapping[str, Any],
+    *,
+    context: str,
+    allow_runtime_injected_environment: bool,
+) -> list[dict[str, Any]]:
+    if not isinstance(servers, dict) or set(servers) != set(REASONING_MCP_SERVER_IDS):
+        raise ValueError(f"{context} requires the exact MCP server IDs")
+    expected_keys = {
+        "reasoning_agent": _PINNED_MCP_BASE_KEYS | {"disabled_tools"},
+        "reasoning_checkpoint_primary": _PINNED_MCP_BASE_KEYS | {"enabled_tools"},
+        "reasoning_checkpoint_recovery": _PINNED_MCP_BASE_KEYS
+        | {"enabled_tools"},
+    }
+    expected_roles = {
+        "reasoning_agent": ("disabled_tools", ["memory_append_batch"], 3600),
+        "reasoning_checkpoint_primary": (
+            "enabled_tools",
+            ["memory_append_batch"],
+            60,
+        ),
+        "reasoning_checkpoint_recovery": (
+            "enabled_tools",
+            ["memory_append_batch"],
+            60,
+        ),
+    }
+    common_keys = _PINNED_MCP_BASE_KEYS - {"tool_timeout_sec"}
+    common_values: set[str] = set()
+    environments: list[dict[str, Any]] = []
+    for server_id in REASONING_MCP_SERVER_IDS:
+        server = servers.get(server_id)
+        if not isinstance(server, dict) or set(server) != expected_keys[server_id]:
+            raise ValueError(f"{context} has a non-exact {server_id} configuration")
+        tool_key, tool_value, timeout = expected_roles[server_id]
+        if (
+            server.get(tool_key) != tool_value
+            or server.get("tool_timeout_sec") != timeout
+            or server.get("required") is not True
+            or server.get("default_tools_approval_mode") != "approve"
+        ):
+            raise ValueError(f"{context} violates the {server_id} role contract")
+        environment = server.get("env")
+        if not isinstance(environment, dict) or not all(
+            isinstance(key, str) and isinstance(value, str)
+            for key, value in environment.items()
+        ):
+            raise ValueError(f"{context} has an invalid {server_id} environment")
+        if not allow_runtime_injected_environment:
+            _reject_runtime_injected_reasoning_mcp_base_environment(environment)
+        environments.append(environment)
+        common_values.add(
+            _canonical_json({key: server[key] for key in common_keys})
+        )
+    if len(common_values) != 1:
+        raise ValueError(f"{context} lacks exact MCP common-field parity")
+    return environments
+
+
+def _derive_reasoning_mcp_server_map(
+    pinned_base: Mapping[str, Any],
+) -> dict[str, dict[str, Any]]:
+    """Derive the exact three-role map from one already validated base."""
+
+    if set(pinned_base) != _PINNED_MCP_BASE_KEYS:
+        raise ValueError("pinned MCP base must contain only the exact base fields")
+    if pinned_base.get("tool_timeout_sec") != 3600:
+        raise ValueError("pinned reasoning MCP base must use tool_timeout_sec=3600")
+    environment = pinned_base.get("env")
+    if not isinstance(environment, dict):
+        raise ValueError("pinned reasoning MCP base env must be an object")
+    _reject_runtime_injected_reasoning_mcp_base_environment(environment)
+    serialized = _canonical_json(dict(pinned_base))
+
+    def fresh_base() -> dict[str, Any]:
+        copied = _json_loads_strict(serialized)
+        if not isinstance(copied, dict):  # pragma: no cover - canonical object invariant
+            raise AssertionError("canonical MCP base did not remain an object")
+        return copied
+
+    reasoning = fresh_base()
+    reasoning["disabled_tools"] = ["memory_append_batch"]
+    primary = fresh_base()
+    primary["tool_timeout_sec"] = 60
+    primary["enabled_tools"] = ["memory_append_batch"]
+    recovery = fresh_base()
+    recovery["tool_timeout_sec"] = 60
+    recovery["enabled_tools"] = ["memory_append_batch"]
+    servers = {
+        "reasoning_agent": reasoning,
+        "reasoning_checkpoint_primary": primary,
+        "reasoning_checkpoint_recovery": recovery,
+    }
+    if tuple(servers) != REASONING_MCP_SERVER_IDS:
+        raise AssertionError("reasoning MCP server order drifted")
+    common_keys = _PINNED_MCP_BASE_KEYS - {"tool_timeout_sec"}
+    common_projection = {
+        server_id: {key: servers[server_id][key] for key in common_keys}
+        for server_id in REASONING_MCP_SERVER_IDS
+    }
+    if len({_canonical_json(value) for value in common_projection.values()}) != 1:
+        raise AssertionError("derived reasoning MCP common configuration drifted")
+    return servers
+
+
+def _exact_reasoning_mcp_environments(
+    thread_params: Mapping[str, Any],
+    *,
+    context: str,
+    allow_runtime_injected_environment: bool,
+) -> list[dict[str, Any]]:
+    config = thread_params.get("config")
+    servers = config.get("mcp_servers") if isinstance(config, dict) else None
+    try:
+        return _validate_exact_reasoning_mcp_server_map(
+            servers if isinstance(servers, dict) else {},
+            context=context,
+            allow_runtime_injected_environment=allow_runtime_injected_environment,
+        )
+    except ValueError as exc:
+        raise HotJoinError(str(exc)) from exc
+
+
+def _update_reasoning_mcp_environment_parity(
+    thread_params: Mapping[str, Any],
+    updates: Mapping[str, str],
+    *,
+    context: str,
+) -> None:
+    environments = _exact_reasoning_mcp_environments(
+        thread_params,
+        context=context,
+        allow_runtime_injected_environment=True,
+    )
+    for environment in environments:
+        environment.update(updates)
+    if len({_canonical_json(environment) for environment in environments}) != 1:
+        raise AssertionError("reasoning MCP environment parity update drifted")
+
+
 def _validate_generator_config(
     *,
     mcp: object,
@@ -25268,17 +25706,15 @@ def _validate_generator_config(
         raise ValueError("runtime must be positive and idle grace must be non-negative")
     if not isinstance(mcp, dict):
         raise ValueError("--mcp-config-toml must be an object")
-    missing = {
-        "command",
-        "args",
-        "cwd",
-        "env",
-        "required",
-        "tool_timeout_sec",
-        "default_tools_approval_mode",
-    } - set(mcp)
-    if missing:
-        raise ValueError("MCP object is incomplete: " + ", ".join(sorted(missing)))
+    missing = _PINNED_MCP_BASE_KEYS - set(mcp)
+    extra = set(mcp) - _PINNED_MCP_BASE_KEYS
+    if missing or extra:
+        details = []
+        if missing:
+            details.append("missing " + ", ".join(sorted(missing)))
+        if extra:
+            details.append("unexpected " + ", ".join(sorted(extra)))
+        raise ValueError("MCP base is not exact: " + "; ".join(details))
     command = mcp["command"]
     if (
         not isinstance(command, str)
@@ -25303,13 +25739,14 @@ def _validate_generator_config(
         for key, value in mcp["env"].items()
     ):
         raise ValueError("MCP env must map strings to strings")
+    _reject_runtime_injected_reasoning_mcp_base_environment(mcp["env"])
     timeout = mcp["tool_timeout_sec"]
     if (
         isinstance(timeout, bool)
         or not isinstance(timeout, (int, float))
-        or timeout <= 0
+        or timeout != 3600
     ):
-        raise ValueError("MCP tool_timeout_sec must be positive")
+        raise ValueError("reasoning MCP base tool_timeout_sec must equal 3600")
     if mcp["default_tools_approval_mode"] != "approve":
         raise ValueError("reasoning MCP tools must remain noninteractive")
     if mcp["required"] is not True:
@@ -28083,8 +28520,18 @@ def _reasoning_phase_preflight_control(
         due_action = (
             connection.execute(
                 "SELECT * FROM cadence_actions WHERE cycle_id = ? "
-                "AND kind IN ('review_1','review_2') AND state = 'completed' "
-                "ORDER BY due_at DESC LIMIT 1",
+                "AND kind IN ('review_1','review_2') "
+                "AND state NOT IN ('completed','failed','execution_unknown',"
+                "'delivery_unknown') ORDER BY due_at ASC LIMIT 1",
+                (cycle["cycle_id"],),
+            ).fetchone()
+            if cycle is not None
+            else None
+        )
+        hard_stop_action = (
+            connection.execute(
+                "SELECT * FROM cadence_actions WHERE cycle_id = ? "
+                "AND kind = 'hard_stop' LIMIT 1",
                 (cycle["cycle_id"],),
             ).fetchone()
             if cycle is not None
@@ -28093,6 +28540,26 @@ def _reasoning_phase_preflight_control(
         connection.commit()
     if run is None or cycle is None:
         raise HotJoinError("reasoning phase preflight lacks an active cadence cycle")
+    try:
+        observed_boot_identity = _current_boot_identity()
+    except BaseException as exc:
+        raise HotJoinError(
+            "reasoning phase preflight cannot establish the current boot identity"
+        ) from exc
+    if (
+        not isinstance(cycle["boot_identity"], str)
+        or not cycle["boot_identity"]
+        or cycle["boot_identity"] != observed_boot_identity
+        or hard_stop_action is None
+        or hard_stop_action["due_monotonic"] is None
+        or (
+            due_action is not None
+            and due_action["due_monotonic"] is None
+        )
+    ):
+        raise HotJoinError(
+            "reasoning phase preflight lacks a same-boot durable monotonic clock"
+        )
     review_only_tools = {
         "route_review_prepare",
         "review_frontier_status",
@@ -28107,6 +28574,20 @@ def _reasoning_phase_preflight_control(
     }
     review_only = cycle["allowed_action"] == "independent_review_only"
     safe_state = cycle["state"] in {"active", "review_due", "review_running"}
+    now_wall = time.time()
+    now_monotonic = time.monotonic()
+    before_hard_stop = bool(
+        now_wall < float(cycle["hard_stop_due"])
+        and now_monotonic < float(hard_stop_action["due_monotonic"])
+    )
+    before_checkpoint_boundary = bool(
+        tool_name != "memory_append_batch"
+        or due_action is None
+        or (
+            now_wall < float(due_action["due_at"])
+            and now_monotonic < float(due_action["due_monotonic"])
+        )
+    )
     tool_permitted = bool(
         safe_state
         and cycle["allowed_action"]
@@ -28115,7 +28596,8 @@ def _reasoning_phase_preflight_control(
             "descendant_reap_only",
             "review_boundary_interrupt_only",
         }
-        and time.time() < float(cycle["hard_stop_due"])
+        and before_hard_stop
+        and before_checkpoint_boundary
         and (not review_only or tool_name in review_only_tools)
     )
     return {
@@ -28133,8 +28615,511 @@ def _reasoning_phase_preflight_control(
             if due_action is not None
             else None
         ),
+        "review_due_monotonic": (
+            float(due_action["due_monotonic"])
+            if due_action is not None and due_action["due_monotonic"] is not None
+            else None
+        ),
         "hard_stop_at_utc": _utc_from_epoch(float(cycle["hard_stop_due"])),
+        "hard_stop_monotonic": (
+            float(hard_stop_action["due_monotonic"])
+            if hard_stop_action is not None
+            and hard_stop_action["due_monotonic"] is not None
+            else None
+        ),
         "tool_permitted": tool_permitted,
+    }
+
+
+def _memory_batch_publication_receipt(
+    *,
+    state: str,
+    run_id: str,
+    problem_id: str,
+    batch_id: str,
+    checkpoint_sha256: str,
+    commit_sha256: str,
+    publication_class: str,
+    cycle_id: str,
+    cutoff_action_id: str,
+    cutoff_kind: str,
+    cutoff_at: float,
+    cutoff_monotonic: float,
+    accepted_at: float | None,
+    accepted_at_monotonic: float | None,
+    boot_identity: str,
+) -> dict[str, Any]:
+    seed = {
+        "schema_version": MEMORY_BATCH_PUBLICATION_RECEIPT_SCHEMA,
+        "state": state,
+        "run_id": run_id,
+        "problem_id": problem_id,
+        "batch_id": batch_id,
+        "checkpoint_sha256": checkpoint_sha256,
+        "commit_sha256": commit_sha256,
+        "publication_class": publication_class,
+        "cycle_id": cycle_id,
+        "cutoff_action_id": cutoff_action_id,
+        "cutoff_kind": cutoff_kind,
+        "cutoff_at_utc": _utc_from_epoch(cutoff_at),
+        "cutoff_monotonic": float(cutoff_monotonic),
+        "accepted_at_utc": (
+            _utc_from_epoch(accepted_at) if accepted_at is not None else None
+        ),
+        "accepted_at_monotonic": (
+            float(accepted_at_monotonic)
+            if accepted_at_monotonic is not None
+            else None
+        ),
+        "boot_identity": boot_identity,
+    }
+    return {
+        **seed,
+        "receipt_sha256": hashlib.sha256(
+            _canonical_json(seed).encode("utf-8")
+        ).hexdigest(),
+    }
+
+
+def _valid_memory_batch_problem_id(value: object) -> bool:
+    if (
+        not isinstance(value, str)
+        or not value
+        or len(value.encode("utf-8")) > 128
+        or value != value.strip()
+        or "\\" in value
+    ):
+        return False
+    parts = value.split("/")
+    return bool(
+        parts
+        and all(
+            part not in {"", ".", ".."}
+            and MEMORY_BATCH_PROBLEM_COMPONENT_RE.fullmatch(part) is not None
+            for part in parts
+        )
+    )
+
+
+def _validate_memory_batch_publication_receipt(value: object) -> dict[str, Any]:
+    if not isinstance(value, dict) or set(value) != MEMORY_BATCH_PUBLICATION_RECEIPT_KEYS:
+        raise HotJoinError("memory batch publication receipt has an unsupported shape")
+    state = value.get("state")
+    accepted_at_utc = value.get("accepted_at_utc")
+    accepted_at_monotonic = value.get("accepted_at_monotonic")
+    if (
+        value.get("schema_version") != MEMORY_BATCH_PUBLICATION_RECEIPT_SCHEMA
+        or state not in {"accepted", "rejected"}
+        or not isinstance(value.get("run_id"), str)
+        or RUN_ID_RE.fullmatch(value["run_id"]) is None
+        or not _valid_memory_batch_problem_id(value.get("problem_id"))
+        or re.fullmatch(r"batch_[0-9a-f]{64}", str(value.get("batch_id"))) is None
+        or SHA256_RE.fullmatch(str(value.get("checkpoint_sha256"))) is None
+        or SHA256_RE.fullmatch(str(value.get("commit_sha256"))) is None
+        or value.get("publication_class")
+        not in {"reasoning_checkpoint", "control_only"}
+        or re.fullmatch(r"cycle_[0-9a-f]{32}", str(value.get("cycle_id"))) is None
+        or re.fullmatch(r"cadact_[0-9a-f]{32}", str(value.get("cutoff_action_id")))
+        is None
+        or value.get("cutoff_kind") not in {"review_1", "review_2", "hard_stop"}
+        or not isinstance(value.get("boot_identity"), str)
+        or MEMORY_BATCH_BOOT_IDENTITY_RE.fullmatch(value["boot_identity"]) is None
+    ):
+        raise HotJoinError("memory batch publication receipt has invalid bindings")
+    for timestamp, label in (
+        (value.get("cutoff_at_utc"), "cutoff"),
+        (accepted_at_utc, "accepted"),
+    ):
+        if timestamp is None and label == "accepted" and state == "rejected":
+            continue
+        if not isinstance(timestamp, str):
+            raise HotJoinError(f"memory batch publication {label} time is invalid")
+        try:
+            parsed = datetime.fromisoformat(timestamp)
+        except ValueError as exc:
+            raise HotJoinError(
+                f"memory batch publication {label} time is invalid"
+            ) from exc
+        if parsed.tzinfo is None or parsed.utcoffset() != timezone.utc.utcoffset(parsed):
+            raise HotJoinError(f"memory batch publication {label} time is invalid")
+        if parsed.astimezone(timezone.utc).isoformat() != timestamp:
+            raise HotJoinError(f"memory batch publication {label} time is not canonical")
+    for clock, label in (
+        (value.get("cutoff_monotonic"), "cutoff"),
+        (accepted_at_monotonic, "accepted"),
+    ):
+        if clock is None and label == "accepted" and state == "rejected":
+            continue
+        if (
+            type(clock) is not float
+            or not math.isfinite(float(clock))
+            or float(clock) <= 0
+        ):
+            raise HotJoinError(
+                f"memory batch publication {label} monotonic time is invalid"
+            )
+    if state == "accepted" and (
+        accepted_at_utc is None or accepted_at_monotonic is None
+    ) or state == "rejected" and (
+        accepted_at_utc is not None or accepted_at_monotonic is not None
+    ):
+        raise HotJoinError("memory batch publication state/time bindings are invalid")
+    if state == "accepted" and (
+        datetime.fromisoformat(str(accepted_at_utc))
+        >= datetime.fromisoformat(str(value["cutoff_at_utc"]))
+        or float(accepted_at_monotonic) >= float(value["cutoff_monotonic"])
+    ):
+        raise HotJoinError("memory batch publication acceptance crossed its cutoff")
+    receipt_sha256 = value.get("receipt_sha256")
+    seed = {key: item for key, item in value.items() if key != "receipt_sha256"}
+    if (
+        not isinstance(receipt_sha256, str)
+        or SHA256_RE.fullmatch(receipt_sha256) is None
+        or hashlib.sha256(_canonical_json(seed).encode("utf-8")).hexdigest()
+        != receipt_sha256
+    ):
+        raise HotJoinError("memory batch publication receipt digest is invalid")
+    return dict(value)
+
+
+def _memory_batch_publication_receipt_matches_row(
+    receipt: Mapping[str, Any], row: Mapping[str, Any]
+) -> bool:
+    accepted_at_utc = (
+        _utc_from_epoch(float(row["accepted_at"]))
+        if row["accepted_at"] is not None
+        else None
+    )
+    return bool(
+        receipt["receipt_sha256"] == row["receipt_sha256"]
+        and receipt["state"] == row["state"]
+        and receipt["run_id"] == row["run_id"]
+        and receipt["problem_id"] == row["problem_id"]
+        and receipt["batch_id"] == row["batch_id"]
+        and receipt["checkpoint_sha256"] == row["checkpoint_sha256"]
+        and receipt["commit_sha256"] == row["commit_sha256"]
+        and receipt["publication_class"] == row["publication_class"]
+        and receipt["cycle_id"] == row["cycle_id"]
+        and receipt["cutoff_action_id"] == row["cutoff_action_id"]
+        and receipt["cutoff_kind"] == row["cutoff_kind"]
+        and receipt["cutoff_at_utc"] == _utc_from_epoch(float(row["cutoff_at"]))
+        and float(receipt["cutoff_monotonic"])
+        == float(row["cutoff_monotonic"])
+        and receipt["accepted_at_utc"] == accepted_at_utc
+        and receipt["accepted_at_monotonic"] == row["accepted_at_monotonic"]
+        and receipt["boot_identity"] == row["boot_identity"]
+    )
+
+
+def _memory_batch_publication_control(
+    ledger: ConversationLedger, payload: Mapping[str, Any]
+) -> dict[str, Any]:
+    required = {
+        "operation",
+        "problem_id",
+        "batch_id",
+        "checkpoint_sha256",
+        "commit_sha256",
+        "publication_class",
+    }
+    if set(payload) != required or payload.get("operation") != (
+        "memory_batch_publication_commit"
+    ):
+        raise ValueError("memory batch publication payload has an unsupported shape")
+    problem_id = payload.get("problem_id")
+    batch_id = payload.get("batch_id")
+    checkpoint_sha256 = payload.get("checkpoint_sha256")
+    commit_sha256 = payload.get("commit_sha256")
+    publication_class = payload.get("publication_class")
+    if (
+        not _valid_memory_batch_problem_id(problem_id)
+        or not isinstance(batch_id, str)
+        or re.fullmatch(r"batch_[0-9a-f]{64}", batch_id) is None
+        or not isinstance(checkpoint_sha256, str)
+        or SHA256_RE.fullmatch(checkpoint_sha256) is None
+        or not isinstance(commit_sha256, str)
+        or SHA256_RE.fullmatch(commit_sha256) is None
+        or publication_class not in {"reasoning_checkpoint", "control_only"}
+    ):
+        raise ValueError("memory batch publication bindings are invalid")
+    token = _review_control_token()
+    run_id = _run_id_for_review_control_token(ledger, token)
+    capability = _reasoning_or_owner_capability(
+        ledger,
+        run_id,
+        token,
+        operation="memory_batch_publication_commit",
+    )
+    authority = capability.get("_capability_authority")
+    expected_class = (
+        "reasoning_checkpoint" if authority == "reasoning_epoch" else "control_only"
+    )
+    if publication_class != expected_class:
+        raise HotJoinError(
+            "memory batch publication class does not match its capability authority"
+        )
+    publication_id = "membatchpub_" + hashlib.sha256(
+        f"{run_id}\0{batch_id}".encode("utf-8")
+    ).hexdigest()[:32]
+    with ledger._connect() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        ledger._require_review_control_fence(
+            connection, run_id, capability["_control_fence"]
+        )
+        run = ledger._run_row(connection, run_id)
+        existing = connection.execute(
+            "SELECT * FROM memory_batch_publications WHERE run_id = ? "
+            "AND batch_id = ?",
+            (run_id, batch_id),
+        ).fetchone()
+        if existing is not None:
+            if any(
+                existing[key] != expected
+                for key, expected in {
+                    "problem_id": problem_id,
+                    "checkpoint_sha256": checkpoint_sha256,
+                    "commit_sha256": commit_sha256,
+                    "publication_class": publication_class,
+                }.items()
+            ):
+                raise IdempotencyConflict(
+                    "memory batch publication identity cannot be rebound"
+                )
+            receipt = _validate_memory_batch_publication_receipt(
+                _json_loads_strict(str(existing["receipt_json"]))
+            )
+            if not _memory_batch_publication_receipt_matches_row(receipt, existing):
+                raise HotJoinError("memory batch publication receipt is not exact")
+            connection.commit()
+            return dict(receipt)
+        if run["problem_id"] != problem_id:
+            raise HotJoinError("memory batch publication belongs to another problem")
+        fence = capability["_control_fence"]
+        if isinstance(fence, GuardianRunnerFence):
+            cycles = connection.execute(
+                "SELECT * FROM cadence_cycles WHERE run_id = ? AND cycle_id = ?",
+                (run_id, fence.cycle_id),
+            ).fetchall()
+        else:
+            thread_id = None
+            if isinstance(fence, ReasoningEpochFence):
+                epoch = connection.execute(
+                    "SELECT thread_id FROM thread_epochs WHERE run_id = ? "
+                    "AND thread_epoch = ? AND state = 'active'",
+                    (run_id, fence.thread_epoch),
+                ).fetchone()
+                thread_id = epoch["thread_id"] if epoch is not None else None
+                if not isinstance(thread_id, str) or not thread_id:
+                    raise HotJoinError(
+                        "memory batch publication lacks its active thread epoch"
+                    )
+            query = (
+                "SELECT * FROM cadence_cycles WHERE run_id = ? "
+                "AND state IN ('active','review_due','review_running',"
+                "'verification_required','hard_stop_pending')"
+            )
+            parameters: tuple[Any, ...] = (run_id,)
+            if thread_id is not None:
+                query += " AND expected_thread_id = ?"
+                parameters = (run_id, thread_id)
+            cycles = connection.execute(query, parameters).fetchall()
+        if len(cycles) != 1:
+            raise HotJoinError(
+                "memory batch publication lacks one capability-bound cadence cycle"
+            )
+        cycle = cycles[0]
+        cutoff = (
+            connection.execute(
+                "SELECT * FROM cadence_actions WHERE cycle_id = ? "
+                "AND kind = 'hard_stop' LIMIT 1",
+                (cycle["cycle_id"],),
+            ).fetchone()
+            if publication_class == "control_only"
+            else connection.execute(
+                "SELECT * FROM cadence_actions WHERE cycle_id = ? "
+                "AND kind IN ('review_1','review_2') "
+                "AND state NOT IN ('completed','failed','execution_unknown',"
+                "'delivery_unknown') ORDER BY due_at ASC LIMIT 1",
+                (cycle["cycle_id"],),
+            ).fetchone()
+        )
+        if cutoff is None and publication_class == "reasoning_checkpoint":
+            cutoff = connection.execute(
+                "SELECT * FROM cadence_actions WHERE cycle_id = ? "
+                "AND kind = 'hard_stop' LIMIT 1",
+                (cycle["cycle_id"],),
+            ).fetchone()
+        try:
+            observed_boot = _current_boot_identity()
+            observed_wall = time.time()
+            observed_monotonic = time.monotonic()
+        except BaseException as exc:
+            raise HotJoinError(
+                "memory batch publication cannot establish its host clocks"
+            ) from exc
+        if cutoff is None or cutoff["due_monotonic"] is None:
+            raise HotJoinError("memory batch publication lacks a durable cutoff")
+        state_open = (
+            cycle["state"]
+            in {"active", "review_due", "review_running", "verification_required"}
+            if publication_class == "control_only"
+            else cycle["state"] == "active"
+        )
+        accepted = bool(
+            state_open
+            and isinstance(cycle["boot_identity"], str)
+            and cycle["boot_identity"] == observed_boot
+            and observed_wall < float(cutoff["due_at"])
+            and observed_monotonic < float(cutoff["due_monotonic"])
+            and (
+                publication_class == "control_only"
+                or (
+                    cycle["allowed_action"] != "independent_review_only"
+                    and cycle["allowed_action"]
+                    not in {
+                        "host_review_driver_only",
+                        "descendant_reap_only",
+                        "review_boundary_interrupt_only",
+                    }
+                )
+            )
+        )
+        if accepted:
+            accepted_counts = connection.execute(
+                "SELECT COUNT(*) AS total_count, "
+                "COALESCE(SUM(publication_class = 'reasoning_checkpoint'), 0) "
+                "AS reasoning_count FROM memory_batch_publications "
+                "WHERE run_id = ? AND problem_id = ? AND state = 'accepted'",
+                (run_id, problem_id),
+            ).fetchone()
+            total_accepted = int(accepted_counts["total_count"])
+            reasoning_accepted = int(accepted_counts["reasoning_count"])
+            if (
+                total_accepted >= MAX_ACCEPTED_MEMORY_BATCH_PUBLICATIONS
+                or (
+                    publication_class == "reasoning_checkpoint"
+                    and reasoning_accepted
+                    >= MAX_ACCEPTED_REASONING_MEMORY_BATCH_PUBLICATIONS
+                )
+            ):
+                accepted = False
+        state = "accepted" if accepted else "rejected"
+        receipt = _memory_batch_publication_receipt(
+            state=state,
+            run_id=run_id,
+            problem_id=problem_id,
+            batch_id=batch_id,
+            checkpoint_sha256=checkpoint_sha256,
+            commit_sha256=commit_sha256,
+            publication_class=str(publication_class),
+            cycle_id=str(cycle["cycle_id"]),
+            cutoff_action_id=str(cutoff["action_id"]),
+            cutoff_kind=str(cutoff["kind"]),
+            cutoff_at=float(cutoff["due_at"]),
+            cutoff_monotonic=float(cutoff["due_monotonic"]),
+            accepted_at=observed_wall if accepted else None,
+            accepted_at_monotonic=observed_monotonic if accepted else None,
+            boot_identity=observed_boot,
+        )
+        sequence, _, _ = ledger._append_event(
+            connection,
+            run_id=run_id,
+            kind=f"memory_batch_publication_{state}",
+            actor="reasoning_control",
+            payload={
+                "batch_id": batch_id,
+                "checkpoint_sha256": checkpoint_sha256,
+                "commit_sha256": commit_sha256,
+                "publication_class": publication_class,
+                "receipt_sha256": receipt["receipt_sha256"],
+            },
+        )
+        connection.execute(
+            "INSERT INTO memory_batch_publications("
+            "publication_id, run_id, problem_id, batch_id, checkpoint_sha256, "
+            "commit_sha256, publication_class, state, cycle_id, cutoff_action_id, "
+            "cutoff_kind, cutoff_at, cutoff_monotonic, accepted_at, "
+            "accepted_at_monotonic, boot_identity, receipt_json, receipt_sha256, "
+            "created_sequence) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, "
+            "?, ?, ?, ?, ?)",
+            (
+                publication_id,
+                run_id,
+                problem_id,
+                batch_id,
+                checkpoint_sha256,
+                commit_sha256,
+                publication_class,
+                state,
+                cycle["cycle_id"],
+                cutoff["action_id"],
+                cutoff["kind"],
+                float(cutoff["due_at"]),
+                float(cutoff["due_monotonic"]),
+                observed_wall if accepted else None,
+                observed_monotonic if accepted else None,
+                observed_boot,
+                _canonical_json(receipt),
+                receipt["receipt_sha256"],
+                sequence,
+            ),
+        )
+        connection.commit()
+    return receipt
+
+
+def _memory_batch_publication_status_control(
+    ledger: ConversationLedger, payload: Mapping[str, Any]
+) -> dict[str, Any]:
+    if set(payload) != {"operation", "problem_id"} or payload.get("operation") != (
+        "memory_batch_publication_status"
+    ):
+        raise ValueError("memory batch status payload has an unsupported shape")
+    problem_id = payload.get("problem_id")
+    if (
+        not _valid_memory_batch_problem_id(problem_id)
+    ):
+        raise ValueError("memory batch status problem id is invalid")
+    token = _review_control_token()
+    run_id = _run_id_for_review_control_token(ledger, token)
+    capability = _reasoning_or_owner_capability(
+        ledger,
+        run_id,
+        token,
+        operation="memory_batch_publication_status",
+    )
+    with ledger._connect() as connection:
+        connection.execute("BEGIN")
+        ledger._require_review_control_fence(
+            connection, run_id, capability["_control_fence"]
+        )
+        run = ledger._run_row(connection, run_id)
+        if run["problem_id"] != problem_id:
+            raise HotJoinError("memory batch status belongs to another problem")
+        rows = connection.execute(
+            "SELECT * FROM memory_batch_publications "
+            "WHERE run_id = ? AND problem_id = ? AND state = 'accepted' "
+            "ORDER BY batch_id LIMIT ?",
+            (run_id, problem_id, MAX_ACCEPTED_MEMORY_BATCH_PUBLICATIONS + 1),
+        ).fetchall()
+        connection.commit()
+    if len(rows) > MAX_ACCEPTED_MEMORY_BATCH_PUBLICATIONS:
+        raise HotJoinError("memory batch publication manifest exceeds 128 rows")
+    receipts = []
+    for row in rows:
+        receipt = _validate_memory_batch_publication_receipt(
+            _json_loads_strict(str(row["receipt_json"]))
+        )
+        if receipt["state"] != "accepted" or not (
+            _memory_batch_publication_receipt_matches_row(receipt, row)
+        ):
+            raise HotJoinError("accepted memory batch manifest contains rejection")
+        receipts.append(receipt)
+    return {
+        "schema_version": MEMORY_BATCH_PUBLICATION_STATUS_SCHEMA,
+        "run_id": run_id,
+        "problem_id": problem_id,
+        "receipts": receipts,
     }
 
 
@@ -31393,6 +32378,15 @@ def _handle_review_control_command(
     if command == "review-prepare":
         return _prepare_review_control(ledger, payload)
     if command == "review-status":
+        if (
+            _CONTROL_TOKEN_OVERRIDE is not None
+            and _CONTROL_TOKEN_OVERRIDE[0] == "owner"
+            and payload.get("operation") != "memory_batch_publication_status"
+        ):
+            raise HotJoinError(
+                "owner FD review-status is restricted to the read-only memory "
+                "batch publication manifest"
+            )
         if payload.get("operation") == "targeted_verification_prepare":
             return _targeted_verification_prepare_control(ledger, payload)
         if payload.get("operation") == "targeted_verification_commit":
@@ -31403,6 +32397,10 @@ def _handle_review_control_command(
             return _review_due_status_control(ledger, payload)
         if payload.get("operation") == "reasoning_phase_preflight":
             return _reasoning_phase_preflight_control(ledger, payload)
+        if payload.get("operation") == "memory_batch_publication_commit":
+            return _memory_batch_publication_control(ledger, payload)
+        if payload.get("operation") == "memory_batch_publication_status":
+            return _memory_batch_publication_status_control(ledger, payload)
         return _review_status_control(ledger, operation=operation, payload=payload)
     if command == "review-close":
         return _review_close_control(ledger, payload)
@@ -31765,6 +32763,7 @@ def _run_generator_command(args: argparse.Namespace) -> dict[str, Any]:
         mcp["env"]["RETHLAS_REVIEW_EXPECTED_MODEL"] = args.model
         mcp["env"]["RETHLAS_REVIEW_EXPECTED_REASONING_EFFORT"] = args.effort
         mcp["env"]["RETHLAS_REVIEW_POLICY_SHA256"] = REVIEW_CADENCE_POLICY_SHA256
+    mcp_servers = _derive_reasoning_mcp_server_map(mcp)
     cwd = args.cwd.resolve(strict=True)
     if not cwd.is_dir():
         raise ValueError("--cwd must resolve to a directory")
@@ -31776,19 +32775,9 @@ def _run_generator_command(args: argparse.Namespace) -> dict[str, Any]:
     ):
         raise ValueError("--advisor-control-plane-sha256 must be lowercase SHA-256 hex")
     adapter_commitment = _adapter_code_commitment()
-    commitment_env = dict(mcp["env"])
-    if policies_enabled:
-        # Commit the existence of a rotatable model-visible secret without ever
-        # placing the owner master in the reasoning MCP configuration.
-        commitment_env[REVIEW_CONTROL_TOKEN_ENV] = "0" * 64
-    mcp_env_commitment, rotatable_secret_env_keys = _mcp_env_commitment(commitment_env)
-    for runtime_path_key in (
-        REVIEW_ADAPTER_PATH_ENV,
-        REVIEW_DATABASE_ENV,
-        "RETHLAS_REVIEW_CONTRACT_CLI_PATH",
-    ):
-        if runtime_path_key in mcp_env_commitment:
-            mcp_env_commitment[runtime_path_key] = "<runtime-bound-path>"
+    committed_mcp_servers, rotatable_secret_env_keys = _mcp_server_map_commitment(
+        mcp_servers, policies_enabled=policies_enabled
+    )
     stable_review_helper_commitment = (
         {
             "role": "review_contract_cli",
@@ -31806,10 +32795,6 @@ def _run_generator_command(args: argparse.Namespace) -> dict[str, Any]:
         if review_driver_commitment is not None
         else None
     )
-    committed_mcp = dict(mcp)
-    committed_mcp["args"] = _mcp_args_commitment(mcp["args"], mcp["cwd"])
-    committed_mcp["env"] = mcp_env_commitment
-    committed_mcp["role"] = "reasoning_agent"
     fingerprint_material = {
         "app_server_schema_digest": capability.schema_digest,
         "advisor_control_plane_sha256": advisor_control_plane_sha256,
@@ -31817,7 +32802,7 @@ def _run_generator_command(args: argparse.Namespace) -> dict[str, Any]:
         "codex_version": capability.codex_version,
         "cwd": str(cwd),
         "effort": args.effort,
-        "mcp": committed_mcp,
+        "mcp_servers": committed_mcp_servers,
         "model": args.model,
         "sandbox": "workspace-write",
         "shell_policy": shell_policy,
@@ -31857,7 +32842,9 @@ def _run_generator_command(args: argparse.Namespace) -> dict[str, Any]:
             "effort": args.effort,
             "mcp_command": mcp["command"],
             "mcp_cwd": mcp["cwd"],
-            "mcp_role": "reasoning_agent",
+            "mcp_role": "exact_three_server_checkpoint_split",
+            "mcp_server_ids": list(REASONING_MCP_SERVER_IDS),
+            "mcp_servers": committed_mcp_servers,
             "model": args.model,
             "rotatable_secret_env_keys": rotatable_secret_env_keys,
             "sandbox": "workspace-write",
@@ -31918,7 +32905,7 @@ def _run_generator_command(args: argparse.Namespace) -> dict[str, Any]:
         "allowProviderModelFallback": False,
         "approvalPolicy": "never",
         "config": {
-            "mcp_servers": {"reasoning_agent": mcp},
+            "mcp_servers": mcp_servers,
             "model_reasoning_effort": args.effort,
             "shell_environment_policy": shell_policy,
             "web_search": args.web_mode,
@@ -31996,6 +32983,10 @@ _CONTROL_TOKEN_COMMAND_DOMAINS: dict[str, frozenset[str]] = {
     "cadence-admit": frozenset({"owner", "runner"}),
     "cadence-close": frozenset({"owner"}),
     "review-drive": frozenset({"owner"}),
+    # The owner wrapper uses this generic command only for the exact read-only
+    # memory_batch_publication_status payload.  The command handler above
+    # narrows this FD domain before dispatching any mutable review-status op.
+    "review-status": frozenset({"owner"}),
     "stale-recovery-capability-prepare": frozenset({"stale"}),
     "stale-turn-reconcile": frozenset({"owner", "stale"}),
 }
@@ -32019,6 +33010,10 @@ def _install_control_token_fd(args: argparse.Namespace) -> None:
             and args.command in _CONTROL_TOKEN_COMMAND_DOMAINS
             and _CONTROL_TOKEN_COMMAND_DOMAINS[args.command]
             & {"owner", "guardian", "runner"}
+            # review-status retains its existing scoped reasoning-token env
+            # lane.  Its new owner lane is accepted only when an owner FD is
+            # explicitly supplied and is narrowed by the handler above.
+            and args.command != "review-status"
         ):
             raise HotJoinError(
                 "released privileged control requires a one-shot control token FD"

@@ -69,9 +69,10 @@ authorization, or turn an ordinary stuck/cost-gated state into an advisor job.
 Only the owner-side durable broker may announce an `advisor_available` notice
 in the main conversation.
 
-Advisor use is an evidence-triggered, event-driven intervention. The root may write one bounded
-`rethlas_advisor_checkpoint_v1` recommendation to `events` and update
-`branch_states` to `waiting_owner_advisor_decision` only after either all
+Advisor use is an evidence-triggered, event-driven intervention. The root may
+include one bounded `rethlas_advisor_checkpoint_v1` recommendation in `events`
+and one `branch_states` transition to `waiting_owner_advisor_decision` in the
+same `memory_append_batch` only after either all
 current proof branches are terminally blocked/dead-ended, the root solver and
 its first adversarial critic have produced a shared concrete failure synthesis,
 or all remaining routes are evidence-backed near exhaustion. The latter additionally requires
@@ -85,8 +86,8 @@ suggested question synthesized from the current authoritative problem,
 verified results, failed routes, and bottleneck. Never reuse a static prompt or
 present heuristics as verified facts. It must say
 `owner_action_required=true`, `browser_dispatch_authorized=false`, and
-`advisor_request_id=null`. Include the returned advisor-event and branch-state
-record ids in one final
+`advisor_request_id=null`. Bind the batch receipt's two returned record ids to
+their input order and include the advisor-event and branch-state ids in one final
 `generation_yield(problem_id, state="waiting_owner_advisor_decision", reason=...,
 evidence_record_ids=[...])` call, then return locally without polling. Merely
 writing `branch_states` is not a yield and does not stop the runner. A cost gate,
@@ -424,9 +425,11 @@ action. Absolute review and hard-stop deadlines survive that move.
 ## Required Memory Policy
 
 Persist frontier-changing reasoning artifacts in `memory/{problem_id}/` using
-MCP tools (`memory_init`, `memory_append_batch`, `memory_append`,
-`memory_search`, `branch_update`). Transient scratch stays in the active
-reasoning context and is not a durable artifact.
+MCP tools (`memory_init`, `memory_append_batch`, `memory_search`). Transient
+scratch stays in the active reasoning context and is not a durable artifact.
+In a released run, `memory_append` and `branch_update` are unavailable: they
+write legacy JSONL outside the host publication registry and therefore fail
+closed. They remain offline/local compatibility tools only.
 
 Initialize memory only when the first protected phase is ready to flush. A
 `memory_append_batch` call initializes the channel files itself, so do not spend
@@ -451,10 +454,11 @@ Use append-only channels (except `meta.json`):
 Prefer one `memory_append_batch` call at a reasoning phase boundary. A batch may
 contain records for several channels and returns compact receipts without
 echoing record bodies. It is published as one immutable phase-checkpoint
-sidecar, so logical memory observes the whole batch or none of it. Use
-`memory_append` only for an urgent single durable state transition or when
-batching is unavailable. Never split one phase into many writes merely to
-mirror the order in which thoughts occurred.
+sidecar, so logical memory observes the whole batch or none of it. For an
+urgent single durable state transition in a released run, include it in
+the next bounded batch; never fall back to `memory_append` or `branch_update`.
+Never split one phase into many writes merely to mirror the order in which
+thoughts occurred.
 During the initial root-only attack, invoking another reasoning skill does not
 create a new phase boundary. Hold its compact result in working context and
 merge it into the single pre-critic checkpoint. This reduces repeated model
@@ -463,6 +467,262 @@ resumptions and context reprocessing while preserving the full frontier state.
 Use the exact shape `memory_append_batch(problem_id, items=[{"channel":
 "proof_steps", "record": {...}}])`; the array key is `items` and each payload
 key is `record` (not `records` or `content`).
+
+Checkpoint batches use the two dedicated short-timeout MCP servers; the long
+`reasoning_agent` server must never call `memory_append_batch`. Make the
+primary call and its possible recovery in **one** `functions.exec` JavaScript
+program so fallback occurs inside the still-running cell, without another model
+sampling turn. Use this exact program shape, substituting only `problem_id`
+and `items`:
+
+```javascript
+const checkpointArgs = Object.freeze({problem_id, items});
+const checkedReceipt = (receipt) => {
+  const exactObject = (value, keys) =>
+    value !== null &&
+    typeof value === "object" &&
+    !Array.isArray(value) &&
+    Object.keys(value).length === keys.length &&
+    keys.every((key) => Object.prototype.hasOwnProperty.call(value, key));
+  const sameJson = (left, right) => {
+    if (left === right) {
+      return typeof left !== "number" || Number.isFinite(left);
+    }
+    if (Array.isArray(left) || Array.isArray(right)) {
+      return (
+        Array.isArray(left) &&
+        Array.isArray(right) &&
+        left.length === right.length &&
+        left.every((value, index) => sameJson(value, right[index]))
+      );
+    }
+    if (
+      left === null ||
+      right === null ||
+      typeof left !== "object" ||
+      typeof right !== "object"
+    ) {
+      return false;
+    }
+    const leftKeys = Object.keys(left).sort();
+    const rightKeys = Object.keys(right).sort();
+    return (
+      leftKeys.length === rightKeys.length &&
+      leftKeys.every(
+        (key, index) =>
+          key === rightKeys[index] && sameJson(left[key], right[key])
+      )
+    );
+  };
+  const sha256 = (value) =>
+    typeof value === "string" && /^[0-9a-f]{64}$/.test(value);
+  const utc = (value) =>
+    typeof value === "string" &&
+    /^\d{4}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12]\d|3[01])T(?:[01]\d|2[0-3]):[0-5]\d:[0-5]\d(?:\.\d{1,6})?\+00:00$/.test(value) &&
+    Number.isFinite(Date.parse(value));
+  const finitePositive = (value) =>
+    typeof value === "number" && Number.isFinite(value) && value > 0;
+  const fail = () => {
+    throw new TypeError("invalid durable checkpoint receipt");
+  };
+
+  if (
+    receipt !== null &&
+    typeof receipt === "object" &&
+    !Array.isArray(receipt) &&
+    receipt.isError === true
+  ) {
+    throw receipt;
+  }
+  if (
+    !exactObject(receipt, ["content", "isError", "structuredContent"]) ||
+    receipt.isError !== false ||
+    !Array.isArray(receipt.content) ||
+    receipt.content.length !== 1 ||
+    !exactObject(receipt.content[0], ["type", "text"]) ||
+    receipt.content[0].type !== "text" ||
+    typeof receipt.content[0].text !== "string"
+  ) {
+    fail();
+  }
+
+  const body = receipt.structuredContent;
+  const localBodyKeys = [
+    "schema_version", "status", "problem_id", "batch_id",
+    "checkpoint_sha256", "timestamp_utc", "committed_at_utc",
+    "committed_at_monotonic", "commit_sha256", "count", "records",
+    "checkpoint_path"
+  ];
+  const hostBodyKeys = [...localBodyKeys, "publication_receipt"];
+  const publicationKeys = [
+    "schema_version", "state", "run_id", "problem_id", "batch_id",
+    "checkpoint_sha256", "commit_sha256", "publication_class", "cycle_id",
+    "cutoff_action_id", "cutoff_kind", "cutoff_at_utc",
+    "cutoff_monotonic", "accepted_at_utc", "accepted_at_monotonic",
+    "boot_identity", "receipt_sha256"
+  ];
+  const localCommit =
+    exactObject(body, localBodyKeys) &&
+    body.schema_version ===
+      "rethlas_memory_batch_local_commit_receipt_v1";
+  const hostPublication =
+    exactObject(body, hostBodyKeys) &&
+    body.schema_version === "rethlas_memory_batch_receipt_v3" &&
+    exactObject(body.publication_receipt, publicationKeys);
+  if (!localCommit && !hostPublication) {
+    fail();
+  }
+
+  if (
+    body.status !== "ok" ||
+    body.problem_id !== checkpointArgs.problem_id ||
+    typeof body.batch_id !== "string" ||
+    !/^batch_[0-9a-f]{64}$/.test(body.batch_id) ||
+    !sha256(body.checkpoint_sha256) ||
+    !utc(body.timestamp_utc) ||
+    !utc(body.committed_at_utc) ||
+    body.timestamp_utc > body.committed_at_utc ||
+    !finitePositive(body.committed_at_monotonic) ||
+    !sha256(body.commit_sha256) ||
+    !Number.isSafeInteger(body.count) ||
+    body.count !== checkpointArgs.items.length ||
+    !Array.isArray(body.records) ||
+    body.records.length !== body.count ||
+    typeof body.checkpoint_path !== "string" ||
+    !body.checkpoint_path.startsWith("/") ||
+    !body.checkpoint_path.endsWith(
+      `/.phase_checkpoints/${body.batch_id}.json`
+    )
+  ) {
+    fail();
+  }
+
+  const publication = hostPublication ? body.publication_receipt : null;
+  if (
+    hostPublication &&
+    (
+    publication.schema_version !==
+      "rethlas_memory_batch_publication_receipt_v1" ||
+    publication.state !== "accepted" ||
+    !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(publication.run_id) ||
+    publication.problem_id !== body.problem_id ||
+    publication.batch_id !== body.batch_id ||
+    publication.checkpoint_sha256 !== body.checkpoint_sha256 ||
+    publication.commit_sha256 !== body.commit_sha256 ||
+    publication.publication_class !== "reasoning_checkpoint" ||
+    !/^cycle_[0-9a-f]{32}$/.test(publication.cycle_id) ||
+    !/^cadact_[0-9a-f]{32}$/.test(publication.cutoff_action_id) ||
+    !["review_1", "review_2", "hard_stop"].includes(
+      publication.cutoff_kind
+    ) ||
+    !utc(publication.cutoff_at_utc) ||
+    !finitePositive(publication.cutoff_monotonic) ||
+    publication.accepted_at_utc !== body.committed_at_utc ||
+    publication.accepted_at_monotonic !== body.committed_at_monotonic ||
+    publication.accepted_at_utc >= publication.cutoff_at_utc ||
+    publication.accepted_at_monotonic >= publication.cutoff_monotonic ||
+    typeof publication.boot_identity !== "string" ||
+    !/^[ -~]{1,128}$/.test(publication.boot_identity) ||
+    !sha256(publication.receipt_sha256)
+    )
+  ) {
+    fail();
+  }
+
+  const recordKeys = ["record_id", "channel", "active", "supersedes"];
+  const seenRecordIds = new Set();
+  for (let index = 0; index < body.records.length; index += 1) {
+    const actual = body.records[index];
+    const expected = checkpointArgs.items[index];
+    const expectedActive = Object.prototype.hasOwnProperty.call(
+      expected, "active"
+    ) ? expected.active : true;
+    const expectedSupersedes = Object.prototype.hasOwnProperty.call(
+      expected, "supersedes"
+    ) ? expected.supersedes : [];
+    if (
+      !exactObject(actual, recordKeys) ||
+      typeof actual.record_id !== "string" ||
+      !/^mem_[0-9a-f]{64}$/.test(actual.record_id) ||
+      seenRecordIds.has(actual.record_id) ||
+      typeof actual.channel !== "string" ||
+      actual.channel !== expected.channel ||
+      typeof actual.active !== "boolean" ||
+      actual.active !== expectedActive ||
+      !Array.isArray(actual.supersedes) ||
+      !sameJson(actual.supersedes, expectedSupersedes)
+    ) {
+      fail();
+    }
+    seenRecordIds.add(actual.record_id);
+  }
+
+  let textBody;
+  try {
+    textBody = JSON.parse(receipt.content[0].text);
+  } catch (_failure) {
+    fail();
+  }
+  if (!sameJson(textBody, body)) {
+    fail();
+  }
+  return body;
+};
+let receipt;
+try {
+  receipt = checkedReceipt(
+    await tools.mcp__reasoning_checkpoint_primary__memory_append_batch(
+      checkpointArgs
+    )
+  );
+} catch (failure) {
+  const retryable =
+    failure === "tool call failed for `reasoning_checkpoint_primary/memory_append_batch`: timed out awaiting tools/call after 60s" ||
+    failure === "tool call failed for `reasoning_checkpoint_primary/memory_append_batch`: timed out awaiting tools/call after 60000ms";
+  if (!retryable) throw failure;
+  receipt = checkedReceipt(
+    await tools.mcp__reasoning_checkpoint_recovery__memory_append_batch(
+      checkpointArgs
+    )
+  );
+}
+text(JSON.stringify(receipt));
+```
+
+`checkedReceipt` accepts only the exact successful `CallToolResult` envelope.
+Its one text block must decode to the same JSON value as `structuredContent`.
+That value is either the exact 12-key
+`rethlas_memory_batch_local_commit_receipt_v1` returned after the trusted
+server durably re-reads an offline checkpoint and commit marker, or the exact
+released-run `rethlas_memory_batch_receipt_v3` containing an accepted
+reasoning-checkpoint publication receipt bound to the frozen request,
+immutable batch, commit, cutoff, and compact record metadata. A local commit
+receipt is checkpoint success for a legacy non-hot-join run only; it carries no
+host admission, review cutoff, cadence, or released-run authority. The trusted
+server fails closed instead of returning that local schema whenever any
+released-run environment sentinel is present without the complete host
+registry. `undefined`, strings, arrays, missing or extra fields, non-boolean
+`isError`, `status: "error"`, a null or malformed host publication, local/host
+cross-schema fields, rejected/control-only publications, mismatched text and
+structured content, or any malformed binding fail closed and are not
+checkpoint success.
+
+Those two complete, version-pinned primitive strings are the entire recovery
+allowlist. Compare with `===` only: never use a substring, regular expression,
+prefix/suffix, error-name, generic timeout, or transport match. Every
+`isError: true` result and every semantic, validation, authorization,
+idempotency, object, generic, or unclassified failure propagates without
+recovery. After the one recovery call, propagate its failure: never make a
+third call, poll the unknown primary, load-balance, or start a second semantic
+attempt. A successful primary result also forbids recovery. The single frozen
+`checkpointArgs` identity guarantees byte-identical `problem_id` and
+`items` arguments across the one permitted replay. Do not claim that a
+fallback or checkpoint succeeded unless its durable receipt was returned.
+If the outer `functions.exec` invocation yields `Script running with cell ID`,
+use `functions.wait` on that exact same cell until it returns a result, bounded
+to at most 120 seconds. This is continuation of the one outer cell, not an MCP
+poll or retry. Never issue a separate primary poll, new `functions.exec`, or
+new MCP tool call while that cell is pending.
 
 ## Phase-boundary routing
 
@@ -489,9 +749,10 @@ Then choose only the next necessary skill:
 completion wait is 600,000 ms with early wake, no-change waits back off to
 3,600,000 ms, and the exact resumption/token/no-progress gates live in its
 `SKILL.md`. Repeated 60-second polling is forbidden. When a cost gate fires,
-persist a matching recursive-round event and branch state, then call
-`generation_yield` with both returned record ids as the final tool action. Make
-no further collaboration call. It never
+persist a matching recursive-round event and branch state as two items in one
+`memory_append_batch`, bind their returned record ids by input order, then call
+`generation_yield` with both ids as the final tool action. Make no further
+collaboration call. It never
 authorizes an invented human turn or advisor request; only the repository owner decides
 whether and when to intervene.
 
@@ -529,9 +790,10 @@ The only successful terminal state is a blueprint that passes verification and
 is published as `blueprint_verified.md`. Two truthful non-success yield states
 are also legal: `waiting_cost_gate` and
 `waiting_owner_advisor_decision`. In either state, persist the exact reason,
-state that the theorem remains unsolved, call `generation_yield` with the exact
-active event and branch-state evidence ids, and return locally without polling
-or inventing progress. The runner accepts this bounded control record as an
+state that the theorem remains unsolved, batch the active event and branch-state
+transition together, call `generation_yield` with those exact batch-returned
+evidence ids, and return locally without polling or inventing progress. The
+runner accepts this bounded control record as an
 unfinished yield and will not start another paid turn until the owner explicitly
 invokes the runner again.
 
@@ -555,8 +817,8 @@ invokes the runner again.
    churn plans without new evidence.
 8. The final target `## statement` must reproduce the complete input statement.
 
-Relevant tools are `memory_init`, `memory_append_batch`, `memory_append`,
-`memory_search`, `branch_update`, `generation_yield`, `search_matlas_theorems`,
+Relevant released-run tools are `memory_init`, `memory_append_batch`,
+`memory_search`, `generation_yield`, `search_matlas_theorems`,
 `search_arxiv_theorems`,
 `advisor_report_get`, `review_frontier_status`, `route_review_prepare`,
 `route_review_wait`, `route_review_status`, `verify_review_claim`,

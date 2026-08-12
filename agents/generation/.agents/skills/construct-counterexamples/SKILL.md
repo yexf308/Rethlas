@@ -73,10 +73,8 @@ Do this whenever the constructed example is useful enough to test future claims 
 
 ## MCP Tools
 
-- `memory_append`
 - `memory_append_batch`
 - `memory_search`
-- `branch_update`
 - bounded external retrieval only through the named-gap policy
 - reuse stored counterexamples to test future conjectures/claims
 

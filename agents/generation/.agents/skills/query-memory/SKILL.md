@@ -69,10 +69,11 @@ merely re-reads already known state:
 ## MCP Tools
 
 - `memory_search`
-- `memory_append`
 - `memory_append_batch`
 
-`memory_append` returns a compact metadata receipt with a `record_id` by default. Use that id in a later append's `supersedes` list when replacing a stale fact. Request `return_mode="full"` only when the complete just-written record is genuinely needed in the immediate context.
+In released runs, include replacements in the next batch and use that batch's
+record ids in later `supersedes` lists. The legacy single-record append is
+offline/local only.
 
 ## Failure Logging
 

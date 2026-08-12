@@ -10,6 +10,7 @@ environment; mathematical content never appears in argv.
 from __future__ import annotations
 
 import hashlib
+import math
 import os
 import re
 import stat
@@ -60,11 +61,17 @@ ADAPTER_COMMAND_SCHEMA = "rethlas_review_adapter_command_v1"
 ADAPTER_RESPONSE_SCHEMA = "rethlas_review_adapter_response_v1"
 MAX_ADAPTER_REQUEST_BYTES = 229_376
 MAX_ADAPTER_RESPONSE_BYTES = 262_144
+MAX_ACCEPTED_MEMORY_BATCH_PUBLICATIONS = 128
+_MEMORY_BATCH_PROBLEM_COMPONENT_RE = re.compile(
+    r"^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9-])?$"
+)
+_MEMORY_BATCH_BOOT_IDENTITY_RE = re.compile(r"^[ -~]{1,128}$")
 MAX_ADAPTER_STDERR_BYTES = 4_096
 ADAPTER_ENV_PATH = "RETHLAS_REVIEW_ADAPTER_PATH"
 ADAPTER_ENV_SHA256 = "RETHLAS_REVIEW_ADAPTER_SHA256"
 ADAPTER_ENV_DB = "RETHLAS_REVIEW_DB"
 CONTROL_TOKEN_ENV = "RETHLAS_REVIEW_CONTROL_TOKEN"
+EXPECTED_RUN_ENV = "RETHLAS_EXPECTED_HOTJOIN_RUN_ID"
 CONTROL_TOKEN_RE = re.compile(r"^[0-9a-f]{64}$")
 
 REVIEW_STATES = frozenset(
@@ -86,6 +93,31 @@ REVIEW_STATES = frozenset(
 HANDOFF_STATES = frozenset({"prepared", "available", "consumed"})
 HANDOFF_PURPOSES = frozenset({"context_guard", "owner_yield", "cycle_close"})
 PUBLICATION_RECEIPT_SCHEMA = "rethlas_route_review_publication_receipt_v1"
+MEMORY_BATCH_PUBLICATION_RECEIPT_SCHEMA = (
+    "rethlas_memory_batch_publication_receipt_v1"
+)
+MEMORY_BATCH_PUBLICATION_STATUS_SCHEMA = (
+    "rethlas_memory_batch_publication_status_v1"
+)
+_MEMORY_BATCH_PUBLICATION_RECEIPT_KEYS = {
+    "schema_version",
+    "state",
+    "run_id",
+    "problem_id",
+    "batch_id",
+    "checkpoint_sha256",
+    "commit_sha256",
+    "publication_class",
+    "cycle_id",
+    "cutoff_action_id",
+    "cutoff_kind",
+    "cutoff_at_utc",
+    "cutoff_monotonic",
+    "accepted_at_utc",
+    "accepted_at_monotonic",
+    "boot_identity",
+    "receipt_sha256",
+}
 _PUBLICATION_RECEIPT_KEYS = {
     "schema_version",
     "problem_id",
@@ -747,6 +779,26 @@ def _canonical_adapter_utc(value: Any, *, label: str) -> str:
     return value
 
 
+def _valid_memory_batch_problem_id(value: object) -> bool:
+    if (
+        not isinstance(value, str)
+        or not value
+        or len(value.encode("utf-8")) > 128
+        or value != value.strip()
+        or "\\" in value
+    ):
+        return False
+    parts = value.split("/")
+    return bool(
+        parts
+        and all(
+            part not in {"", ".", ".."}
+            and _MEMORY_BATCH_PROBLEM_COMPONENT_RE.fullmatch(part) is not None
+            for part in parts
+        )
+    )
+
+
 def review_due_status(
     *,
     cycle_id: str,
@@ -881,7 +933,9 @@ def reasoning_phase_preflight(*, tool_name: str) -> dict[str, Any]:
             "allowed_action",
             "active_review_id",
             "review_due_at_utc",
+            "review_due_monotonic",
             "hard_stop_at_utc",
+            "hard_stop_monotonic",
             "tool_permitted",
         },
         label="reasoning phase preflight response",
@@ -907,14 +961,38 @@ def reasoning_phase_preflight(*, tool_name: str) -> dict[str, Any]:
     ):
         raise ReviewAdapterError("reasoning phase preflight review id is invalid")
     review_due = raw["review_due_at_utc"]
+    review_due_monotonic = raw["review_due_monotonic"]
     if review_due is not None:
         _canonical_adapter_utc(
             review_due, label="reasoning phase preflight review due time"
+        )
+        if (
+            isinstance(review_due_monotonic, bool)
+            or not isinstance(review_due_monotonic, (int, float))
+            or not math.isfinite(float(review_due_monotonic))
+            or float(review_due_monotonic) <= 0
+        ):
+            raise ReviewAdapterError(
+                "reasoning phase preflight review monotonic due time is invalid"
+            )
+    elif review_due_monotonic is not None:
+        raise ReviewAdapterError(
+            "reasoning phase preflight review monotonic due time lacks wall time"
         )
     _canonical_adapter_utc(
         raw["hard_stop_at_utc"],
         label="reasoning phase preflight hard-stop time",
     )
+    hard_stop_monotonic = raw["hard_stop_monotonic"]
+    if (
+        isinstance(hard_stop_monotonic, bool)
+        or not isinstance(hard_stop_monotonic, (int, float))
+        or not math.isfinite(float(hard_stop_monotonic))
+        or float(hard_stop_monotonic) <= 0
+    ):
+        raise ReviewAdapterError(
+            "reasoning phase preflight hard-stop monotonic time is invalid"
+        )
     if raw["allowed_action"] == "independent_review_only":
         expected = tool_name in _REVIEW_ONLY_TOOLS
         if raw["tool_permitted"] != expected:
@@ -922,6 +1000,239 @@ def reasoning_phase_preflight(*, tool_name: str) -> dict[str, Any]:
                 "host phase permission conflicts with the review-only allowlist"
             )
     return deepcopy(raw)
+
+
+def _validate_memory_batch_publication_receipt(value: object) -> dict[str, Any]:
+    raw = _exact_object(
+        value,
+        _MEMORY_BATCH_PUBLICATION_RECEIPT_KEYS,
+        label="memory batch publication receipt",
+    )
+    if (
+        raw["schema_version"] != MEMORY_BATCH_PUBLICATION_RECEIPT_SCHEMA
+        or raw["state"] not in {"accepted", "rejected"}
+        or not isinstance(raw["run_id"], str)
+        or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}", raw["run_id"])
+        is None
+        or not _valid_memory_batch_problem_id(raw["problem_id"])
+        or re.fullmatch(r"batch_[0-9a-f]{64}", str(raw["batch_id"])) is None
+        or SHA256_RE.fullmatch(str(raw["checkpoint_sha256"])) is None
+        or SHA256_RE.fullmatch(str(raw["commit_sha256"])) is None
+        or raw["publication_class"]
+        not in {"reasoning_checkpoint", "control_only"}
+        or re.fullmatch(r"cycle_[0-9a-f]{32}", str(raw["cycle_id"])) is None
+        or re.fullmatch(r"cadact_[0-9a-f]{32}", str(raw["cutoff_action_id"])) is None
+        or raw["cutoff_kind"] not in {"review_1", "review_2", "hard_stop"}
+        or not isinstance(raw["boot_identity"], str)
+        or _MEMORY_BATCH_BOOT_IDENTITY_RE.fullmatch(raw["boot_identity"]) is None
+    ):
+        raise ReviewAdapterError("memory batch publication receipt is invalid")
+    _canonical_adapter_utc(
+        raw["cutoff_at_utc"], label="memory batch publication cutoff"
+    )
+    if (
+        type(raw["cutoff_monotonic"]) is not float
+        or not math.isfinite(float(raw["cutoff_monotonic"]))
+        or float(raw["cutoff_monotonic"]) <= 0
+    ):
+        raise ReviewAdapterError(
+            "memory batch publication cutoff monotonic time is invalid"
+        )
+    accepted_at_utc = raw["accepted_at_utc"]
+    accepted_at_monotonic = raw["accepted_at_monotonic"]
+    if raw["state"] == "accepted":
+        accepted_text = _canonical_adapter_utc(
+            accepted_at_utc, label="memory batch publication acceptance"
+        )
+        if (
+            type(accepted_at_monotonic) is not float
+            or not math.isfinite(float(accepted_at_monotonic))
+            or float(accepted_at_monotonic) <= 0
+        ):
+            raise ReviewAdapterError(
+                "memory batch publication acceptance monotonic time is invalid"
+            )
+        if (
+            datetime.fromisoformat(accepted_text)
+            >= datetime.fromisoformat(raw["cutoff_at_utc"])
+            or float(accepted_at_monotonic) >= float(raw["cutoff_monotonic"])
+        ):
+            raise ReviewAdapterError(
+                "memory batch publication acceptance crossed its cutoff"
+            )
+    elif accepted_at_utc is not None or accepted_at_monotonic is not None:
+        raise ReviewAdapterError(
+            "rejected memory batch publication has an acceptance time"
+        )
+    seed = {key: item for key, item in raw.items() if key != "receipt_sha256"}
+    if (
+        not isinstance(raw["receipt_sha256"], str)
+        or SHA256_RE.fullmatch(raw["receipt_sha256"]) is None
+        or hashlib.sha256(canonical_json_bytes(seed)).hexdigest()
+        != raw["receipt_sha256"]
+    ):
+        raise ReviewAdapterError("memory batch publication receipt digest is invalid")
+    return deepcopy(raw)
+
+
+def memory_batch_publication_commit(
+    *,
+    problem_id: str,
+    batch_id: str,
+    checkpoint_sha256: str,
+    commit_sha256: str,
+    publication_class: str,
+) -> dict[str, Any]:
+    if not _valid_memory_batch_problem_id(problem_id):
+        raise ReviewAdapterError("memory batch publication problem id is invalid")
+    response = _invoke_adapter(
+        "review-status",
+        _command(
+            "review_status",
+            {
+                "operation": "memory_batch_publication_commit",
+                "problem_id": problem_id,
+                "batch_id": batch_id,
+                "checkpoint_sha256": checkpoint_sha256,
+                "commit_sha256": commit_sha256,
+                "publication_class": publication_class,
+            },
+        ),
+        timeout_seconds=30,
+    )
+    receipt = _validate_memory_batch_publication_receipt(response)
+    expected_run = os.environ.get(EXPECTED_RUN_ENV, "")
+    if not expected_run:
+        raise ReviewAdapterError("runner did not bind an expected hot-join run id")
+    expected = {
+        "run_id": expected_run,
+        "problem_id": problem_id,
+        "batch_id": batch_id,
+        "checkpoint_sha256": checkpoint_sha256,
+        "commit_sha256": commit_sha256,
+        "publication_class": publication_class,
+    }
+    if any(receipt[key] != value for key, value in expected.items()):
+        raise ReviewAdapterError(
+            "memory batch publication receipt does not bind its request"
+        )
+    return receipt
+
+
+def memory_batch_publication_status(*, problem_id: str) -> dict[str, Any]:
+    if not _valid_memory_batch_problem_id(problem_id):
+        raise ReviewAdapterError("memory batch publication problem id is invalid")
+    response = _invoke_adapter(
+        "review-status",
+        _command(
+            "review_status",
+            {
+                "operation": "memory_batch_publication_status",
+                "problem_id": problem_id,
+            },
+        ),
+        timeout_seconds=30,
+    )
+    expected_run = os.environ.get(EXPECTED_RUN_ENV, "")
+    if not expected_run:
+        raise ReviewAdapterError("runner did not bind an expected hot-join run id")
+    return _validate_memory_batch_publication_status(
+        response,
+        expected_run_id=expected_run,
+        expected_problem_id=problem_id,
+    )
+
+
+def _validate_memory_batch_publication_status(
+    value: object,
+    *,
+    expected_run_id: str,
+    expected_problem_id: str,
+) -> dict[str, Any]:
+    """Purely validate one already-decoded host publication manifest."""
+
+    raw = _exact_object(
+        value,
+        {"schema_version", "run_id", "problem_id", "receipts"},
+        label="memory batch publication status",
+    )
+    receipts = raw["receipts"]
+    if (
+        raw["schema_version"] != MEMORY_BATCH_PUBLICATION_STATUS_SCHEMA
+        or not isinstance(expected_run_id, str)
+        or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}", expected_run_id)
+        is None
+        or not _valid_memory_batch_problem_id(expected_problem_id)
+        or raw["run_id"] != expected_run_id
+        or not isinstance(raw["run_id"], str)
+        or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}", raw["run_id"])
+        is None
+        or raw["problem_id"] != expected_problem_id
+        or not isinstance(receipts, list)
+        or len(receipts) > MAX_ACCEPTED_MEMORY_BATCH_PUBLICATIONS
+    ):
+        raise ReviewAdapterError("memory batch publication status is invalid")
+    normalized = [_validate_memory_batch_publication_receipt(item) for item in receipts]
+    if any(
+        item["state"] != "accepted"
+        or item["run_id"] != raw["run_id"]
+        or item["problem_id"] != raw["problem_id"]
+        for item in normalized
+    ):
+        raise ReviewAdapterError(
+            "memory batch publication manifest has cross-bound receipts"
+        )
+    if [item["batch_id"] for item in normalized] != sorted(
+        item["batch_id"] for item in normalized
+    ) or len({item["batch_id"] for item in normalized}) != len(normalized):
+        raise ReviewAdapterError("memory batch publication manifest is not exact")
+    return {**deepcopy(raw), "receipts": normalized}
+
+
+def validate_memory_batch_publication_status_snapshot(
+    snapshot_json: str,
+    *,
+    expected_run_id: str,
+    expected_problem_id: str,
+) -> dict[str, Any]:
+    """Validate a canonical, bounded owner-authenticated read-only snapshot.
+
+    This helper is deliberately pure: it reads no environment, database,
+    adapter, or capability.  The owner wrapper authenticates the adapter call;
+    this function only validates the exact value transported to the dedicated
+    generation-control receipt CLI.
+    """
+
+    if type(snapshot_json) is not str:
+        raise ReviewAdapterError("memory batch publication snapshot is not text")
+    try:
+        encoded = snapshot_json.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise ReviewAdapterError(
+            "memory batch publication snapshot is not UTF-8"
+        ) from exc
+    if not encoded or len(encoded) > MAX_ADAPTER_RESPONSE_BYTES:
+        raise ReviewAdapterError(
+            "memory batch publication snapshot exceeds its byte bound"
+        )
+    try:
+        decoded = strict_json_loads(
+            encoded, label="memory batch publication snapshot"
+        )
+        canonical = canonical_json_bytes(decoded)
+    except ReviewContractError as exc:
+        raise ReviewAdapterError(
+            f"memory batch publication snapshot is invalid: {exc}"
+        ) from exc
+    if canonical != encoded:
+        raise ReviewAdapterError(
+            "memory batch publication snapshot is not canonical JSON"
+        )
+    return _validate_memory_batch_publication_status(
+        decoded,
+        expected_run_id=expected_run_id,
+        expected_problem_id=expected_problem_id,
+    )
 
 
 def route_review_targeted_verification_prepare(

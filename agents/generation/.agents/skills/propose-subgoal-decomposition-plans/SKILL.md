@@ -64,9 +64,7 @@ Do not append a second event that merely restates the same plan set.
 ## MCP Tools
 
 - `memory_search`
-- `memory_append`
 - `memory_append_batch`
-- `branch_update`
 - `search_matlas_theorems`
 
 ## Failure Logging

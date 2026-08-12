@@ -88,7 +88,6 @@ gap.
 - `verify_blueprint_service`
 - `memory_append_batch`
 - `memory_search` only for one bounded missing-state rehydration
-- `branch_update`
 - `$search-math-results` only for a verifier-identified named knowledge gap
 
 ## Failure Logging

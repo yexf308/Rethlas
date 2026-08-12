@@ -56,7 +56,6 @@ Rules:
 
 ## MCP Tools
 
-- `memory_append`
 - `memory_append_batch`
 - `memory_search`
 

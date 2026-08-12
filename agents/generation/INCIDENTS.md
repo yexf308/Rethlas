@@ -407,3 +407,84 @@ an incident.
   it does not claim to contain deliberately malicious code that escapes with
   `setsid`; such an escape remains outside the release threat model and must
   not be disguised as proof of exact process containment.
+
+## 2026-08-12: checkpoint MCP wait crossed the first review boundary
+
+- **Classification:** checkpoint transport/recovery and publication-boundary
+  defects exposed by the sixth fresh guardian soak; corrected by the
+  three-role MCP and host-registry change described below.
+- **Trigger:** run `guardian-soak-20260812-fresh-06` used a real model on the
+  Chowla cosine problem. At roughly T+10m the model called
+  `memory_append_batch` from the required single outer `functions.exec` cell.
+  The former single `reasoning_agent` server exposed that write tool with
+  `tool_timeout_sec=3600`. The outer call yielded a running cell ID and remained
+  pending through repeated observations until the T+30m boundary.
+- **Observed effect:** no checkpoint memory directory, durable batch, or tool
+  receipt appeared. At T+30m the guardian correctly interrupted the run,
+  failed closed, and proved all registered paid process groups empty. The
+  wrapper exited operationally hard-stopped and no official T+30m review was
+  published. Mathematical work from the turn is not treated as a checkpoint
+  or review result.
+- **Attribution limit:** the available rollout and filesystem evidence cannot
+  distinguish a stall in nested tool-call delivery, authenticated MCP
+  preflight or handler execution, or result transport back through the outer
+  cell. The old 3,600-second timeout explains why there was no bounded return
+  before T+30m; it does not identify the internal stall location.
+- **MCP role split:** one content-attested base definition now derives three
+  required MCP processes. `reasoning_agent` retains the long 3,600-second
+  budget needed by reasoning and verification tools but explicitly disables
+  `memory_append_batch`. `reasoning_checkpoint_primary` and
+  `reasoning_checkpoint_recovery` each expose only `memory_append_batch` and
+  each has a 60-second tool timeout. The independent recovery process is a
+  separate fault domain from the primary; it is not a general load-balancing
+  path.
+- **Recovery boundary:** recovery is currently selected by the model prompt's
+  exact classifier inside the same outer `functions.exec` program. It accepts
+  only either of the two version-pinned primitive timeout strings for the
+  primary's exact server/tool pair, compared with `===`, and makes at most one
+  recovery call with the same frozen arguments. Semantic errors, `isError`
+  results, objects, generic transport errors, and every unclassified failure
+  fail closed. This is not yet a host-side automatic circuit breaker, and a
+  second MCP call is never evidence of success without its durable receipt.
+- **Timeout semantics:** an MCP tool timeout bounds how long Codex awaits the
+  response; it does not guarantee cancellation of the server handler. The
+  primary may therefore commit durably and continue running after the caller
+  observes a timeout. The recovery call is an exact content-addressed replay
+  that must return the original receipt rather than publish a second logical
+  batch.
+- **Publication authority:** new batch writes first durably prepare a v3
+  content-addressed data file and a separately validated commit marker. Those
+  files are immutable candidates, not publication authority. In a released
+  run, the MCP must then register their exact hashes through the authenticated
+  adapter. That registration samples fresh wall and same-boot monotonic clocks
+  inside the same SQLite `BEGIN IMMEDIATE` writer fence used by cadence
+  transitions, and stores one immutable accepted-or-rejected receipt. If the
+  boundary transaction wins first, registration is rejected; if registration
+  wins first with both artifacts already durable and both clocks pre-due, the
+  later boundary observes the accepted row. A marker left by timeout, crash,
+  or post-due registration is invisible to trusted readers. Exact replay
+  returns the original row and receipt after response loss.
+- **Legacy boundary:** markerless v2 checkpoints and legacy JSONL remain
+  readable only in offline development where no released registry is
+  configured. A released run trusts only v3 artifacts whose hashes match its
+  accepted registry manifest; same-UID creation of a syntactically valid v2
+  file, a v3 marker without a row, or a JSONL record cannot enter the official
+  review projection. The legacy `memory_append` and `branch_update` tools fail
+  before any filesystem write in released runs instead of returning a success
+  receipt for evidence that official readers would ignore. Fresh soak runs do
+  not import legacy evidence implicitly.
+- **Regression evidence:** a zero-model integration test drives the installed
+  Codex app-server directly through `thread/start`, MCP status, and MCP tool
+  calls, and never invokes `turn/start`. With shortened test timeouts it proves
+  three distinct MCP process IDs, long-lane batch disablement, a primary
+  handler that continues after Codex times out, recovery with the exact same
+  frozen arguments in the separate process, one durable publication, and
+  successful completion of a long-lane probe. Focused persistence tests cover
+  dual-clock and second-auth denial, the SQLite publication/boundary ordering,
+  invisible rejected or crash-orphaned v3 candidates, exact response-loss
+  replay, released-run rejection of unregistered v2 files and JSONL writes,
+  and offline-only legacy v2/JSONL reads.
+- **OS threat boundary:** this incident and its regression evidence cover the
+  trusted ordinary runtime tree. They do not expand the macOS guardian threat
+  model and do not claim containment of deliberately malicious code that
+  escapes with `setsid`.

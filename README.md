@@ -204,9 +204,13 @@ This script uses the machine-readable `rethlas_reasoning_first_v1` contract:
   phase (30 minutes by default as a soft target)
 - transient scratch stays in the active reasoning context; durable conclusions,
   counterexamples, branch decisions, and failed routes are flushed with one
-  bounded, atomically visible `memory_append_batch` checkpoint at a phase
-  boundary; sequential root-only skills share one pre-critic checkpoint rather
-  than each forcing a model resumption
+  bounded `memory_append_batch` checkpoint at a phase boundary; in released
+  runs its immutable files become logically visible only after the host admits
+  their exact hashes through the cadence database's publication fence;
+  legacy JSONL single-record writes are offline-only and fail closed in a
+  released run rather than reporting success outside that registry;
+  sequential root-only skills share one pre-critic checkpoint rather than each
+  forcing a model resumption
 - retrieval is allowed only for a named external knowledge gap, with at most
   two targeted queries for that gap
 - the root remains the primary solver; the first recursive addition is one
@@ -272,12 +276,22 @@ The script also:
   instance only at a fail-closed wrapper boundary with no live lease,
   unresolved external-effect intent, or pending owner-yield close; its
   model/policy/runtime/helper/Codex content commitments cannot rotate
-- injects the trusted `reasoning_agent` MCP as one complete CLI object
+- derives an exact three-role MCP map from one complete, attested CLI object
   (`command`, `args`, `cwd`, `env`, `required=true`, `tool_timeout_sec`, and
   `default_tools_approval_mode="approve"`), rather than relying on workspace
-  MCP configuration merging; all tools on this narrowly scoped trusted server,
-  including the memory write tools, therefore run noninteractively even when
-  the outer Codex approval policy is `never`
+  MCP configuration merging. The long-lived `reasoning_agent` lane explicitly
+  disables `memory_append_batch`; two independent 60-second checkpoint lanes
+  expose only that content-addressed write. All three receive the same scoped
+  thread-epoch capability and run noninteractively even when the outer Codex
+  approval policy is `never`
+- treats checkpoint data and marker files as prepared immutable candidates,
+  not as proof of timely publication. The authenticated host records one exact
+  accepted-or-rejected publication receipt under the same SQLite writer fence
+  as T+30m/T+60m cadence transitions. Released memory and review projections
+  accept only v3 candidates whose hashes match that registry; unregistered v3
+  markers, runtime-created legacy v2 files, and legacy JSONL remain invisible;
+  the old `memory_append` and `branch_update` write paths are offline-only and
+  reject released calls before creating files
 - writes iteration logs to `agents/generation/logs/example/iter/`
 - writes memory artifacts to `agents/generation/memory/example/`
 - writes the draft proof to `agents/generation/results/example/blueprint.md`
@@ -334,11 +348,12 @@ not reset that streak. Effective red can switch routes only to the exact
 pre-due fallback commitment with its bound active evidence. Without that
 fallback, the active route freezes and no paid root continuation is admitted.
 
-Before each scheduled review boundary, the latest pre-due checkpoint for that
-review window must leave exactly one active `branch_states` commitment using
+Before each scheduled review boundary, the latest host-admitted checkpoint for
+that review window must leave exactly one active `branch_states` commitment using
 schema `rethlas_active_route_commitment_v1`, with identical stable `branch_id` and
 `route_id`, the load-bearing `core_bridge`, and a nonempty bounded list of
-concrete obligations. The first commitment is due before T+30m; after an
+concrete obligations. Its registry acceptance time, not a model-supplied file
+timestamp, must precede the boundary. The first commitment is due before T+30m; after an
 official review and fresh-epoch handoff, the continued or host-switched route
 must be committed again before the next review. At most one separately
 evidenced fallback may be precommitted. Before the boundary, at most two
@@ -646,11 +661,11 @@ python3 agents/hotjoin_adapter.py retry-unknown-turn \
 ```
 
 Each persistent run is also bound to the Codex version/schema, model and effort,
-sandbox, working directory, shell policy, complete reasoning-MCP object, and the
-hot-join control-plane version/code hash. Ephemeral trusted-runtime paths are
-committed by file content plus the runner's full runtime manifest; secret
-environment values may rotate, but their names and all non-secret values remain
-bound. Completed, failed, and interrupted turns are projected atomically with
+sandbox, working directory, shell policy, the complete three-role reasoning-MCP
+map, and the hot-join control-plane version/code hash. Ephemeral trusted-runtime
+paths are committed by file content plus the runner's full runtime manifest;
+secret environment values may rotate, but their names and all non-secret values
+remain bound. Completed, failed, and interrupted turns are projected atomically with
 their message states and error receipts. The adapter waits a bounded 250 ms after
 the terminal event for a delayed token update; receipts distinguish observed but
 not schema-attested-final usage, no usage after the full settle window, and

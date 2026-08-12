@@ -59,9 +59,7 @@ has been selected.
 ## MCP Tools
 
 - `memory_search`
-- `memory_append`
 - `memory_append_batch`
-- `branch_update`
 
 ## Failure Logging
 

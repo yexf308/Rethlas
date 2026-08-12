@@ -8,13 +8,14 @@ import os
 import re
 import stat
 import sys
+import time
 import uuid
 from collections import Counter
 from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 from functools import wraps
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Mapping, Optional
+from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional
 
 import requests
 
@@ -59,6 +60,8 @@ try:
         context_handoff_prepare as _adapter_context_handoff_prepare,
         context_handoff_status as _adapter_context_handoff_status,
         generation_yield_prepare as _adapter_generation_yield_prepare,
+        memory_batch_publication_commit as _adapter_memory_batch_publication_commit,
+        memory_batch_publication_status as _adapter_memory_batch_publication_status,
         reasoning_phase_preflight as _adapter_reasoning_phase_preflight,
         review_due_status as _adapter_review_due_status,
         route_review_close as _adapter_route_review_close,
@@ -68,6 +71,7 @@ try:
         route_review_targeted_verification_prepare as _adapter_targeted_verification_prepare,
         route_review_wait as _adapter_route_review_wait,
         route_cycle_close as _adapter_route_cycle_close,
+        validate_memory_batch_publication_status_snapshot as _validate_memory_batch_publication_status_snapshot,
     )
 except ImportError:  # pragma: no cover - direct module execution
     from review_client import (  # type: ignore[no-redef]
@@ -76,6 +80,8 @@ except ImportError:  # pragma: no cover - direct module execution
         context_handoff_prepare as _adapter_context_handoff_prepare,
         context_handoff_status as _adapter_context_handoff_status,
         generation_yield_prepare as _adapter_generation_yield_prepare,
+        memory_batch_publication_commit as _adapter_memory_batch_publication_commit,
+        memory_batch_publication_status as _adapter_memory_batch_publication_status,
         reasoning_phase_preflight as _adapter_reasoning_phase_preflight,
         review_due_status as _adapter_review_due_status,
         route_review_close as _adapter_route_review_close,
@@ -85,6 +91,7 @@ except ImportError:  # pragma: no cover - direct module execution
         route_review_targeted_verification_prepare as _adapter_targeted_verification_prepare,
         route_review_wait as _adapter_route_review_wait,
         route_cycle_close as _adapter_route_cycle_close,
+        validate_memory_batch_publication_status_snapshot as _validate_memory_batch_publication_status_snapshot,
     )
 
 try:
@@ -249,8 +256,18 @@ MAX_OMITTED_IDS = 100
 BM25_NEAR_TIE_DECIMALS = 6
 MAX_MEMORY_BATCH_RECORDS = 32
 MAX_MEMORY_BATCH_UTF8_BYTES = 131_072
-MEMORY_BATCH_SCHEMA = "rethlas_memory_batch_v2"
+LEGACY_MEMORY_BATCH_SCHEMA = "rethlas_memory_batch_v2"
+MEMORY_BATCH_SCHEMA = "rethlas_memory_batch_v3"
+MEMORY_BATCH_COMMIT_SCHEMA = "rethlas_memory_batch_commit_v1"
+MEMORY_BATCH_RECEIPT_SCHEMA = "rethlas_memory_batch_receipt_v3"
+MEMORY_BATCH_LOCAL_COMMIT_RECEIPT_SCHEMA = (
+    "rethlas_memory_batch_local_commit_receipt_v1"
+)
+MEMORY_BATCH_PUBLICATION_RECEIPT_SCHEMA = (
+    "rethlas_memory_batch_publication_receipt_v1"
+)
 MAX_MEMORY_BATCH_FILE_BYTES = 262_144
+MAX_MEMORY_BATCH_COMMIT_FILE_BYTES = 4_096
 GENERATION_CONTROL_SCHEMA = "rethlas_generation_control_v1"
 GENERATION_WAIT_STATES = frozenset(
     {"waiting_cost_gate", "waiting_owner_advisor_decision"}
@@ -267,6 +284,47 @@ _REVIEW_MODEL_ENV = "RETHLAS_REVIEW_EXPECTED_MODEL"
 _REVIEW_EFFORT_ENV = "RETHLAS_REVIEW_EXPECTED_REASONING_EFFORT"
 _REVIEW_POLICY_SHA_ENV = "RETHLAS_REVIEW_POLICY_SHA256"
 _REVIEW_RUN_ENV = "RETHLAS_EXPECTED_HOTJOIN_RUN_ID"
+_OWNER_MEMORY_BATCH_MANIFEST_SNAPSHOT_ENV = (
+    "RETHLAS_OWNER_MEMORY_BATCH_PUBLICATION_SNAPSHOT_JSON"
+)
+_RELEASED_MEMORY_REGISTRY_STATIC_ENV_NAMES = (
+    "RETHLAS_REVIEW_ADAPTER_PATH",
+    "RETHLAS_REVIEW_ADAPTER_SHA256",
+    "RETHLAS_REVIEW_DB",
+    _REVIEW_RUN_ENV,
+)
+_RELEASED_MEMORY_REGISTRY_ENV_NAMES = (
+    *_RELEASED_MEMORY_REGISTRY_STATIC_ENV_NAMES,
+    "RETHLAS_REVIEW_CONTROL_TOKEN",
+)
+# Presence of any of these keys means this process was intended to participate
+# in a host-controlled run.  Even an empty value must therefore fail closed
+# instead of silently selecting the offline/local receipt contract.  Keep
+# ordinary legacy bindings such as the generation/runtime digests out of this
+# set: the default non-hot-join runner supplies those too.
+_RELEASED_REASONING_ENV_SENTINELS = frozenset(
+    {
+        *_RELEASED_MEMORY_REGISTRY_ENV_NAMES,
+        _OWNER_MEMORY_BATCH_MANIFEST_SNAPSHOT_ENV,
+        "RETHLAS_ADVISOR_RECEIPTS_ROOT",
+        "RETHLAS_REVIEW_CADENCE_POLICY",
+        "RETHLAS_CONTEXT_GUARD_POLICY",
+        "RETHLAS_POLICY_CONTRACT_SHA256",
+        "RETHLAS_REVIEW_CONTRACT_CLI_PATH",
+        "RETHLAS_REVIEW_CONTRACT_CLI_SHA256",
+        "RETHLAS_REVIEW_EXPECTED_MODEL",
+        "RETHLAS_REVIEW_EXPECTED_REASONING_EFFORT",
+        "RETHLAS_REVIEW_POLICY_SHA256",
+        "RETHLAS_CONTEXT_HANDOFF_REQUIRED_ID",
+        "RETHLAS_CONTEXT_HANDOFF_REQUIRED_SHA256",
+        "RETHLAS_CONTEXT_THREAD_EPOCH",
+        "RETHLAS_CONTEXT_CYCLE_ID",
+        "RETHLAS_CONTEXT_RUN_ID",
+        "RETHLAS_GUARDIAN_CYCLE_TOKEN",
+        "RETHLAS_RUNNER_CYCLE_TOKEN",
+        "RETHLAS_STALE_RECOVERY_TOKEN",
+    }
+)
 _REVIEW_PROGRESS_KIND_FIELD = "review_progress_kind"
 _ACTIVE_ROUTE_COMMITMENT_SCHEMA = "rethlas_active_route_commitment_v1"
 _ROUTE_TRANSITION_STATE_SCHEMA = "rethlas_route_transition_state_v1"
@@ -396,6 +454,14 @@ def _channel_path(problem_id: str, channel: str) -> Path:
 
 def _batch_checkpoint_dir(problem_id: str) -> Path:
     return _problem_dir(problem_id) / ".phase_checkpoints"
+
+
+def _batch_commit_path(checkpoint_path: Path) -> Path:
+    if not checkpoint_path.name.endswith(".json"):
+        raise ValueError("memory batch checkpoint path is invalid")
+    return checkpoint_path.with_name(
+        f".{checkpoint_path.name.removesuffix('.json')}.commit"
+    )
 
 
 def _strict_json_loads(raw: str, *, label: str) -> Any:
@@ -1297,9 +1363,16 @@ def _publish_atomic_json_once(
     return published
 
 
-def _batch_id_for_items(problem_id: str, encoded_items: bytes) -> str:
+def _batch_id_for_items(
+    problem_id: str,
+    encoded_items: bytes,
+    *,
+    schema: str = MEMORY_BATCH_SCHEMA,
+) -> str:
+    if schema not in {LEGACY_MEMORY_BATCH_SCHEMA, MEMORY_BATCH_SCHEMA}:
+        raise ValueError("memory batch schema is unsupported")
     material = (
-        MEMORY_BATCH_SCHEMA.encode("utf-8")
+        schema.encode("utf-8")
         + b"\0"
         + problem_id.encode("utf-8")
         + b"\0"
@@ -1337,6 +1410,232 @@ def _memory_batch_checkpoint_sha256(payload: Dict[str, Any]) -> str:
         + "\n"
     ).encode("utf-8")
     return hashlib.sha256(canonical).hexdigest()
+
+
+def _memory_batch_commit_sha256(payload: Mapping[str, Any]) -> str:
+    unsigned = dict(payload)
+    unsigned.pop("commit_sha256", None)
+    canonical = (
+        json.dumps(
+            unsigned,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+        + "\n"
+    ).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()
+
+
+def _memory_batch_publication_cutoffs(
+    phase: Mapping[str, Any] | None,
+) -> tuple[float, float] | None:
+    if phase is None:
+        return None
+    wall_value = phase.get("review_due_at_utc")
+    monotonic_value = phase.get("review_due_monotonic")
+    if wall_value is None:
+        wall_value = phase.get("hard_stop_at_utc")
+        monotonic_value = phase.get("hard_stop_monotonic")
+    wall_text = _validate_canonical_utc_timestamp(
+        wall_value, label="memory checkpoint publication cutoff"
+    )
+    if (
+        isinstance(monotonic_value, bool)
+        or not isinstance(monotonic_value, (int, float))
+        or not math.isfinite(float(monotonic_value))
+        or float(monotonic_value) <= 0
+    ):
+        raise ValueError("memory checkpoint monotonic publication cutoff is invalid")
+    return datetime.fromisoformat(wall_text).timestamp(), float(monotonic_value)
+
+
+def _released_memory_registry_mode(
+    *, owner_manifest_snapshot_json: str | None = None
+) -> str | None:
+    """Classify the two disjoint released-registry authorization paths.
+
+    Ordinary reasoning tools require the scoped model capability.  The only
+    alternative is an explicitly threaded, owner-authenticated *read-only*
+    snapshot used by the generation-control receipt CLI.  Merely placing the
+    snapshot environment key in an MCP/app-server environment never grants
+    either mode.
+    """
+
+    snapshot_in_environment = _OWNER_MEMORY_BATCH_MANIFEST_SNAPSHOT_ENV in os.environ
+    if owner_manifest_snapshot_json is None:
+        if snapshot_in_environment:
+            raise ValueError(
+                "released reasoning registry is incomplete: owner memory "
+                "publication snapshot is restricted to the generation-control "
+                "receipt CLI"
+            )
+        if not any(name in os.environ for name in _RELEASED_REASONING_ENV_SENTINELS):
+            return None
+        missing = [
+            name
+            for name in _RELEASED_MEMORY_REGISTRY_ENV_NAMES
+            if not os.getenv(name)
+        ]
+        if missing:
+            raise ValueError(
+                "released reasoning registry is incomplete: " + ", ".join(missing)
+            )
+        return "reasoning_capability"
+
+    if snapshot_in_environment:
+        raise ValueError(
+            "owner memory publication snapshot was not consumed by its CLI boundary"
+        )
+    if "RETHLAS_REVIEW_CONTROL_TOKEN" in os.environ:
+        raise ValueError(
+            "owner memory publication snapshot forbids a raw review control token"
+        )
+    missing = [
+        name
+        for name in _RELEASED_MEMORY_REGISTRY_STATIC_ENV_NAMES
+        if not os.getenv(name)
+    ]
+    if missing:
+        raise ValueError(
+            "owner memory publication snapshot lacks static registry bindings: "
+            + ", ".join(missing)
+        )
+    adapter_path = os.environ["RETHLAS_REVIEW_ADAPTER_PATH"]
+    adapter_sha256 = os.environ["RETHLAS_REVIEW_ADAPTER_SHA256"]
+    database_path = os.environ["RETHLAS_REVIEW_DB"]
+    expected_run = os.environ[_REVIEW_RUN_ENV]
+    if (
+        not Path(adapter_path).is_absolute()
+        or re.fullmatch(r"[0-9a-f]{64}", adapter_sha256) is None
+        or not Path(database_path).is_absolute()
+        or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}", expected_run)
+        is None
+    ):
+        raise ValueError(
+            "owner memory publication snapshot has invalid static registry bindings"
+        )
+    return "owner_read_only_snapshot"
+
+
+def _released_memory_registry_configured(
+    *, owner_manifest_snapshot_json: str | None = None
+) -> bool:
+    return (
+        _released_memory_registry_mode(
+            owner_manifest_snapshot_json=owner_manifest_snapshot_json
+        )
+        is not None
+    )
+
+
+def _memory_batch_publication_class(*, trusted_control: bool) -> str:
+    return "control_only" if trusted_control else "reasoning_checkpoint"
+
+
+def _memory_batch_registry_manifest(
+    problem_id: str,
+    *,
+    owner_manifest_snapshot_json: str | None = None,
+) -> Dict[str, Dict[str, Any]]:
+    mode = _released_memory_registry_mode(
+        owner_manifest_snapshot_json=owner_manifest_snapshot_json
+    )
+    if mode is None:
+        return {}
+    expected_run = _required_review_env(_REVIEW_RUN_ENV, label="review run id")
+    if mode == "owner_read_only_snapshot":
+        if owner_manifest_snapshot_json is None:  # pragma: no cover - mode invariant
+            raise AssertionError("owner snapshot mode lost its explicit value")
+        status = _validate_memory_batch_publication_status_snapshot(
+            owner_manifest_snapshot_json,
+            expected_run_id=expected_run,
+            expected_problem_id=problem_id,
+        )
+    else:
+        status = _adapter_memory_batch_publication_status(problem_id=problem_id)
+    if status["run_id"] != expected_run or status["problem_id"] != problem_id:
+        raise ValueError("memory publication manifest belongs to another run or problem")
+    return {receipt["batch_id"]: receipt for receipt in status["receipts"]}
+
+
+def _bind_checkpoint_to_publication_receipt(
+    checkpoint: Mapping[str, Any],
+    commit: Mapping[str, Any],
+    receipt: Mapping[str, Any],
+    *,
+    problem_id: str,
+    expected_publication_class: str | None = None,
+) -> Dict[str, Any]:
+    expected_run = _required_review_env(_REVIEW_RUN_ENV, label="review run id")
+    if (
+        receipt.get("schema_version") != MEMORY_BATCH_PUBLICATION_RECEIPT_SCHEMA
+        or receipt.get("state") != "accepted"
+        or receipt.get("run_id") != expected_run
+        or checkpoint.get("schema") != MEMORY_BATCH_SCHEMA
+        or receipt.get("problem_id") != problem_id
+        or receipt.get("batch_id") != checkpoint.get("batch_id")
+        or receipt.get("checkpoint_sha256") != checkpoint.get("checkpoint_sha256")
+        or receipt.get("commit_sha256") != commit.get("commit_sha256")
+        or not isinstance(receipt.get("accepted_at_utc"), str)
+        or not isinstance(receipt.get("accepted_at_monotonic"), (int, float))
+        or isinstance(receipt.get("accepted_at_monotonic"), bool)
+        or receipt.get("publication_class")
+        not in {"reasoning_checkpoint", "control_only"}
+        or (
+            expected_publication_class is not None
+            and receipt.get("publication_class") != expected_publication_class
+        )
+    ):
+        raise ValueError("memory batch publication receipt does not bind its artifact")
+    return {
+        **checkpoint,
+        "committed_at_utc": receipt["accepted_at_utc"],
+        "committed_at_monotonic": float(receipt["accepted_at_monotonic"]),
+        "commit_sha256": commit["commit_sha256"],
+        "publication_receipt": deepcopy(dict(receipt)),
+        "legacy_unmarked": False,
+    }
+
+
+def _same_memory_batch_publication_cutoffs(
+    initial: tuple[float, float] | None,
+    refreshed: tuple[float, float] | None,
+) -> tuple[float, float] | None:
+    if initial is None:
+        if refreshed is not None:
+            raise ValueError(
+                "memory checkpoint publication acquired a late host cutoff"
+            )
+        return None
+    if refreshed is None:
+        raise ValueError("memory checkpoint publication lost its host cutoff")
+    if refreshed != initial:
+        raise ValueError("memory checkpoint publication cutoff changed during commit")
+    return initial
+
+
+def _require_memory_batch_publication_open(
+    cutoffs: tuple[float, float] | None,
+    *,
+    observed_wall: float | None = None,
+    observed_monotonic: float | None = None,
+) -> tuple[float, float]:
+    wall = time.time() if observed_wall is None else observed_wall
+    monotonic = time.monotonic() if observed_monotonic is None else observed_monotonic
+    for value, label in ((wall, "wall"), (monotonic, "monotonic")):
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(float(value))
+        ):
+            raise ValueError(f"memory checkpoint {label} clock is invalid")
+    if cutoffs is not None and (
+        float(wall) >= cutoffs[0] or float(monotonic) >= cutoffs[1]
+    ):
+        raise ValueError("memory checkpoint publication window is closed")
+    return float(wall), float(monotonic)
 
 
 def _batch_record_id(batch_id: str, index: int) -> str:
@@ -1409,7 +1708,7 @@ def _validate_memory_batch_payload(
     event = payload.get("event")
     checkpoint_sha256 = payload.get("checkpoint_sha256")
     if (
-        payload.get("schema") != MEMORY_BATCH_SCHEMA
+        payload.get("schema") not in {LEGACY_MEMORY_BATCH_SCHEMA, MEMORY_BATCH_SCHEMA}
         or not isinstance(batch_id, str)
         or path.name != f"{batch_id}.json"
         or not isinstance(checkpoint_sha256, str)
@@ -1513,7 +1812,9 @@ def _validate_memory_batch_payload(
             allow_nan=False,
         ).encode("utf-8")
         expected_batch_id = _batch_id_for_items(
-            sanitize_problem_id(problem_id), encoded_items
+            sanitize_problem_id(problem_id),
+            encoded_items,
+            schema=str(payload["schema"]),
         )
         expected_record_ids = [
             _batch_record_id(batch_id, index) for index in range(len(records))
@@ -1539,6 +1840,310 @@ def _validate_memory_batch_payload(
                 f"content-addressed memory batch checkpoint is not hash-bound: {path}"
             )
     return payload
+
+
+def _validate_memory_batch_commit_payload(
+    checkpoint: Mapping[str, Any], path: Path, encoded: bytes
+) -> Dict[str, Any]:
+    if not encoded or len(encoded) > MAX_MEMORY_BATCH_COMMIT_FILE_BYTES:
+        raise ValueError(f"memory batch commit marker has an invalid size: {path}")
+    try:
+        raw = encoded.decode("utf-8")
+    except UnicodeError as exc:
+        raise ValueError(
+            f"cannot read memory batch commit marker {path}: {exc}"
+        ) from exc
+    payload = _strict_json_loads(raw, label=f"memory batch commit marker {path}")
+    keys = {
+        "schema",
+        "batch_id",
+        "checkpoint_sha256",
+        "committed_at_utc",
+        "committed_at_monotonic",
+        "commit_sha256",
+    }
+    if not isinstance(payload, dict) or set(payload) != keys:
+        raise ValueError(f"memory batch commit marker has an invalid envelope: {path}")
+    committed_at_utc = _validate_canonical_utc_timestamp(
+        payload.get("committed_at_utc"), label="memory batch commit timestamp"
+    )
+    committed_at_monotonic = payload.get("committed_at_monotonic")
+    if (
+        payload.get("schema") != MEMORY_BATCH_COMMIT_SCHEMA
+        or payload.get("batch_id") != checkpoint.get("batch_id")
+        or payload.get("checkpoint_sha256") != checkpoint.get("checkpoint_sha256")
+        or not isinstance(committed_at_monotonic, (int, float))
+        or isinstance(committed_at_monotonic, bool)
+        or not math.isfinite(float(committed_at_monotonic))
+        or float(committed_at_monotonic) <= 0
+        or not isinstance(payload.get("commit_sha256"), str)
+        or re.fullmatch(r"[0-9a-f]{64}", payload["commit_sha256"]) is None
+        or payload["commit_sha256"] != _memory_batch_commit_sha256(payload)
+    ):
+        raise ValueError(f"memory batch commit marker has invalid bindings: {path}")
+    canonical = (
+        json.dumps(
+            payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+        + "\n"
+    ).encode("utf-8")
+    if canonical != encoded:
+        raise ValueError(f"memory batch commit marker is not canonical: {path}")
+    return {
+        **payload,
+        "committed_at_utc": committed_at_utc,
+        "committed_at_monotonic": float(committed_at_monotonic),
+    }
+
+
+def _read_memory_batch_commit(
+    checkpoint: Mapping[str, Any], checkpoint_path: Path, *, allow_missing: bool
+) -> Dict[str, Any] | None:
+    marker_path = _batch_commit_path(checkpoint_path)
+    try:
+        parent, name = _open_memory_parent(marker_path, create=False)
+    except FileNotFoundError:
+        if allow_missing:
+            return None
+        raise
+    try:
+        try:
+            descriptor = _open_existing_regular_allowed_nlinks(
+                parent,
+                name,
+                os.O_RDONLY,
+                label=f"memory batch commit marker {marker_path}",
+                allowed_nlinks=frozenset({1, 2}),
+            )
+        except FileNotFoundError:
+            if allow_missing:
+                return None
+            raise
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX)
+            try:
+                before = _verify_open_regular_allowed_nlinks(
+                    parent,
+                    name,
+                    descriptor,
+                    label=f"memory batch commit marker {marker_path}",
+                    allowed_nlinks=frozenset({1, 2}),
+                )
+            except FileNotFoundError:
+                if allow_missing:
+                    return None
+                raise
+            encoded = _read_open_memory_batch_bytes(descriptor, marker_path)
+            commit = _validate_memory_batch_commit_payload(
+                checkpoint, marker_path, encoded
+            )
+            after = _verify_open_regular_allowed_nlinks(
+                parent,
+                name,
+                descriptor,
+                label=f"memory batch commit marker {marker_path}",
+                allowed_nlinks=frozenset({1, 2}),
+            )
+            if before.st_nlink != after.st_nlink:
+                raise ValueError(
+                    f"memory batch commit marker changed while it was read: {marker_path}"
+                )
+            if after.st_nlink == 2:
+                _recover_checkpoint_orphan_at(
+                    parent, marker_path.parent, name, descriptor, None
+                )
+            _verify_open_regular_at(
+                parent,
+                name,
+                descriptor,
+                label=f"memory batch commit marker {marker_path}",
+            )
+            return commit
+        finally:
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+            finally:
+                os.close(descriptor)
+    finally:
+        os.close(parent)
+
+
+def _durably_revalidate_memory_batch_artifacts(
+    problem_id: str, checkpoint_path: Path
+) -> tuple[Dict[str, Any], Dict[str, Any]]:
+    """Re-read, flush, and re-bind both artifacts before any success receipt."""
+
+    checkpoint = _validate_memory_batch_checkpoint_data(problem_id, checkpoint_path)
+    commit = _read_memory_batch_commit(
+        checkpoint, checkpoint_path, allow_missing=False
+    )
+    if commit is None:  # pragma: no cover - allow_missing=False invariant
+        raise ValueError("memory batch commit marker disappeared")
+    parent = _open_memory_directory(checkpoint_path.parent, create=False)
+    try:
+        for path in (checkpoint_path, _batch_commit_path(checkpoint_path)):
+            descriptor = _open_existing_regular_allowed_nlinks(
+                parent,
+                path.name,
+                os.O_RDONLY,
+                label=f"memory batch publication artifact {path}",
+                allowed_nlinks=frozenset({1}),
+            )
+            try:
+                before = os.fstat(descriptor)
+                os.fsync(descriptor)
+                after = _verify_open_regular_at(
+                    parent,
+                    path.name,
+                    descriptor,
+                    label=f"memory batch publication artifact {path}",
+                )
+                if not _same_inode(before, after):
+                    raise ValueError(
+                        "memory batch publication artifact changed while flushed"
+                    )
+            finally:
+                os.close(descriptor)
+        _validate_directory_metadata(
+            os.fstat(parent),
+            label=f"memory checkpoint directory {checkpoint_path.parent}",
+            require_owner=True,
+        )
+        _fsync_directory_fd(parent, checkpoint_path.parent)
+    finally:
+        os.close(parent)
+    refreshed = _validate_memory_batch_checkpoint_data(problem_id, checkpoint_path)
+    refreshed_commit = _read_memory_batch_commit(
+        refreshed, checkpoint_path, allow_missing=False
+    )
+    if refreshed_commit is None:  # pragma: no cover - allow_missing=False invariant
+        raise ValueError("memory batch commit marker disappeared")
+    if (
+        refreshed["checkpoint_sha256"] != checkpoint["checkpoint_sha256"]
+        or refreshed_commit["commit_sha256"] != commit["commit_sha256"]
+    ):
+        raise ValueError("memory batch publication artifacts changed after flush")
+    return refreshed, refreshed_commit
+
+
+def _publish_memory_batch_commit_once(
+    checkpoint_path: Path,
+    checkpoint: Mapping[str, Any],
+    *,
+    initial_cutoffs: tuple[float, float] | None,
+    publication_preflight: Callable[[], Mapping[str, Any] | None] | None,
+) -> Dict[str, Any]:
+    marker_path = _batch_commit_path(checkpoint_path)
+    committed_at_wall, committed_at_monotonic = (
+        _require_memory_batch_publication_open(initial_cutoffs)
+    )
+    payload: Dict[str, Any] = {
+        "schema": MEMORY_BATCH_COMMIT_SCHEMA,
+        "batch_id": checkpoint["batch_id"],
+        "checkpoint_sha256": checkpoint["checkpoint_sha256"],
+        "committed_at_utc": datetime.fromtimestamp(
+            committed_at_wall, timezone.utc
+        ).isoformat(),
+        "committed_at_monotonic": committed_at_monotonic,
+    }
+    payload["commit_sha256"] = _memory_batch_commit_sha256(payload)
+    encoded = (
+        json.dumps(
+            payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+        + "\n"
+    ).encode("utf-8")
+    if len(encoded) > MAX_MEMORY_BATCH_COMMIT_FILE_BYTES:
+        raise ValueError("encoded memory batch commit marker exceeds its size limit")
+
+    parent, name = _open_memory_parent(marker_path, create=False)
+    temporary_name = f".{name}.{uuid.uuid4().hex}.tmp"
+    descriptor: int | None = None
+    temporary_locked = False
+    published = False
+    try:
+        descriptor = _open_new_regular_at(
+            parent,
+            temporary_name,
+            os.O_WRONLY,
+            label=f"memory batch commit temporary {marker_path.parent / temporary_name}",
+        )
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        temporary_locked = True
+        _write_all(descriptor, encoded)
+        os.fsync(descriptor)
+        _verify_open_regular_at(
+            parent,
+            temporary_name,
+            descriptor,
+            label=f"memory batch commit temporary {marker_path.parent / temporary_name}",
+        )
+        refreshed_cutoffs = (
+            _memory_batch_publication_cutoffs(publication_preflight())
+            if publication_preflight is not None
+            else None
+        )
+        cutoffs = _same_memory_batch_publication_cutoffs(
+            initial_cutoffs, refreshed_cutoffs
+        )
+        _require_memory_batch_publication_open(cutoffs)
+        try:
+            os.link(
+                temporary_name,
+                name,
+                src_dir_fd=parent,
+                dst_dir_fd=parent,
+                follow_symlinks=False,
+            )
+        except FileExistsError:
+            winner = _read_memory_batch_commit(
+                checkpoint, checkpoint_path, allow_missing=False
+            )
+            if winner is None:  # pragma: no cover - allow_missing=False invariant
+                raise ValueError("memory batch commit marker disappeared")
+            return winner
+        published = True
+        _verify_open_regular_at(
+            parent,
+            name,
+            descriptor,
+            label=f"memory batch commit marker {marker_path}",
+            expected_nlink=2,
+        )
+        _fsync_directory_fd(parent, marker_path.parent)
+    finally:
+        try:
+            if descriptor is not None:
+                _unlink_temporary_durable_at(
+                    parent,
+                    marker_path.parent,
+                    temporary_name,
+                    descriptor,
+                )
+        finally:
+            if descriptor is not None:
+                try:
+                    if temporary_locked:
+                        fcntl.flock(descriptor, fcntl.LOCK_UN)
+                finally:
+                    os.close(descriptor)
+            os.close(parent)
+    if not published:
+        raise AssertionError("memory batch commit marker was not published")
+    committed = _read_memory_batch_commit(
+        checkpoint, checkpoint_path, allow_missing=False
+    )
+    if committed is None:  # pragma: no cover - allow_missing=False invariant
+        raise ValueError("memory batch commit marker is not durable")
+    return committed
 
 
 def _validate_open_memory_batch_checkpoint_at(
@@ -1606,9 +2211,8 @@ def _validate_open_memory_batch_checkpoint_at(
     return payload
 
 
-def _validate_memory_batch_checkpoint(
-    problem_id: str,
-    path: Path,
+def _validate_memory_batch_checkpoint_data(
+    problem_id: str, path: Path
 ) -> Dict[str, Any]:
     parent, name = _open_memory_parent(path, create=False)
     try:
@@ -1637,17 +2241,91 @@ def _validate_memory_batch_checkpoint(
         os.close(parent)
 
 
-def _iter_memory_batch_checkpoints(problem_id: str) -> Iterable[Dict[str, Any]]:
+def _validate_memory_batch_checkpoint(
+    problem_id: str,
+    path: Path,
+    *,
+    registry_manifest: Mapping[str, Mapping[str, Any]] | None = None,
+) -> Dict[str, Any]:
+    checkpoint = _validate_memory_batch_checkpoint_data(problem_id, path)
+    commit = _read_memory_batch_commit(checkpoint, path, allow_missing=True)
+    released = (
+        registry_manifest is not None or _released_memory_registry_configured()
+    )
+    if commit is None:
+        if checkpoint["schema"] == LEGACY_MEMORY_BATCH_SCHEMA and not released:
+            return {
+                **checkpoint,
+                "committed_at_utc": checkpoint["timestamp_utc"],
+                "committed_at_monotonic": None,
+                "commit_sha256": None,
+                "legacy_unmarked": True,
+            }
+        raise ValueError("memory batch checkpoint is not logically committed")
+    if released:
+        manifest = (
+            _memory_batch_registry_manifest(problem_id)
+            if registry_manifest is None
+            else registry_manifest
+        )
+        receipt = manifest.get(str(checkpoint["batch_id"]))
+        if receipt is None:
+            raise ValueError("memory batch checkpoint lacks host registry admission")
+        return _bind_checkpoint_to_publication_receipt(
+            checkpoint, commit, receipt, problem_id=problem_id
+        )
+    return {
+        **checkpoint,
+        "committed_at_utc": commit["committed_at_utc"],
+        "committed_at_monotonic": commit["committed_at_monotonic"],
+        "commit_sha256": commit["commit_sha256"],
+        "publication_receipt": None,
+        "legacy_unmarked": False,
+    }
+
+
+def _iter_memory_batch_checkpoints(
+    problem_id: str,
+    *,
+    owner_manifest_snapshot_json: str | None = None,
+) -> Iterable[Dict[str, Any]]:
     checkpoint_dir = _batch_checkpoint_dir(problem_id)
+    released = _released_memory_registry_configured(
+        owner_manifest_snapshot_json=owner_manifest_snapshot_json
+    )
+    registry_manifest = (
+        _memory_batch_registry_manifest(
+            problem_id,
+            owner_manifest_snapshot_json=owner_manifest_snapshot_json,
+        )
+        if released
+        else {}
+    )
     try:
         descriptor = _open_memory_directory(checkpoint_dir, create=False)
     except FileNotFoundError:
+        if registry_manifest:
+            raise ValueError(
+                "accepted memory batch manifest has no checkpoint directory"
+            )
         return
     try:
         names = sorted(
             name
             for name in os.listdir(descriptor)
-            if name.startswith("batch_") and name.endswith(".json")
+            if (
+                (
+                    released
+                    and re.fullmatch(r"batch_[0-9a-f]{64}\.json", name) is not None
+                    and name.removesuffix(".json") in registry_manifest
+                )
+                or (
+                    not released
+                    and name.startswith("batch_")
+                    and name.endswith(".json")
+                    and not name.endswith(".commit.json")
+                )
+            )
         )
         _validate_directory_metadata(
             os.fstat(descriptor),
@@ -1656,9 +2334,51 @@ def _iter_memory_batch_checkpoints(problem_id: str) -> Iterable[Dict[str, Any]]:
         )
     finally:
         os.close(descriptor)
+    consumed_registry_batches: set[str] = set()
     for name in names:
         path = checkpoint_dir / name
-        yield _validate_memory_batch_checkpoint(problem_id, path)
+        checkpoint = _validate_memory_batch_checkpoint_data(problem_id, path)
+        commit = _read_memory_batch_commit(checkpoint, path, allow_missing=True)
+        if commit is None:
+            if released and str(checkpoint["batch_id"]) in registry_manifest:
+                raise ValueError(
+                    "accepted memory batch checkpoint lacks its commit marker"
+                )
+            if checkpoint["schema"] == LEGACY_MEMORY_BATCH_SCHEMA and not released:
+                yield {
+                    **checkpoint,
+                    "committed_at_utc": checkpoint["timestamp_utc"],
+                    "committed_at_monotonic": None,
+                    "commit_sha256": None,
+                    "legacy_unmarked": True,
+                }
+            # A v2 file in a released run, or a v3 crash/rejection between data and
+            # marker publication leaves an inert orphan. Exact retry may
+            # commit it.
+            continue
+        if released:
+            receipt = registry_manifest.get(str(checkpoint["batch_id"]))
+            if receipt is None:
+                continue
+            bound = _bind_checkpoint_to_publication_receipt(
+                checkpoint, commit, receipt, problem_id=problem_id
+            )
+            consumed_registry_batches.add(str(checkpoint["batch_id"]))
+            yield bound
+            continue
+        yield {
+            **checkpoint,
+            "committed_at_utc": commit["committed_at_utc"],
+            "committed_at_monotonic": commit["committed_at_monotonic"],
+            "commit_sha256": commit["commit_sha256"],
+            "publication_receipt": None,
+            "legacy_unmarked": False,
+        }
+    leftovers = set(registry_manifest) - consumed_registry_batches
+    if leftovers:
+        raise ValueError(
+            "accepted memory batch manifest contains missing checkpoint artifacts"
+        )
 
 
 def _new_record_id(prefix: str = "mem") -> str:
@@ -1715,12 +2435,29 @@ def _legacy_record_id(channel: str, ordinal: int, item: Dict[str, Any]) -> str:
     return f"legacy_{hashlib.sha256(material).hexdigest()[:24]}"
 
 
-def _load_memory_entries(problem_id: str) -> Dict[str, List[Dict[str, Any]]]:
+def _load_memory_entries(
+    problem_id: str,
+    *,
+    owner_manifest_snapshot_json: str | None = None,
+) -> Dict[str, List[Dict[str, Any]]]:
+    released = _released_memory_registry_configured(
+        owner_manifest_snapshot_json=owner_manifest_snapshot_json
+    )
     raw_items_by_channel: Dict[str, List[Dict[str, Any]]] = {
-        channel: list(_iter_jsonl(_channel_path(problem_id, channel)))
+        # Legacy JSONL files have no host-registry admission.  They remain the
+        # offline/local compatibility store, but are never evidence in either
+        # released reasoning mode or the owner-authenticated snapshot view.
+        channel: (
+            []
+            if released
+            else list(_iter_jsonl(_channel_path(problem_id, channel)))
+        )
         for channel in CHANNEL_FILES
     }
-    for checkpoint in _iter_memory_batch_checkpoints(problem_id):
+    for checkpoint in _iter_memory_batch_checkpoints(
+        problem_id,
+        owner_manifest_snapshot_json=owner_manifest_snapshot_json,
+    ):
         for item in checkpoint["records"]:
             raw_items_by_channel[item["channel"]].append(item)
         raw_items_by_channel["events"].append(checkpoint["event"])
@@ -2342,12 +3079,18 @@ def memory_append(
     supersedes: Optional[List[str]] = None,
     return_mode: str = "metadata",
 ) -> Dict[str, Any]:
-    """Append one fact and return a compact receipt unless full mode is requested.
+    """Append one offline/local fact and return a compact legacy receipt.
 
     ``supersedes`` is append-only metadata: referenced records are treated as
     inactive by searches, while legacy records without lifecycle metadata remain
-    active by default.
+    active by default. Released runs must use ``memory_append_batch`` so the host
+    publication registry can make the write authoritative.
     """
+    if _released_memory_registry_configured():
+        raise ValueError(
+            "memory_append is offline-only; released runs require "
+            "memory_append_batch"
+        )
     if channel in _CONTROL_ONLY_MEMORY_CHANNELS or _is_route_transition_projection(
         channel, record
     ):
@@ -2407,16 +3150,20 @@ def memory_append_batch(
     items: List[Dict[str, Any]],
     *,
     _trusted_control_publication: bool = False,
+    _trusted_publication_preflight: (
+        Callable[[], Mapping[str, Any] | None] | None
+    ) = None,
 ) -> Dict[str, Any]:
     """Append a bounded write-behind checkpoint in one MCP round trip.
 
     Every item is validated and JSON-encoded before the first file write. The
-    complete logical channel update and its event are then published as one
-    immutable, content-addressed sidecar with an atomic no-clobber link, so a
-    reader observes either none or all of the checkpoint. An exact retry returns
-    the original receipt, including after a post-publication durability error.
-    The response intentionally omits record bodies so a checkpoint is not
-    echoed back into the model context.
+    complete logical channel update and its event are stored in one immutable,
+    content-addressed sidecar. New-format data becomes logically visible only
+    through a separately fsynced commit witness whose final no-clobber link is
+    preceded by a second authenticated host preflight and dual-clock check. An
+    exact retry returns the original receipt, including after a response loss.
+    The response intentionally omits record bodies so a checkpoint is not echoed
+    back into the model context.
     """
 
     if not isinstance(items, list) or not items:
@@ -2478,6 +3225,77 @@ def memory_append_batch(
 
     sanitized_problem_id = sanitize_problem_id(problem_id)
     batch_id = _batch_id_for_items(sanitized_problem_id, encoded)
+    checkpoint_path = _batch_checkpoint_dir(sanitized_problem_id) / f"{batch_id}.json"
+    released_registry = _released_memory_registry_configured()
+    publication_class = _memory_batch_publication_class(
+        trusted_control=_trusted_control_publication
+    )
+    try:
+        existing_checkpoint = _validate_memory_batch_checkpoint_data(
+            sanitized_problem_id, checkpoint_path
+        )
+    except FileNotFoundError:
+        existing_checkpoint = None
+    if existing_checkpoint is not None:
+        if _checkpoint_normalized_items(existing_checkpoint) != normalized_items:
+            raise ValueError(
+                "content-addressed memory batch checkpoint collides with different items"
+            )
+        existing_commit = _read_memory_batch_commit(
+            existing_checkpoint, checkpoint_path, allow_missing=True
+        )
+        if existing_commit is not None:
+            existing_checkpoint, existing_commit = (
+                _durably_revalidate_memory_batch_artifacts(
+                    sanitized_problem_id, checkpoint_path
+                )
+            )
+            if released_registry:
+                receipt = _adapter_memory_batch_publication_commit(
+                    problem_id=sanitized_problem_id,
+                    batch_id=batch_id,
+                    checkpoint_sha256=existing_checkpoint["checkpoint_sha256"],
+                    commit_sha256=existing_commit["commit_sha256"],
+                    publication_class=publication_class,
+                )
+                if receipt["state"] != "accepted":
+                    raise ValueError("memory checkpoint publication was rejected")
+                # An accepted database row is not success unless both immutable
+                # artifacts still re-read with the exact registered hashes.
+                refreshed = _validate_memory_batch_checkpoint_data(
+                    sanitized_problem_id, checkpoint_path
+                )
+                refreshed_commit = _read_memory_batch_commit(
+                    refreshed, checkpoint_path, allow_missing=False
+                )
+                if refreshed_commit is None:  # pragma: no cover - invariant
+                    raise ValueError("memory batch commit marker disappeared")
+                committed = _bind_checkpoint_to_publication_receipt(
+                    refreshed,
+                    refreshed_commit,
+                    receipt,
+                    problem_id=sanitized_problem_id,
+                    expected_publication_class=publication_class,
+                )
+            else:
+                committed = {
+                    **existing_checkpoint,
+                    "committed_at_utc": existing_commit["committed_at_utc"],
+                    "committed_at_monotonic": existing_commit[
+                        "committed_at_monotonic"
+                    ],
+                    "commit_sha256": existing_commit["commit_sha256"],
+                    "publication_receipt": None,
+                }
+            return _memory_batch_receipt(
+                sanitized_problem_id, checkpoint_path, committed
+            )
+    initial_cutoffs = (
+        _memory_batch_publication_cutoffs(_trusted_publication_preflight())
+        if _trusted_publication_preflight is not None
+        else None
+    )
+    _require_memory_batch_publication_open(initial_cutoffs)
     timestamp = _utc_now()
     entries: List[Dict[str, Any]] = []
     for index, item in enumerate(normalized_items):
@@ -2505,7 +3323,6 @@ def memory_append_batch(
             for entry in entries
         ],
     }
-    checkpoint_path = _batch_checkpoint_dir(sanitized_problem_id) / f"{batch_id}.json"
     candidate = {
         "schema": MEMORY_BATCH_SCHEMA,
         "batch_id": batch_id,
@@ -2520,11 +3337,73 @@ def memory_append_batch(
         problem_id=sanitized_problem_id,
         expected_normalized_items=normalized_items,
     )
-    committed = _validate_memory_batch_checkpoint(sanitized_problem_id, checkpoint_path)
-    if _checkpoint_normalized_items(committed) != normalized_items:
+    checkpoint = _validate_memory_batch_checkpoint_data(
+        sanitized_problem_id, checkpoint_path
+    )
+    if _checkpoint_normalized_items(checkpoint) != normalized_items:
         raise ValueError(
             "content-addressed memory batch checkpoint collides with different items"
         )
+    existing_commit = _read_memory_batch_commit(
+        checkpoint, checkpoint_path, allow_missing=True
+    )
+    if existing_commit is None:
+        _publish_memory_batch_commit_once(
+            checkpoint_path,
+            checkpoint,
+            initial_cutoffs=initial_cutoffs,
+            publication_preflight=_trusted_publication_preflight,
+        )
+    checkpoint = _validate_memory_batch_checkpoint_data(
+        sanitized_problem_id, checkpoint_path
+    )
+    commit = _read_memory_batch_commit(checkpoint, checkpoint_path, allow_missing=False)
+    if commit is None:  # pragma: no cover - allow_missing=False invariant
+        raise ValueError("memory batch commit marker disappeared")
+    checkpoint, commit = _durably_revalidate_memory_batch_artifacts(
+        sanitized_problem_id, checkpoint_path
+    )
+    if released_registry:
+        publication_receipt = _adapter_memory_batch_publication_commit(
+            problem_id=sanitized_problem_id,
+            batch_id=batch_id,
+            checkpoint_sha256=checkpoint["checkpoint_sha256"],
+            commit_sha256=commit["commit_sha256"],
+            publication_class=publication_class,
+        )
+        if publication_receipt["state"] != "accepted":
+            raise ValueError("memory checkpoint publication was rejected")
+        checkpoint = _validate_memory_batch_checkpoint_data(
+            sanitized_problem_id, checkpoint_path
+        )
+        commit = _read_memory_batch_commit(
+            checkpoint, checkpoint_path, allow_missing=False
+        )
+        if commit is None:  # pragma: no cover - allow_missing=False invariant
+            raise ValueError("memory batch commit marker disappeared")
+        committed = _bind_checkpoint_to_publication_receipt(
+            checkpoint,
+            commit,
+            publication_receipt,
+            problem_id=sanitized_problem_id,
+            expected_publication_class=publication_class,
+        )
+    else:
+        committed = {
+            **checkpoint,
+            "committed_at_utc": commit["committed_at_utc"],
+            "committed_at_monotonic": commit["committed_at_monotonic"],
+            "commit_sha256": commit["commit_sha256"],
+            "publication_receipt": None,
+        }
+    return _memory_batch_receipt(sanitized_problem_id, checkpoint_path, committed)
+
+
+def _memory_batch_receipt(
+    problem_id: str,
+    checkpoint_path: Path,
+    committed: Mapping[str, Any],
+) -> Dict[str, Any]:
     receipts = [
         {
             "record_id": entry["record_id"],
@@ -2534,14 +3413,29 @@ def memory_append_batch(
         }
         for entry in committed["records"]
     ]
-    return {
+    common = {
         "status": "ok",
-        "problem_id": sanitized_problem_id,
-        "batch_id": batch_id,
+        "problem_id": problem_id,
+        "batch_id": committed["batch_id"],
         "timestamp_utc": committed["timestamp_utc"],
+        "committed_at_utc": committed["committed_at_utc"],
+        "committed_at_monotonic": committed["committed_at_monotonic"],
+        "commit_sha256": committed["commit_sha256"],
+        "checkpoint_sha256": committed["checkpoint_sha256"],
         "count": len(receipts),
         "records": receipts,
         "checkpoint_path": str(checkpoint_path),
+    }
+    publication_receipt = committed.get("publication_receipt")
+    if publication_receipt is None:
+        return {
+            "schema_version": MEMORY_BATCH_LOCAL_COMMIT_RECEIPT_SCHEMA,
+            **common,
+        }
+    return {
+        "schema_version": MEMORY_BATCH_RECEIPT_SCHEMA,
+        **common,
+        "publication_receipt": deepcopy(publication_receipt),
     }
 
 
@@ -2800,21 +3694,17 @@ def _trusted_checkpoint_records(
     all_records: Dict[str, Dict[str, Any]] = {}
     superseded: set[str] = set()
     for checkpoint in _iter_memory_batch_checkpoints(problem_id):
+        committed_at_utc = _validate_canonical_utc_timestamp(
+            checkpoint["committed_at_utc"],
+            label="checkpoint logical commit timestamp",
+        )
         for raw in checkpoint["records"]:
-            if (
-                cutoff is not None
-                and datetime.fromisoformat(
-                    _validate_canonical_utc_timestamp(
-                        raw["timestamp_utc"], label="checkpoint record timestamp"
-                    )
-                )
-                > cutoff
-            ):
+            if cutoff is not None and datetime.fromisoformat(committed_at_utc) > cutoff:
                 continue
             record_id = str(raw["record_id"])
             normalized = {
                 "record_id": record_id,
-                "timestamp_utc": raw["timestamp_utc"],
+                "timestamp_utc": committed_at_utc,
                 "channel": raw["channel"],
                 "active": raw["active"],
                 "supersedes": list(raw["supersedes"]),
@@ -3533,7 +4423,7 @@ def _append_review_memory(
         "snapshot_sha256": normalized_body["snapshot_sha256"],
         "batch_id": receipt["batch_id"],
         "record_id": record["record_id"],
-        "timestamp_utc": checkpoint["timestamp_utc"],
+        "timestamp_utc": checkpoint["committed_at_utc"],
         "checkpoint_sha256": checkpoint["checkpoint_sha256"],
         "record_sha256": hashlib.sha256(
             canonical_json_bytes(normalized_body)
@@ -3643,7 +4533,7 @@ def _append_targeted_result_memory(
         "verifier_receipt_sha256": result_sha,
         "batch_id": receipt["batch_id"],
         "record_id": record["record_id"],
-        "timestamp_utc": checkpoint["timestamp_utc"],
+        "timestamp_utc": checkpoint["committed_at_utc"],
         "checkpoint_sha256": checkpoint["checkpoint_sha256"],
         "record_sha256": hashlib.sha256(canonical_json_bytes(body)).hexdigest(),
         "publication_state": "pending",
@@ -3691,7 +4581,7 @@ def _targeted_publication_receipt_for_existing(
         "verifier_receipt_sha256": body["result_sha256"],
         "batch_id": record["batch_id"],
         "record_id": record["record_id"],
-        "timestamp_utc": record["timestamp_utc"],
+        "timestamp_utc": checkpoint["committed_at_utc"],
         "checkpoint_sha256": checkpoint["checkpoint_sha256"],
         "record_sha256": hashlib.sha256(canonical_json_bytes(body)).hexdigest(),
         "publication_state": "pending",
@@ -3836,7 +4726,7 @@ def _publication_receipt_for_existing(
         "snapshot_sha256": body["snapshot_sha256"],
         "batch_id": record["batch_id"],
         "record_id": record["record_id"],
-        "timestamp_utc": record["timestamp_utc"],
+        "timestamp_utc": checkpoint["committed_at_utc"],
         "checkpoint_sha256": checkpoint["checkpoint_sha256"],
         "record_sha256": hashlib.sha256(canonical_json_bytes(body)).hexdigest(),
         "publication_state": {
@@ -4148,7 +5038,7 @@ def _route_transition_projection_receipt(
         "to_route_id": None if fallback is None else fallback["route_id"],
         "batch_id": expected_batch_id,
         "record_ids": [record["record_id"] for record in records],
-        "timestamp_utc": checkpoint["timestamp_utc"],
+        "timestamp_utc": checkpoint["committed_at_utc"],
         "checkpoint_sha256": checkpoint["checkpoint_sha256"],
         "transition_sha256": hashlib.sha256(canonical_json_bytes(items)).hexdigest(),
     }
@@ -5022,18 +5912,9 @@ def _context_rehydrate_preflight(tool_name: str) -> None:
 def _reasoning_phase_preflight(tool_name: str) -> Dict[str, Any] | None:
     """Fail closed when authenticated cadence forbids this exact MCP tool."""
 
-    adapter_env_names = (
-        "RETHLAS_REVIEW_ADAPTER_PATH",
-        "RETHLAS_REVIEW_ADAPTER_SHA256",
-        "RETHLAS_REVIEW_DB",
-        "RETHLAS_REVIEW_CONTROL_TOKEN",
-    )
-    configured = [bool(os.getenv(name)) for name in adapter_env_names]
-    if not any(configured):
-        # Offline unit/dev use has no host cadence. Production binds all four.
+    if not _released_memory_registry_configured():
+        # Offline unit/dev and the legacy runner have no host cadence.
         return None
-    if not all(configured):
-        raise ValueError("review adapter phase guard is only partially configured")
     result = _adapter_reasoning_phase_preflight(tool_name=tool_name)
     expected_run = _required_review_env(_REVIEW_RUN_ENV, label="review run id")
     expected_problem = validate_verified_problem_id(
@@ -5182,8 +6063,13 @@ def _validate_generation_control_evidence_ids(
 
 def _active_memory_records_by_id(
     problem_id: str,
+    *,
+    owner_manifest_snapshot_json: str | None = None,
 ) -> Dict[str, Dict[str, Any]]:
-    entries_by_channel = _load_memory_entries(problem_id)
+    entries_by_channel = _load_memory_entries(
+        problem_id,
+        owner_manifest_snapshot_json=owner_manifest_snapshot_json,
+    )
     return {
         str(entry["record_id"]): entry
         for entries in entries_by_channel.values()
@@ -5196,8 +6082,13 @@ def _validate_generation_wait_evidence(
     problem_id: str,
     state: str,
     evidence_record_ids: List[str],
+    *,
+    owner_manifest_snapshot_json: str | None = None,
 ) -> None:
-    active = _active_memory_records_by_id(problem_id)
+    active = _active_memory_records_by_id(
+        problem_id,
+        owner_manifest_snapshot_json=owner_manifest_snapshot_json,
+    )
     missing = sorted(set(evidence_record_ids) - set(active))
     if missing:
         raise ValueError(
@@ -5353,7 +6244,12 @@ def generation_control_resume(problem_id: str, instance_id: str) -> Dict[str, An
     )
 
 
-def generation_control_status(problem_id: str, instance_id: str) -> Dict[str, Any]:
+def generation_control_status(
+    problem_id: str,
+    instance_id: str,
+    *,
+    owner_manifest_snapshot_json: str | None = None,
+) -> Dict[str, Any]:
     sanitized_problem_id = validate_verified_problem_id(problem_id)
     normalized_instance = _validate_generation_control_instance(instance_id)
     _statement, statement_digest = _trusted_problem_statement(sanitized_problem_id)
@@ -5429,17 +6325,29 @@ def generation_control_status(problem_id: str, instance_id: str) -> Dict[str, An
     elif state in GENERATION_WAIT_STATES:
         normalized_evidence = _validate_generation_control_evidence_ids(evidence)
         _validate_generation_wait_evidence(
-            sanitized_problem_id, state, normalized_evidence
+            sanitized_problem_id,
+            state,
+            normalized_evidence,
+            owner_manifest_snapshot_json=owner_manifest_snapshot_json,
         )
     else:
         raise ValueError("generation control record has an invalid state")
     return dict(payload)
 
 
-def generation_control_receipt(problem_id: str, instance_id: str) -> Dict[str, Any]:
+def generation_control_receipt(
+    problem_id: str,
+    instance_id: str,
+    *,
+    owner_manifest_snapshot_json: str | None = None,
+) -> Dict[str, Any]:
     """Content-bind one trusted control projection for host cadence admission."""
 
-    control = generation_control_status(problem_id, instance_id)
+    control = generation_control_status(
+        problem_id,
+        instance_id,
+        owner_manifest_snapshot_json=owner_manifest_snapshot_json,
+    )
     return {
         "schema_version": "rethlas_generation_control_receipt_v1",
         "control": control,
@@ -5453,13 +6361,19 @@ def build_mcp_app() -> Optional[Any]:
 
     app = FastMCP("reasoning-agent")
 
-    def _guarded_tool(name: str, *, rehydrate_exempt: bool = False):
+    def _guarded_tool(
+        name: str,
+        *,
+        rehydrate_exempt: bool = False,
+        phase_preflight_deferred: bool = False,
+    ):
         def register(function: Any) -> Any:
             @wraps(function)
             def guarded(*args: Any, **kwargs: Any) -> Any:
                 if not rehydrate_exempt:
                     _context_rehydrate_preflight(name)
-                _reasoning_phase_preflight(name)
+                if not phase_preflight_deferred:
+                    _reasoning_phase_preflight(name)
                 return function(*args, **kwargs)
 
             guarded._rethlas_rehydrate_guarded = not rehydrate_exempt  # type: ignore[attr-defined]
@@ -5522,7 +6436,7 @@ def build_mcp_app() -> Optional[Any]:
         supersedes: Optional[List[str]] = None,
         return_mode: str = "metadata",
     ) -> Dict[str, Any]:
-        """Append a record and return compact metadata, or the full entry on request."""
+        """Append one legacy record in offline/local runs only."""
         return memory_append(
             problem_id=problem_id,
             channel=channel,
@@ -5532,13 +6446,19 @@ def build_mcp_app() -> Optional[Any]:
             return_mode=return_mode,
         )
 
-    @_guarded_tool("memory_append_batch")
+    @_guarded_tool("memory_append_batch", phase_preflight_deferred=True)
     def _tool_memory_append_batch(
         problem_id: str,
         items: List[Dict[str, Any]],
     ) -> Dict[str, Any]:
         """Persist a bounded phase checkpoint in one compact tool call."""
-        return memory_append_batch(problem_id=problem_id, items=items)
+        return memory_append_batch(
+            problem_id=problem_id,
+            items=items,
+            _trusted_publication_preflight=lambda: _reasoning_phase_preflight(
+                "memory_append_batch"
+            ),
+        )
 
     @_guarded_tool("memory_search")
     def _tool_memory_search(
@@ -5567,6 +6487,7 @@ def build_mcp_app() -> Optional[Any]:
         branch_id: str,
         state: Dict[str, Any],
     ) -> Dict[str, Any]:
+        """Append one legacy branch state in offline/local runs only."""
         return branch_update(problem_id=problem_id, branch_id=branch_id, state=state)
 
     @_guarded_tool("review_frontier_status")
@@ -5732,6 +6653,16 @@ APP = build_mcp_app()
 
 def main() -> None:
     control_token = os.environ.get("RETHLAS_GENERATION_CONTROL_TOKEN", "")
+    owner_manifest_snapshot_json = os.environ.get(
+        _OWNER_MEMORY_BATCH_MANIFEST_SNAPSHOT_ENV
+    )
+    if owner_manifest_snapshot_json is not None and not (
+        len(sys.argv) == 3 and sys.argv[1] == "--generation-control-receipt"
+    ):
+        raise SystemExit(
+            "owner memory publication snapshot is valid only for the "
+            "generation-control receipt CLI"
+        )
     if len(sys.argv) == 3 and sys.argv[1] == "--generation-control-state":
         print(generation_control_status(sys.argv[2], control_token)["state"])
         return
@@ -5739,7 +6670,13 @@ def main() -> None:
         generation_control_resume(sys.argv[2], control_token)
         return
     if len(sys.argv) == 3 and sys.argv[1] == "--generation-control-receipt":
-        receipt = generation_control_receipt(sys.argv[2], control_token)
+        if owner_manifest_snapshot_json is not None:
+            del os.environ[_OWNER_MEMORY_BATCH_MANIFEST_SNAPSHOT_ENV]
+        receipt = generation_control_receipt(
+            sys.argv[2],
+            control_token,
+            owner_manifest_snapshot_json=owner_manifest_snapshot_json,
+        )
         print(canonical_json_bytes(receipt).decode("utf-8"))
         return
     if APP is None:
