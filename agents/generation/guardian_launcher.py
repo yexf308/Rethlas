@@ -1214,40 +1214,8 @@ def _pinned_runner_control_command(
     adapter_source: PinnedSource,
     worker_adapter_fd: int,
 ) -> tuple[str, ...]:
+    _runner_control_operation(configuration, adapter_path=adapter_source.path)
     requested = configuration.worker_command
-    if not requested:
-        raise LauncherError("runner-control target command is empty")
-    adapter_prefix = (
-        requested[0],
-        str(adapter_source.path),
-        "--db",
-        str(configuration.database_path),
-    )
-    is_generator = (
-        len(requested) > len(adapter_prefix)
-        and requested[: len(adapter_prefix)] == adapter_prefix
-        and requested[len(adapter_prefix)] == "run-generator"
-    )
-    is_guarded_review = bool(
-        len(requested) == len(adapter_prefix) + 5
-        and requested[: len(adapter_prefix)] == adapter_prefix
-        and requested[len(adapter_prefix) : -1]
-        == (
-            "guarded-review-drive",
-            "--run-id",
-            configuration.run_id,
-            "--boundary-id",
-        )
-        and re.fullmatch(r"reviewbound_[0-9a-f]{32}", requested[-1]) is not None
-    )
-    if (
-        not (is_generator or is_guarded_review)
-        or "--runner-token-fd" in requested
-    ):
-        raise LauncherError(
-            "runner-control target must be an exact pinned adapter run-generator "
-            "or guarded-review-drive command without a runner token option"
-        )
     if worker_adapter_fd <= 2:
         raise LauncherError("runner-control adapter FD is invalid")
     metadata = os.fstat(worker_adapter_fd)
@@ -1277,6 +1245,81 @@ def _pinned_runner_control_command(
     )
 
 
+def _runner_control_operation(
+    configuration: LaunchConfiguration,
+    *,
+    adapter_path: Path,
+) -> str:
+    requested = configuration.worker_command
+    if not requested:
+        raise LauncherError("runner-control target command is empty")
+    adapter_prefix = (
+        requested[0],
+        str(adapter_path),
+        "--db",
+        str(configuration.database_path),
+    )
+    is_generator = (
+        len(requested) > len(adapter_prefix)
+        and requested[: len(adapter_prefix)] == adapter_prefix
+        and requested[len(adapter_prefix)] == "run-generator"
+    )
+    is_guarded_review = bool(
+        len(requested) == len(adapter_prefix) + 5
+        and requested[: len(adapter_prefix)] == adapter_prefix
+        and requested[len(adapter_prefix) : -1]
+        == (
+            "guarded-review-drive",
+            "--run-id",
+            configuration.run_id,
+            "--boundary-id",
+        )
+        and re.fullmatch(r"reviewbound_[0-9a-f]{32}", requested[-1]) is not None
+    )
+    if (
+        not (is_generator or is_guarded_review)
+        or "--runner-token-fd" in requested
+    ):
+        raise LauncherError(
+            "runner-control target must be an exact pinned adapter run-generator "
+            "or guarded-review-drive command without a runner token option"
+        )
+    return "run-generator" if is_generator else "guarded-review-drive"
+
+
+def _durably_attest_discovered_groups(
+    configuration: LaunchConfiguration,
+    host: PinnedAdapterClient,
+    *,
+    worker_adapter_fd: int | None,
+    runner_token_fd: int,
+    blocked_command: Sequence[str],
+) -> bool:
+    if configuration.worker_mode == "opaque_guarded_command":
+        return True
+    if configuration.worker_mode != "runner_control" or worker_adapter_fd is None:
+        raise LauncherError("runner-control daemon lacks its pinned adapter FD")
+    exact_target = _pinned_runner_control_command(
+        configuration,
+        host.adapter,
+        worker_adapter_fd,
+    )
+    expected_blocked_command = (
+        *exact_target,
+        "--runner-token-fd",
+        str(runner_token_fd),
+    )
+    if tuple(blocked_command) != expected_blocked_command:
+        raise LauncherError(
+            "runner-control daemon command differs from its pinned launch closure"
+        )
+    operation = _runner_control_operation(
+        configuration,
+        adapter_path=host.adapter.path,
+    )
+    return operation == "run-generator"
+
+
 def _daemon_main(
     guardian: types.ModuleType,
     host: PinnedAdapterClient,
@@ -1293,6 +1336,13 @@ def _daemon_main(
     worker_environment: Mapping[str, str],
 ) -> int:
     try:
+        durably_attest_discovered_groups = _durably_attest_discovered_groups(
+            configuration,
+            host,
+            worker_adapter_fd=worker_adapter_fd,
+            runner_token_fd=runner_token_fd,
+            blocked_command=blocked_command,
+        )
         if os.getsid(0) != os.getpid():
             os.setsid()
         os.chdir(configuration.worker_cwd)
@@ -1315,9 +1365,7 @@ def _daemon_main(
             callbacks,
             inspector=callbacks.inspector,
             poll_interval=0.05,
-            durably_attest_discovered_groups=(
-                configuration.worker_mode == "opaque_guarded_command"
-            ),
+            durably_attest_discovered_groups=durably_attest_discovered_groups,
         ).run(
             blocked_command,
             run_id=configuration.run_id,

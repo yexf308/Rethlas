@@ -240,6 +240,37 @@ if command in {"run-generator", "guarded-review-drive"}:
     if runner_token_sha256 != state["prepare"]["runner_token_sha256"]:
         raise RuntimeError("runner token differs from prepared fence")
     if command == "run-generator":
+        setsid_children = []
+        behavior = state.get("runner_setsid_behavior")
+        if behavior is not None:
+            ready_dir = pathlib.Path(behavior["ready_dir"])
+            echo_dir = pathlib.Path(behavior["echo_dir"])
+            for ordinal in range(behavior["count"]):
+                child_pid = os.fork()
+                if child_pid == 0:
+                    os.setsid()
+                    own_pid = os.getpid()
+                    (ready_dir / (str(own_pid) + ".ready")).write_text(
+                        str(ordinal), encoding="utf-8"
+                    )
+                    deadline = time.monotonic() + 20.0
+                    echo_path = echo_dir / (str(own_pid) + ".echo")
+                    echo_count = 0
+                    while echo_count < 2 and time.monotonic() < deadline:
+                        try:
+                            echo_count = int(echo_path.read_text(encoding="utf-8"))
+                        except (FileNotFoundError, ValueError):
+                            echo_count = 0
+                        time.sleep(0.01)
+                    if echo_count >= 2:
+                        time.sleep(0.10)
+                        os._exit(0)
+                    time.sleep(20.0)
+                    os._exit(71)
+                setsid_children.append(child_pid)
+            for child_pid in setsid_children:
+                os.waitpid(child_pid, 0)
+            time.sleep(0.15)
         receipt_index = args.index("--receipt-path")
         receipt_path = pathlib.Path(args[receipt_index + 1])
         del args[receipt_index:receipt_index + 2]
@@ -261,6 +292,7 @@ if command in {"run-generator", "guarded-review-drive"}:
         "command": command,
         "pgid": os.getpgrp(),
         "runner_token_sha256": runner_token_sha256,
+        "setsid_children": setsid_children if command == "run-generator" else [],
     }), encoding="utf-8")
     raise SystemExit(0)
 if token is None or domain not in {"owner", "guardian"}:
@@ -358,6 +390,26 @@ elif command == "guardian-poll":
     if payload["expected_previous_snapshot_sha256"] != state.get("snapshot_sha256"):
         raise RuntimeError("fake guardian poll CAS is stale")
     state["poll_sequence"] += 1
+    durable_discovered = {
+        int(item["identity"]["pgid"]): item
+        for item in state.get("durable_discovered_groups", [])
+    }
+    if not state.get("omit_discovered_echo"):
+        durable_discovered.update({
+            int(item["identity"]["pgid"]): item
+            for item in payload["discovered_groups"]
+        })
+    live_discovered = []
+    for pgid in sorted(durable_discovered):
+        item = durable_discovered[pgid]
+        try:
+            os.kill(int(item["identity"]["pid"]), 0)
+        except ProcessLookupError:
+            continue
+        except PermissionError:
+            pass
+        live_discovered.append(item)
+    state["durable_discovered_groups"] = live_discovered
     snapshot = {
         "sequence": state["poll_sequence"],
         "registration_id": state["registration_ack"]["registration_id"],
@@ -365,9 +417,24 @@ elif command == "guardian-poll":
         "boot_identity": state["request"]["boot_identity"],
         "paid_groups": [
             state["request"]["root_group"],
-            *payload["discovered_groups"],
+            *live_discovered,
         ],
     }
+    behavior = state.get("runner_setsid_behavior")
+    if behavior is not None:
+        echo_dir = pathlib.Path(behavior["echo_dir"])
+        echo_counts = state.setdefault("echo_counts", {})
+        for item in live_discovered:
+            pgid = str(item["identity"]["pgid"])
+            echo_counts[pgid] = int(echo_counts.get(pgid, 0)) + 1
+            (echo_dir / (pgid + ".echo")).write_text(
+                str(echo_counts[pgid]), encoding="utf-8"
+            )
+    state.setdefault("poll_history", []).append({
+        "submitted": payload["discovered_groups"],
+        "echoed": live_discovered,
+        "snapshot": snapshot,
+    })
     state["snapshot_sha256"] = digest(snapshot)
     database.write_text(canonical(state), encoding="utf-8")
     print(canonical({
@@ -1431,6 +1498,140 @@ def test_runner_control_exec_target_consumes_exact_fifo(tmp_path: Path) -> None:
     assert receipt["runner_token_sha256"] == state["prepare"]["runner_token_sha256"]
 
 
+@pytest.mark.skipif(os.name != "posix", reason="requires POSIX sessions")
+@pytest.mark.parametrize("omit_discovered_echo", [False, True])
+def test_runner_control_durably_attests_real_setsid_descendants(
+    tmp_path: Path,
+    omit_discovered_echo: bool,
+) -> None:
+    contract, contract_sha256, policy_sha256 = _policy_contract()
+    generation = tmp_path / "agents" / "generation"
+    data = generation / "data"
+    data.mkdir(parents=True)
+    problem = data / "opaque-probe.md"
+    problem.write_text("Runner durable discovery probe.\n", encoding="utf-8")
+    adapter = tmp_path / "agents" / "hotjoin_adapter.py"
+    adapter.write_text(
+        _FAKE_ADAPTER.replace("__CONTRACT__", repr(contract)), encoding="utf-8"
+    )
+    marker = tmp_path / "runner-worker.json"
+    ready_dir = tmp_path / "setsid-ready"
+    echo_dir = tmp_path / "setsid-echo"
+    ready_dir.mkdir()
+    echo_dir.mkdir()
+    database = tmp_path / "guardian-state.json"
+    owner_token = hashlib.sha256(b"runner-durable-discovery-owner").hexdigest()
+    database.write_text(
+        _canonical(
+            {
+                "owner_token_sha256": hashlib.sha256(
+                    owner_token.encode("ascii")
+                ).hexdigest(),
+                "omit_discovered_echo": omit_discovered_echo,
+                "runner_setsid_behavior": {
+                    "count": 2,
+                    "echo_dir": str(echo_dir),
+                    "ready_dir": str(ready_dir),
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    completed = _invoke_launcher(
+        generation=generation,
+        problem=problem,
+        adapter=adapter,
+        database=database,
+        owner_token=owner_token,
+        run_id="run-runner-durable-discovery",
+        watchdog_id="watchdog-runner-durable-discovery",
+        contract_sha256=contract_sha256,
+        policy_sha256=policy_sha256,
+        worker_mode="runner_control",
+        worker_command=[
+            "/usr/bin/python3",
+            str(adapter),
+            "--db",
+            str(database),
+            "run-generator",
+            "--receipt-path",
+            str(marker),
+        ],
+    )
+
+    state = json.loads(database.read_text(encoding="utf-8"))
+    child_pgids = {int(path.stem) for path in ready_dir.glob("*.ready")}
+    assert len(child_pgids) == 2
+    submitted_pgids = {
+        int(item["identity"]["pgid"])
+        for poll in state["poll_history"]
+        for item in poll["submitted"]
+    }
+    assert child_pgids <= submitted_pgids
+    inspector = SystemProcessInspector()
+    root_pgid = int(state["request"]["root_group"]["identity"]["pgid"])
+    for pgid in child_pgids | {root_pgid}:
+        assert inspector.identity(pgid) is None
+        assert inspector.group_members(pgid) == ()
+
+    result = json.loads(completed.stdout)
+    if not omit_discovered_echo:
+        assert completed.returncode == 0, completed.stdout + completed.stderr
+        assert result["state"] == "completed"
+        assert result["report"]["direct_returncode"] == 0
+        echoed_pgids = {
+            int(item["identity"]["pgid"])
+            for poll in state["poll_history"]
+            for item in poll["echoed"]
+        }
+        assert child_pgids <= echoed_pgids
+        for pgid in child_pgids:
+            echoed_indexes = [
+                index
+                for index, poll in enumerate(state["poll_history"])
+                if pgid
+                in {
+                    int(item["identity"]["pgid"])
+                    for item in poll["echoed"]
+                }
+            ]
+            assert len(echoed_indexes) >= 2
+            assert any(
+                pgid
+                not in {
+                    int(item["identity"]["pgid"])
+                    for item in state["poll_history"][index]["submitted"]
+                }
+                for index in echoed_indexes
+            )
+            assert any(
+                index > echoed_indexes[-1]
+                and {
+                    int(item["identity"]["pgid"])
+                    for item in poll["snapshot"]["paid_groups"]
+                }
+                == {root_pgid}
+                for index, poll in enumerate(state["poll_history"])
+            )
+        assert child_pgids <= set(result["report"]["already_empty_pgids"])
+        receipt = json.loads(marker.read_text(encoding="utf-8"))
+        assert set(receipt["setsid_children"]) == child_pgids
+    else:
+        assert completed.returncode == 70, completed.stdout + completed.stderr
+        assert result["state"] == "execution_unknown"
+        assert "durable host poll omitted a discovered paid group" in result[
+            "report"
+        ]["reason"]
+        assert state["terminal_report"] == result["report"]
+        assert child_pgids <= set(result["report"]["stopped_pgids"])
+        assert child_pgids <= set(result["report"]["killed_pgids"])
+        assert root_pgid in (
+            set(result["report"]["killed_pgids"])
+            | set(result["report"]["already_empty_pgids"])
+        )
+        assert not marker.exists()
+
+
 def test_runner_control_guarded_review_is_exact_and_stays_in_guardian_root(
     tmp_path: Path,
 ) -> None:
@@ -1523,6 +1724,95 @@ def test_runner_control_rejects_inexact_guarded_review_target(
             guardian_launcher._pinned_runner_control_command(  # noqa: SLF001
                 configuration, source, source.descriptor
             )
+    finally:
+        source.close()
+
+
+def test_daemon_discovery_mode_is_bound_to_the_exact_runner_closure(
+    tmp_path: Path,
+) -> None:
+    adapter = tmp_path / "hotjoin_adapter.py"
+    adapter.write_text("# pinned test adapter\n", encoding="utf-8")
+    database = tmp_path / "messages.sqlite3"
+    source = guardian_launcher.PinnedSource.open(adapter)
+    host = guardian_launcher.PinnedAdapterClient(source, database)
+    runner_token_fd = 97
+
+    def configuration(tail: tuple[str, ...]) -> SimpleNamespace:
+        return SimpleNamespace(
+            worker_mode="runner_control",
+            worker_command=(
+                sys.executable,
+                str(adapter),
+                "--db",
+                str(database),
+                *tail,
+            ),
+            database_path=database,
+            run_id="run-1",
+        )
+
+    generator = configuration(("run-generator", "--problem", "probe"))
+    guarded_review = configuration(
+        (
+            "guarded-review-drive",
+            "--run-id",
+            "run-1",
+            "--boundary-id",
+            "reviewbound_" + "a" * 32,
+        )
+    )
+    try:
+        generator_target = guardian_launcher._pinned_runner_control_command(  # noqa: SLF001
+            generator, source, source.descriptor
+        )
+        review_target = guardian_launcher._pinned_runner_control_command(  # noqa: SLF001
+            guarded_review, source, source.descriptor
+        )
+        assert guardian_launcher._durably_attest_discovered_groups(  # noqa: SLF001
+            generator,
+            host,
+            worker_adapter_fd=source.descriptor,
+            runner_token_fd=runner_token_fd,
+            blocked_command=(
+                *generator_target,
+                "--runner-token-fd",
+                str(runner_token_fd),
+            ),
+        )
+        assert not guardian_launcher._durably_attest_discovered_groups(  # noqa: SLF001
+            guarded_review,
+            host,
+            worker_adapter_fd=source.descriptor,
+            runner_token_fd=runner_token_fd,
+            blocked_command=(
+                *review_target,
+                "--runner-token-fd",
+                str(runner_token_fd),
+            ),
+        )
+        with pytest.raises(
+            guardian_launcher.LauncherError,
+            match="differs from its pinned launch closure",
+        ):
+            guardian_launcher._durably_attest_discovered_groups(  # noqa: SLF001
+                generator,
+                host,
+                worker_adapter_fd=source.descriptor,
+                runner_token_fd=runner_token_fd,
+                blocked_command=(
+                    *review_target,
+                    "--runner-token-fd",
+                    str(runner_token_fd),
+                ),
+            )
+        assert guardian_launcher._durably_attest_discovered_groups(  # noqa: SLF001
+            SimpleNamespace(worker_mode="opaque_guarded_command"),
+            host,
+            worker_adapter_fd=None,
+            runner_token_fd=runner_token_fd,
+            blocked_command=(sys.executable, "-c", "pass"),
+        )
     finally:
         source.close()
 
