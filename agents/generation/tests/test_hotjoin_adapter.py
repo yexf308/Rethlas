@@ -16882,7 +16882,7 @@ You may use local read-only shell/Python for the `q=7` arithmetic. Do not use th
     private_adapter.write_text(private_source, encoding="utf-8")
     private_adapter_sha256 = hashlib.sha256(private_adapter.read_bytes()).hexdigest()
     assert private_adapter_sha256 == (
-        "6eefabb416726b78bf01624f07eebed9a5df53d36620823ced596622454ffa56"
+        "50e20aa97b0c9dc5d0ed295a0e0712112ed267f01636b6a8cef2d91620da56ea"
     )
 
     monkeypatch.setattr(hotjoin, "__file__", str(private_adapter))

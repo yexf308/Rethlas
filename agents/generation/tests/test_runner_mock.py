@@ -146,6 +146,7 @@ def main() -> int:
         worker.pop(0)
     assert len(worker) >= 2
     assert pathlib.Path(worker[0]).is_absolute()
+    assert not pathlib.Path(worker[0]).is_symlink()
     assert pathlib.Path(worker[1]).resolve() == args.adapter_path.resolve()
     assert "--runner-token-fd" not in worker
     assert "--control-token-fd" not in worker
@@ -182,6 +183,10 @@ def main() -> int:
         }
         with pathlib.Path(calls_file).open("a", encoding="utf-8") as handle:
             handle.write(canonical(record) + "\n")
+
+    if os.environ.get("MOCK_GUARDIAN_LAUNCHER_FAIL_BEFORE_DISPATCH"):
+        print("mock guardian pre-dispatch failure", file=sys.stderr)
+        return 70
 
     runtime_command = [worker[0], "-I", "-B", *worker[1:]]
     runtime_command.extend(("--runner-token-fd", str(runner_read)))
@@ -228,7 +233,14 @@ def _site_packages(runtime_bin: Path) -> Path:
 def _make_math_runtime(agents_dir: Path) -> Path:
     runtime = agents_dir / ".generation-venv"
     subprocess.run(
-        [sys.executable, "-m", "venv", "--without-pip", str(runtime)],
+        [
+            sys.executable,
+            "-m",
+            "venv",
+            "--copies",
+            "--without-pip",
+            str(runtime),
+        ],
         check=True,
         capture_output=True,
         text=True,
@@ -2825,6 +2837,45 @@ def test_cadence_legal_generation_yield_stops_before_another_paid_cycle(
     assert "owner action is required before another paid turn" in completed.stdout
 
 
+def test_guardian_predispatch_failure_preserves_original_error_before_cycle_check(
+    tmp_path: Path,
+) -> None:
+    runner, fake_bin = _make_runner_tree(tmp_path)
+    _adapter, state_path, calls_path = _install_mock_cadence_adapter(tmp_path)
+    environment = _cadence_environment(
+        runner,
+        fake_bin,
+        state_path,
+        calls_path,
+        dispositions=["hard_stopped"],
+        extra_environment={"MOCK_GUARDIAN_LAUNCHER_FAIL_BEFORE_DISPATCH": "1"},
+    )
+
+    completed = subprocess.run(
+        [str(runner)],
+        cwd=runner.parent.parent,
+        env=environment,
+        text=True,
+        capture_output=True,
+        timeout=30,
+        check=False,
+    )
+
+    assert completed.returncode == 70, completed.stdout + completed.stderr
+    assert "distinct authenticated cycle_id" not in completed.stderr
+    assert "generator exited with code 70" in completed.stderr
+    assert not _cadence_calls(calls_path, "run-generator")
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    assert state["cycle_id"] is None
+    guarded_logs = list(
+        (runner.parents[2] / ".rethlas_hotjoin" / "logs").rglob("*_iter_0.md")
+    )
+    assert len(guarded_logs) == 1
+    assert "mock guardian pre-dispatch failure" in guarded_logs[0].read_text(
+        encoding="utf-8"
+    )
+
+
 def test_clean_early_terminal_gets_one_same_cycle_authorization_without_reset(
     tmp_path: Path,
 ) -> None:
@@ -4640,6 +4691,75 @@ def test_runner_injects_minimal_shell_path_with_preflighted_python(
             "PATH": f"{runtime_bin}:/usr/bin:/bin:/usr/sbin:/sbin",
         },
     }
+
+
+def test_runner_rejects_symlink_python_before_control_or_codex(
+    tmp_path: Path,
+) -> None:
+    runner, runtime_bin = _make_runner_tree(tmp_path)
+    python3 = runtime_bin / "python3"
+    python3.unlink()
+    python3.symlink_to("python")
+    calls_file = tmp_path / "codex-calls.jsonl"
+    environment = _mock_environment(
+        runner,
+        runtime_bin,
+        mode="forged",
+        extra_environment={
+            "MOCK_CODEX_CALLS_FILE": str(calls_file),
+            "RETHLAS_HOTJOIN_RUN_ID": "symlink-runtime-must-not-start",
+        },
+    )
+
+    completed = subprocess.run(
+        [str(runner)],
+        cwd=runner.parent.parent,
+        env=environment,
+        text=True,
+        capture_output=True,
+        timeout=20,
+        check=False,
+    )
+
+    assert completed.returncode == 1
+    assert "non-symlink Python interpreter" in completed.stderr
+    assert "venv --copies" in completed.stderr
+    assert not calls_file.exists()
+    assert not (runner.parents[2] / ".rethlas_hotjoin").exists()
+
+
+def test_runner_rejects_mismatched_python_alias_before_control_or_codex(
+    tmp_path: Path,
+) -> None:
+    runner, runtime_bin = _make_runner_tree(tmp_path)
+    python_alias = runtime_bin / "python"
+    python_alias.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+    python_alias.chmod(0o755)
+    calls_file = tmp_path / "codex-calls.jsonl"
+    environment = _mock_environment(
+        runner,
+        runtime_bin,
+        mode="forged",
+        extra_environment={
+            "MOCK_CODEX_CALLS_FILE": str(calls_file),
+            "RETHLAS_HOTJOIN_RUN_ID": "mismatched-runtime-must-not-start",
+        },
+    )
+
+    completed = subprocess.run(
+        [str(runner)],
+        cwd=runner.parent.parent,
+        env=environment,
+        text=True,
+        capture_output=True,
+        timeout=20,
+        check=False,
+    )
+
+    assert completed.returncode == 1
+    assert "does not contain the selected interpreter bytes" in completed.stderr
+    assert not calls_file.exists()
+    assert not (runner.parents[2] / ".rethlas_hotjoin").exists()
 
 
 @pytest.mark.parametrize("missing_module", REQUIRED_MODULES)

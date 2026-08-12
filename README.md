@@ -131,7 +131,7 @@ does not authenticate the response.
 
 ```bash
 cd agents
-python3 -m venv .generation-venv
+python3 -m venv --copies .generation-venv
 source .generation-venv/bin/activate
 pip install -r generation/requirements-math-research.txt
 cd generation
@@ -142,7 +142,14 @@ The generation MCP environment deliberately lives beside, rather than inside,
 `agents/generation`: the generation Codex can write its workspace, so an
 interpreter or site-packages directory placed there cannot be part of the
 publication trust boundary. The runner rejects Python environments inside the
-generation workspace or the system temporary directory.
+generation workspace or the system temporary directory. Guardian also pins the
+worker executable without following symbolic links, so the generation virtual
+environment must be created with `--copies` rather than the platform-default
+symlink layout.
+
+An existing symlink-based virtual environment cannot be converted in place by
+rerunning `venv --copies`; move or remove that environment and recreate it at an
+empty path before installing the requirements.
 
 `generation/requirements-math-research.txt` is the generation capability
 profile. It includes the authoritative `generation/mcp/requirements.txt`
@@ -1100,11 +1107,11 @@ Put your problem in a markdown file under `agents/generation/data/`. Save that a
 agents/generation/data/my_problem.md
 ```
 
-Then run:
+Then, from the repository root, run:
 
 ```bash
+source agents/.generation-venv/bin/activate
 cd agents/generation
-source .venv/bin/activate
 PROBLEM_FILE=data/my_problem.md ./tests/run_example.sh
 ```
 

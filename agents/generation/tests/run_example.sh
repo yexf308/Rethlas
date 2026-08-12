@@ -150,6 +150,10 @@ for candidate in "$TRUSTED_PYTHON_BIN" "$python_target"; do
     exit 1
   fi
 done
+if [[ "$TRUSTED_PYTHON_BIN" != "$python_target" ]]; then
+  echo "Guardian requires a non-symlink Python interpreter; recreate the external generation environment with: python3 -m venv --copies <path>" >&2
+  exit 1
+fi
 
 # Process .pth files before starting Python with site initialization enabled.
 # Executable .pth lines run before the in-process preflight can inspect
@@ -274,7 +278,9 @@ if ! "$TRUSTED_PYTHON_BIN" -I -B - \
   "${REQUIRED_GENERATION_MODULES[@]}" <<'PY'
 import importlib
 import importlib.util
+import hashlib
 import os
+import stat
 import sys
 import tempfile
 from pathlib import Path
@@ -383,16 +389,26 @@ except UnsafeRuntimePath as exc:
 scripts_dir = expected_executable.parent.resolve(strict=True)
 if os.pathsep in str(scripts_dir) or "\n" in str(scripts_dir):
     fail(f"Python bin directory cannot be represented safely in PATH: {scripts_dir}")
-expected_target = expected_executable.resolve(strict=True)
 command_names = ("python3",) if nonfresh_control_only else ("python", "python3")
+expected_digest = hashlib.sha256(expected_executable.read_bytes()).digest()
 for command_name in command_names:
     candidate = scripts_dir / command_name
     try:
-        candidate_target = candidate.resolve(strict=True)
+        candidate_metadata = candidate.lstat()
     except OSError as exc:
         fail(f"{command_name} is missing from the trusted Python bin directory: {exc}")
-    if not os.access(candidate, os.X_OK) or candidate_target != expected_target:
-        fail(f"{candidate} does not resolve to the selected interpreter")
+    if (
+        candidate.is_symlink()
+        or not stat.S_ISREG(candidate_metadata.st_mode)
+        or candidate_metadata.st_uid not in {0, os.geteuid()}
+        or candidate_metadata.st_nlink != 1
+        or stat.S_IMODE(candidate_metadata.st_mode) & 0o022
+        or stat.S_IMODE(candidate_metadata.st_mode) & 0o111 == 0
+        or not os.access(candidate, os.X_OK)
+    ):
+        fail(f"{candidate} is not a pinned-executable-compatible regular file")
+    if hashlib.sha256(candidate.read_bytes()).digest() != expected_digest:
+        fail(f"{candidate} does not contain the selected interpreter bytes")
 
 errors: list[str] = []
 for module_name in module_names:
@@ -5164,7 +5180,7 @@ while true; do
     cadence_after_turn="$(
       cadence_projection_disposition "$cadence_after_projection"
     )" || exit 70
-    if [[ "$cadence_paid_root_invocation" -eq 1 ]]; then
+    if [[ "$codex_rc" -eq 0 && "$cadence_paid_root_invocation" -eq 1 ]]; then
       if [[ "$cadence_new_cycle_invocation" -eq 1 ]]; then
         if [[ -z "$cadence_after_cycle_id" \
            || ( -n "$cadence_prior_cycle_id" \
