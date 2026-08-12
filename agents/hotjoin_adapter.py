@@ -187,7 +187,7 @@ APPROVED_GUARDIAN_RUNNER_SHA256 = (
     "28c54dbbdd96ed5cf5e6572363fc8e2629b1dfe42be9bcfb7a889c2c9023e0e0"
 )
 APPROVED_GUARDIAN_SHA256 = (
-    "edc1010c235f7685c7623d5c13bdda98c984c7f6a9f0b9366f0e69328cac776a"
+    "475ccd703e6a3c601f3ee5000bdcc6f6fe5a2659e033b561ba31d09653334b9b"
 )
 GUARDIAN_CONTROL_SCHEMA_REGISTRY = {
     "schema_version": "rethlas_guardian_control_registry_v1",
@@ -3019,6 +3019,94 @@ def _release_existing_source_lifecycle_lock(
     lock: _DatabaseLifecycleGuard | None,
 ) -> None:
     _release_database_lifecycle_guard(lock)
+
+
+def _guardian_completed_process_coverage_is_exact(
+    report: Mapping[str, Any],
+    *,
+    registered_pgids: set[int],
+    durably_empty_pgids: set[int],
+    root_pgid: int,
+) -> bool:
+    """Validate the two exact, non-watchdog Guardian completion shapes.
+
+    A paid worker may return before its already-bound helpers have disappeared.
+    Guardian is allowed to synchronously STOP/KILL that exact durable topology,
+    but it must report every signal and prove every registered group empty.
+    Newly discovered, non-durable groups cannot be laundered through this
+    terminal receipt; they remain execution-unknown.
+    """
+
+    try:
+        stopped = set(report["stopped_pgids"])
+        killed = set(report["killed_pgids"])
+        already_empty = set(report["already_empty_pgids"])
+    except (KeyError, TypeError):
+        return False
+    if (
+        not registered_pgids
+        or not durably_empty_pgids <= registered_pgids
+        or killed & already_empty
+        or durably_empty_pgids & (stopped | killed)
+        or not durably_empty_pgids <= already_empty
+    ):
+        return False
+    represented = stopped | killed | already_empty
+    if not represented <= registered_pgids:
+        return False
+    if not stopped and not killed:
+        return bool(
+            report.get("reason") == "paid_group_empty"
+            and registered_pgids == already_empty
+        )
+    return bool(
+        report.get("reason") == "paid_worker_returned_group_cleanup"
+        and stopped
+        and killed
+        and root_pgid in killed
+        and killed <= stopped
+        and stopped <= killed | already_empty
+        and registered_pgids == killed | already_empty
+    )
+
+
+def _guardian_watchdog_process_coverage_is_exact(
+    report: Mapping[str, Any],
+    *,
+    registered_pgids: set[int],
+    durably_empty_pgids: set[int],
+) -> bool:
+    """Validate an exact T90 STOP/KILL/empty process receipt."""
+
+    try:
+        stopped = set(report["stopped_pgids"])
+        killed = set(report["killed_pgids"])
+        already_empty = set(report["already_empty_pgids"])
+    except (KeyError, TypeError):
+        return False
+    represented = stopped | killed | already_empty
+    exact_partition = bool(
+        registered_pgids
+        and durably_empty_pgids <= registered_pgids
+        and not killed & already_empty
+        and not durably_empty_pgids & (stopped | killed)
+        and durably_empty_pgids <= already_empty
+        and represented <= registered_pgids
+        and registered_pgids == killed | already_empty
+        and killed <= stopped
+        and stopped <= killed | already_empty
+    )
+    if not exact_partition:
+        return False
+    reason = report.get("reason")
+    if reason == "hard_stop_due_before_release":
+        return bool(
+            report.get("direct_returncode") is None
+            and not stopped
+            and not killed
+            and registered_pgids == already_empty
+        )
+    return reason == "absolute_hard_stop"
 
 
 class ConversationLedger:
@@ -11409,6 +11497,89 @@ class ConversationLedger:
             },
         }
 
+    def _guardian_discovered_empty_groups_txn(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        registration_id: str,
+        request_sha256: str,
+    ) -> tuple[dict[str, Any], ...]:
+        """Load and revalidate every content-bound empty discovery receipt."""
+
+        groups: list[dict[str, Any]] = []
+        seen_pgids: set[int] = set()
+        rows = connection.execute(
+            "SELECT * FROM guardian_discovered_empty_receipts "
+            "WHERE registration_id = ? ORDER BY source_id",
+            (registration_id,),
+        ).fetchall()
+        for row in rows:
+            try:
+                group = _json_loads_strict(str(row["group_json"]))
+                receipt = _json_loads_strict(str(row["receipt_json"]))
+                normalized = self._normalize_guardian_discovered_groups([group])
+            except (ValueError, json.JSONDecodeError) as error:
+                raise HotJoinError(
+                    "guardian discovered-empty receipt is malformed"
+                ) from error
+            if len(normalized) != 1 or normalized[0] != group:
+                raise HotJoinError(
+                    "guardian discovered-empty group identity is not canonical"
+                )
+            source_id = self._guardian_discovered_source_id(
+                registration_id=registration_id,
+                request_sha256=request_sha256,
+                group=group,
+            )
+            expected_receipt_keys = {
+                "schema_version",
+                "registration_id",
+                "request_sha256",
+                "source_id",
+                "group",
+                "poll_request_sha256",
+                "disposition",
+                "receipt_sha256",
+            }
+            if (
+                row["request_sha256"] != request_sha256
+                or row["source_id"] != source_id
+                or row["group_json"] != _canonical_json(group)
+                or not isinstance(receipt, dict)
+                or set(receipt) != expected_receipt_keys
+                or receipt.get("schema_version")
+                != "rethlas_guardian_discovered_empty_receipt_v1"
+                or receipt.get("registration_id") != registration_id
+                or receipt.get("request_sha256") != request_sha256
+                or receipt.get("source_id") != source_id
+                or receipt.get("group") != group
+                or receipt.get("poll_request_sha256")
+                != row["poll_request_sha256"]
+                or receipt.get("disposition") != "discovered_already_empty"
+                or receipt.get("receipt_sha256") != row["receipt_sha256"]
+                or hashlib.sha256(
+                    _canonical_json(
+                        {
+                            key: value
+                            for key, value in receipt.items()
+                            if key != "receipt_sha256"
+                        }
+                    ).encode("utf-8")
+                ).hexdigest()
+                != row["receipt_sha256"]
+            ):
+                raise HotJoinError(
+                    "guardian discovered-empty receipt is not content-exact"
+                )
+            pgid = int(group["identity"]["pgid"])
+            if pgid in seen_pgids:
+                raise HotJoinError(
+                    "guardian discovered-empty receipt reused a process group"
+                )
+            seen_pgids.add(pgid)
+            groups.append(group)
+        return tuple(groups)
+
     def _guardian_terminal_clean_txn(
         self,
         connection: sqlite3.Connection,
@@ -11444,25 +11615,51 @@ class ConversationLedger:
             or report.get("state") != "completed"
             or report.get("forced") is not False
             or report.get("direct_returncode") != 0
-            or report.get("stopped_pgids") != []
-            or report.get("killed_pgids") != []
             or inspector.boot_identity() != registration["boot_identity"]
             or inspector.identity(int(registration["daemon_pid"])) is not None
         ):
-            return False
-        already_empty = report.get("already_empty_pgids")
-        if not isinstance(already_empty, list):
             return False
         group_rows = connection.execute(
             "SELECT * FROM guardian_paid_groups WHERE registration_id = ?",
             (registration["registration_id"],),
         ).fetchall()
+        empty_groups = self._guardian_discovered_empty_groups_txn(
+            connection,
+            registration_id=str(registration["registration_id"]),
+            request_sha256=str(registration["request_sha256"]),
+        )
+        registered_pgids = {int(row["pgid"]) for row in group_rows}
+        empty_pgids = {int(group["identity"]["pgid"]) for group in empty_groups}
+        if registered_pgids & empty_pgids:
+            return False
+        coverage_pgids = registered_pgids | empty_pgids
+        # Only a discovered-empty receipt proves that this PGID was already
+        # gone before it could ever become a released paid group.  A regular
+        # paid-group row may become terminal concurrently after Guardian has
+        # STOPped or KILLed it, so its finalize-time state cannot classify the
+        # earlier signal receipt.
+        durably_empty_pgids = empty_pgids
+        root_rows = [row for row in group_rows if row["source_kind"] == "root"]
+        if len(root_rows) != 1:
+            return False
+        if not _guardian_completed_process_coverage_is_exact(
+            report,
+            registered_pgids=coverage_pgids,
+            durably_empty_pgids=durably_empty_pgids,
+            root_pgid=int(root_rows[0]["pgid"]),
+        ):
+            return False
         return bool(
-            {int(row["pgid"]) for row in group_rows} <= set(already_empty)
+            coverage_pgids
             and all(
                 inspector.identity(int(row["pid"])) is None
                 and not inspector.group_members(int(row["pgid"]))
                 for row in group_rows
+            )
+            and all(
+                inspector.identity(int(group["identity"]["pid"])) is None
+                and not inspector.group_members(int(group["identity"]["pgid"]))
+                for group in empty_groups
             )
         )
 
@@ -14136,23 +14333,49 @@ class ConversationLedger:
                 "ORDER BY pgid",
                 (registration_id,),
             ).fetchall()
-            registered_pgids = {int(row["pgid"]) for row in group_rows}
-            covered_pgids = set(arrays["killed_pgids"]) | set(
-                arrays["already_empty_pgids"]
+            empty_groups = self._guardian_discovered_empty_groups_txn(
+                connection,
+                registration_id=str(registration_id),
+                request_sha256=str(request_sha256),
             )
+            registered_pgids = {int(row["pgid"]) for row in group_rows}
+            empty_pgids = {
+                int(group["identity"]["pgid"]) for group in empty_groups
+            }
+            if registered_pgids & empty_pgids:
+                raise HotJoinError(
+                    "guardian durable group and empty receipt identities overlap"
+                )
+            coverage_pgids = registered_pgids | empty_pgids
+            # A paid-group row can become terminal after Guardian signals it;
+            # only never-released discovered-empty receipts are known to have
+            # preceded terminal cleanup.
+            durably_empty_pgids = empty_pgids
+            root_rows = [row for row in group_rows if row["source_kind"] == "root"]
             all_empty = all(
                 inspector.identity(int(row["pid"])) is None
                 and not inspector.group_members(int(row["pgid"]))
                 for row in group_rows
+            ) and all(
+                inspector.identity(int(group["identity"]["pid"])) is None
+                and not inspector.group_members(int(group["identity"]["pgid"]))
+                for group in empty_groups
             )
             state = str(report["state"])
             if state == "completed":
                 valid_terminal = bool(
                     report["forced"] is False
                     and report["direct_returncode"] is not None
-                    and not arrays["stopped_pgids"]
-                    and not arrays["killed_pgids"]
-                    and registered_pgids <= set(arrays["already_empty_pgids"])
+                    and _guardian_completed_process_coverage_is_exact(
+                        report,
+                        registered_pgids=coverage_pgids,
+                        durably_empty_pgids=durably_empty_pgids,
+                        root_pgid=(
+                            int(root_rows[0]["pgid"])
+                            if len(root_rows) == 1
+                            else -1
+                        ),
+                    )
                     and all_empty
                 )
             elif state == "watchdog_forced":
@@ -14164,7 +14387,11 @@ class ConversationLedger:
                 valid_terminal = bool(
                     report["forced"] is True
                     and hard_due
-                    and registered_pgids <= covered_pgids
+                    and _guardian_watchdog_process_coverage_is_exact(
+                        report,
+                        registered_pgids=coverage_pgids,
+                        durably_empty_pgids=durably_empty_pgids,
+                    )
                     and all_empty
                 )
             else:

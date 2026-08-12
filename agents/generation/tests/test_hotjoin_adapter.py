@@ -10702,7 +10702,7 @@ with Path(sys.argv[1]).open('a', encoding='utf-8') as stream:
             "registration_id": race_state["registration_ack"]["registration_id"],
             "request_sha256": race_state["registration_ack"]["request_sha256"],
             "state": "completed",
-            "reason": "private_daemon_lost_after_root_empty",
+            "reason": "paid_group_empty",
             "forced": False,
             "direct_returncode": 0,
             "stopped_pgids": [],
@@ -11827,6 +11827,69 @@ def test_guardian_poll_commits_candidate_that_exits_before_host_attestation(
         assert receipt["group"]["identity"] == vanished.as_dict()
         assert receipt["poll_request_sha256"] == result["poll_request_sha256"]
 
+    inspector.remove(10_101)
+    inexact_cleanup = {
+        "registration_id": ack["registration_id"],
+        "request_sha256": ack["request_sha256"],
+        "state": "completed",
+        "reason": "paid_worker_returned_group_cleanup",
+        "forced": False,
+        "direct_returncode": 0,
+        "stopped_pgids": [10_101, 30_303],
+        "killed_pgids": [10_101, 30_303],
+        "already_empty_pgids": [],
+    }
+    with pytest.raises(
+        hotjoin.HotJoinError,
+        match="terminal process coverage is not exact",
+    ):
+        ledger.finalize_guardian(
+            "run-1",
+            report=inexact_cleanup,
+            report_sha256=hashlib.sha256(
+                hotjoin._canonical_json(inexact_cleanup).encode("utf-8")
+            ).hexdigest(),
+            guardian_token="4" * 64,
+            inspector=inspector,
+            wall_epoch=1_001.0,
+            monotonic_epoch=2_001.0,
+        )
+    report = {
+        "registration_id": ack["registration_id"],
+        "request_sha256": ack["request_sha256"],
+        "state": "completed",
+        "reason": "paid_group_empty",
+        "forced": False,
+        "direct_returncode": 0,
+        "stopped_pgids": [],
+        "killed_pgids": [],
+        "already_empty_pgids": [10_101, 30_303],
+    }
+    terminal = ledger.finalize_guardian(
+        "run-1",
+        report=report,
+        report_sha256=hashlib.sha256(
+            hotjoin._canonical_json(report).encode("utf-8")
+        ).hexdigest(),
+        guardian_token="4" * 64,
+        inspector=inspector,
+        wall_epoch=1_001.0,
+        monotonic_epoch=2_001.0,
+    )
+    assert terminal["state"] == "completed"
+    with ledger._connect() as connection:
+        cycle = connection.execute(
+            "SELECT cycle_id FROM guardian_registrations "
+            "WHERE registration_id = ?",
+            (ack["registration_id"],),
+        ).fetchone()
+        assert cycle is not None
+        assert ledger._guardian_terminal_clean_txn(
+            connection,
+            cycle_id=str(cycle["cycle_id"]),
+            inspector=inspector,
+        )
+
 
 def test_guardian_poll_discovery_rejects_ancestry_toctou_atomically(
     ledger: hotjoin.ConversationLedger,
@@ -12213,6 +12276,32 @@ def test_guardian_paid_group_requires_two_polls_before_release_and_terminal_proo
     assert [
         group["identity"]["pgid"] for group in after_terminal["snapshot"]["paid_groups"]
     ] == [10_101]
+    # A paid-group row may become terminal concurrently after Guardian has
+    # already signalled it.  Finalize-time row state therefore cannot be used
+    # to rewrite the Guardian's earlier exact STOP/KILL receipt.
+    cleanup_report = {
+        "registration_id": registration_id,
+        "request_sha256": request_sha256,
+        "state": "completed",
+        "reason": "paid_worker_returned_group_cleanup",
+        "forced": False,
+        "direct_returncode": 0,
+        "stopped_pgids": [10_101, 30_303],
+        "killed_pgids": [10_101, 30_303],
+        "already_empty_pgids": [],
+    }
+    finalized = ledger.finalize_guardian(
+        "run-1",
+        report=cleanup_report,
+        report_sha256=hashlib.sha256(
+            hotjoin._canonical_json(cleanup_report).encode("utf-8")
+        ).hexdigest(),
+        guardian_token="4" * 64,
+        inspector=inspector,
+        wall_epoch=1_001.0,
+        monotonic_epoch=2_001.0,
+    )
+    assert finalized["state"] == "completed"
 
 
 def test_guardian_callbacks_and_finalize_are_exact_replay_after_capability_revoke(
@@ -12262,7 +12351,7 @@ def test_guardian_callbacks_and_finalize_are_exact_replay_after_capability_revok
         "registration_id": registration_id,
         "request_sha256": request_sha256,
         "state": "completed",
-        "reason": "inner cycle worker returned cleanly",
+        "reason": "paid_group_empty",
         "forced": False,
         "direct_returncode": 0,
         "stopped_pgids": [],
@@ -12432,6 +12521,297 @@ def test_guardian_finalize_persists_known_nonzero_worker_terminal_as_blocked(
             connection,
             cycle_id=str(cycle["cycle_id"]),
             inspector=inspector,
+        )
+
+
+def test_guardian_finalize_accepts_exact_post_worker_group_cleanup(
+    ledger: hotjoin.ConversationLedger,
+) -> None:
+    registered = _arm_initial_guardian(
+        ledger, wall_epoch=1_000.0, monotonic_epoch=2_000.0
+    )
+    ack = registered["registration_ack"]
+    inspector = _GuardianInspector(boot_identity="boot-test-1", identities=[])
+    report = {
+        "registration_id": ack["registration_id"],
+        "request_sha256": ack["request_sha256"],
+        "state": "completed",
+        "reason": "paid_worker_returned_group_cleanup",
+        "forced": False,
+        "direct_returncode": 0,
+        "stopped_pgids": [10_101],
+        "killed_pgids": [10_101],
+        "already_empty_pgids": [],
+    }
+    terminal = ledger.finalize_guardian(
+        "run-1",
+        report=report,
+        report_sha256=hashlib.sha256(
+            hotjoin._canonical_json(report).encode("utf-8")
+        ).hexdigest(),
+        guardian_token="4" * 64,
+        inspector=inspector,
+        wall_epoch=1_001.0,
+        monotonic_epoch=2_001.0,
+    )
+    assert terminal["state"] == "completed"
+    cycle_id = registered["registration_ack"]["projection"].get("cycle_id")
+    with ledger._connect() as connection:
+        row = connection.execute(
+            "SELECT cycle_id FROM guardian_registrations WHERE registration_id = ?",
+            (ack["registration_id"],),
+        ).fetchone()
+        assert row is not None
+        cycle_id = str(row["cycle_id"])
+        assert ledger._guardian_terminal_clean_txn(
+            connection, cycle_id=cycle_id, inspector=inspector
+        )
+
+
+def test_nonzero_worker_cleanup_terminal_is_durable_but_never_clean(
+    ledger: hotjoin.ConversationLedger,
+) -> None:
+    registered = _arm_initial_guardian(
+        ledger, wall_epoch=1_000.0, monotonic_epoch=2_000.0
+    )
+    ack = registered["registration_ack"]
+    inspector = _GuardianInspector(boot_identity="boot-test-1", identities=[])
+    report = {
+        "registration_id": ack["registration_id"],
+        "request_sha256": ack["request_sha256"],
+        "state": "completed",
+        "reason": "paid_worker_returned_group_cleanup",
+        "forced": False,
+        "direct_returncode": 70,
+        "stopped_pgids": [10_101],
+        "killed_pgids": [10_101],
+        "already_empty_pgids": [],
+    }
+    terminal = ledger.finalize_guardian(
+        "run-1",
+        report=report,
+        report_sha256=hashlib.sha256(
+            hotjoin._canonical_json(report).encode("utf-8")
+        ).hexdigest(),
+        guardian_token="4" * 64,
+        inspector=inspector,
+        wall_epoch=1_001.0,
+        monotonic_epoch=2_001.0,
+    )
+    assert terminal["state"] == "completed"
+    with ledger._connect() as connection:
+        row = connection.execute(
+            "SELECT cycle_id FROM guardian_registrations WHERE registration_id = ?",
+            (ack["registration_id"],),
+        ).fetchone()
+        assert row is not None
+        assert not ledger._guardian_terminal_clean_txn(
+            connection,
+            cycle_id=str(row["cycle_id"]),
+            inspector=inspector,
+        )
+        cycle = connection.execute(
+            "SELECT state, allowed_action FROM cadence_cycles WHERE cycle_id = ?",
+            (row["cycle_id"],),
+        ).fetchone()
+        assert cycle is not None
+        assert (cycle["state"], cycle["allowed_action"]) == (
+            "operational_blocked",
+            "close_only",
+        )
+
+
+@pytest.mark.parametrize(
+    ("stopped", "killed", "empty"),
+    [
+        ([10_101, 30_303], [10_101, 30_303], []),
+        ([10_101, 30_303], [10_101], [30_303]),
+    ],
+)
+def test_completed_cleanup_partition_does_not_infer_signal_order_from_later_state(
+    stopped: list[int],
+    killed: list[int],
+    empty: list[int],
+) -> None:
+    report = {
+        "reason": "paid_worker_returned_group_cleanup",
+        "stopped_pgids": stopped,
+        "killed_pgids": killed,
+        "already_empty_pgids": empty,
+    }
+    assert hotjoin._guardian_completed_process_coverage_is_exact(
+        report,
+        registered_pgids={10_101, 30_303},
+        durably_empty_pgids=set(),
+        root_pgid=10_101,
+    )
+
+
+def test_guardian_finalize_rejects_watchdog_receipt_with_unknown_live_group(
+    ledger: hotjoin.ConversationLedger,
+) -> None:
+    registered = _arm_initial_guardian(
+        ledger, wall_epoch=1_000.0, monotonic_epoch=2_000.0
+    )
+    ack = registered["registration_ack"]
+    unknown = _GuardianIdentity(
+        pid=30_303,
+        uid=os.getuid(),
+        pgid=30_303,
+        start_marker="unknown-watchdog-group",
+    )
+    inspector = _GuardianInspector(
+        boot_identity="boot-test-1",
+        identities=[unknown],
+    )
+    report = {
+        "registration_id": ack["registration_id"],
+        "request_sha256": ack["request_sha256"],
+        "state": "watchdog_forced",
+        "reason": "absolute_hard_stop",
+        "forced": True,
+        "direct_returncode": None,
+        "stopped_pgids": [30_303],
+        "killed_pgids": [30_303],
+        "already_empty_pgids": [10_101],
+    }
+    with pytest.raises(
+        hotjoin.HotJoinError,
+        match="terminal process coverage is not exact",
+    ):
+        ledger.finalize_guardian(
+            "run-1",
+            report=report,
+            report_sha256=hashlib.sha256(
+                hotjoin._canonical_json(report).encode("utf-8")
+            ).hexdigest(),
+            guardian_token="4" * 64,
+            inspector=inspector,
+            wall_epoch=6_401.0,
+            monotonic_epoch=7_401.0,
+        )
+
+
+@pytest.mark.parametrize(
+    ("reason", "stopped", "killed", "empty"),
+    [
+        ("absolute_hard_stop", [10_101], [10_101], []),
+        ("hard_stop_due_before_release", [], [], [10_101]),
+    ],
+)
+def test_guardian_finalize_accepts_exact_watchdog_receipt_shapes(
+    ledger: hotjoin.ConversationLedger,
+    reason: str,
+    stopped: list[int],
+    killed: list[int],
+    empty: list[int],
+) -> None:
+    registered = _arm_initial_guardian(
+        ledger, wall_epoch=1_000.0, monotonic_epoch=2_000.0
+    )
+    ack = registered["registration_ack"]
+    inspector = _GuardianInspector(boot_identity="boot-test-1", identities=[])
+    report = {
+        "registration_id": ack["registration_id"],
+        "request_sha256": ack["request_sha256"],
+        "state": "watchdog_forced",
+        "reason": reason,
+        "forced": True,
+        "direct_returncode": None,
+        "stopped_pgids": stopped,
+        "killed_pgids": killed,
+        "already_empty_pgids": empty,
+    }
+    terminal = ledger.finalize_guardian(
+        "run-1",
+        report=report,
+        report_sha256=hashlib.sha256(
+            hotjoin._canonical_json(report).encode("utf-8")
+        ).hexdigest(),
+        guardian_token="4" * 64,
+        inspector=inspector,
+        wall_epoch=6_401.0,
+        monotonic_epoch=7_401.0,
+    )
+    assert terminal["state"] == "watchdog_forced"
+
+
+def test_watchdog_pre_release_shape_rejects_signals_or_direct_returncode() -> None:
+    for report in (
+        {
+            "reason": "hard_stop_due_before_release",
+            "direct_returncode": None,
+            "stopped_pgids": [10_101],
+            "killed_pgids": [10_101],
+            "already_empty_pgids": [],
+        },
+        {
+            "reason": "hard_stop_due_before_release",
+            "direct_returncode": 0,
+            "stopped_pgids": [],
+            "killed_pgids": [],
+            "already_empty_pgids": [10_101],
+        },
+    ):
+        assert not hotjoin._guardian_watchdog_process_coverage_is_exact(
+            report,
+            registered_pgids={10_101},
+            durably_empty_pgids=set(),
+        )
+
+
+@pytest.mark.parametrize(
+    ("reason", "stopped", "killed", "empty"),
+    [
+        ("arbitrary completed reason", [], [], [10_101]),
+        ("paid_group_empty", [10_101], [10_101], []),
+        ("paid_worker_returned_group_cleanup", [], [10_101], []),
+        ("paid_worker_returned_group_cleanup", [10_101], [], []),
+        ("paid_worker_returned_group_cleanup", [10_101], [20_202], [10_101]),
+        ("paid_worker_returned_group_cleanup", [10_101], [20_202], [10_101, 20_202]),
+        ("paid_worker_returned_group_cleanup", [20_202], [20_202], [10_101]),
+        ("paid_worker_returned_group_cleanup", [10_101], [10_101], [10_101]),
+    ],
+)
+def test_guardian_finalize_rejects_inexact_post_worker_cleanup_receipt(
+    ledger: hotjoin.ConversationLedger,
+    reason: str,
+    stopped: list[int],
+    killed: list[int],
+    empty: list[int],
+) -> None:
+    registered = _arm_initial_guardian(
+        ledger, wall_epoch=1_000.0, monotonic_epoch=2_000.0
+    )
+    ack = registered["registration_ack"]
+    inspector = _GuardianInspector(boot_identity="boot-test-1", identities=[])
+    report = {
+        "registration_id": ack["registration_id"],
+        "request_sha256": ack["request_sha256"],
+        "state": "completed",
+        "reason": reason,
+        "forced": False,
+        "direct_returncode": 0,
+        "stopped_pgids": stopped,
+        "killed_pgids": killed,
+        "already_empty_pgids": empty,
+    }
+    expected_error = (
+        ValueError
+        if set(killed) & set(empty)
+        else hotjoin.HotJoinError
+    )
+    with pytest.raises(expected_error):
+        ledger.finalize_guardian(
+            "run-1",
+            report=report,
+            report_sha256=hashlib.sha256(
+                hotjoin._canonical_json(report).encode("utf-8")
+            ).hexdigest(),
+            guardian_token="4" * 64,
+            inspector=inspector,
+            wall_epoch=1_001.0,
+            monotonic_epoch=2_001.0,
         )
 
 
@@ -16954,7 +17334,7 @@ You may use local read-only shell/Python for the `q=7` arithmetic. Do not use th
     private_adapter.write_text(private_source, encoding="utf-8")
     private_adapter_sha256 = hashlib.sha256(private_adapter.read_bytes()).hexdigest()
     assert private_adapter_sha256 == (
-        "676c4176f25fc640a619edfe58492f5c84d1c90d3856cebd8491d9912aa5e14a"
+        "6a9c7e6a9df5c3f873ed95100808b6723f4e1f5ba000516dd95ab61aacef1010"
     )
 
     monkeypatch.setattr(hotjoin, "__file__", str(private_adapter))

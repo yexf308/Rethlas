@@ -813,8 +813,55 @@ class StopReceipt:
     already_empty_pgids: tuple[int, ...]
 
 
+@dataclass(frozen=True, slots=True)
+class _TerminalCleanupOutcome:
+    receipt: StopReceipt
+    groups: tuple[PaidGroup, ...]
+    proven_empty: bool
+    failure_reason: str | None
+
+
 _POST_KILL_FIXED_POINT_MAX_ROUNDS = 256
 _POST_KILL_FIXED_POINT_TIMEOUT_SECONDS = 2.0
+_MAX_RESIDUAL_DIAGNOSTIC_IDENTITIES = 8
+_MAX_RESIDUAL_DIAGNOSTIC_MARKER_CHARS = 128
+
+
+def _residual_identity_diagnostic(
+    identities: Sequence[ProcessIdentity],
+) -> str:
+    """Return a deterministic, bounded description of observed identities."""
+
+    records = sorted(
+        (
+            {
+                "pid": item.pid,
+                "uid": item.uid,
+                "pgid": item.pgid,
+                "start_marker": item.start_marker,
+            }
+            for item in identities
+        ),
+        key=lambda item: (
+            item["pgid"],
+            item["pid"],
+            item["uid"],
+            item["start_marker"],
+        ),
+    )
+    sample = [
+        {
+            **record,
+            "start_marker": str(record["start_marker"])[
+                :_MAX_RESIDUAL_DIAGNOSTIC_MARKER_CHARS
+            ],
+        }
+        for record in records[:_MAX_RESIDUAL_DIAGNOSTIC_IDENTITIES]
+    ]
+    return (
+        f"count={len(records)},sha256={_sha256(records)},"
+        f"sample={_canonical_json(sample).decode('utf-8')}"
+    )
 
 
 def _registered_group_state(group: PaidGroup, inspector: ProcessInspector) -> str:
@@ -975,11 +1022,13 @@ def _require_auxiliary_groups_empty(
             auxiliary_state = _registered_group_state(group, inspector)
         except BaseException as inspect_error:
             raise ResidualDescendants(
-                "root rc observed while auxiliary group state was unavailable"
+                "root rc observed while auxiliary group state was unavailable: "
+                + _residual_identity_diagnostic((group.identity,))
             ) from inspect_error
         if auxiliary_state != "empty":
             raise ResidualDescendants(
-                "root rc observed while auxiliary paid groups were not empty"
+                "root rc observed while auxiliary paid groups were not empty: "
+                + _residual_identity_diagnostic((group.identity,))
             )
 
 
@@ -1648,7 +1697,10 @@ class BlockedProcessGroup:
         members = inspector.group_members(identity.pgid)
         residual = tuple(item for item in members if item.pid != self.leader_pid)
         if residual:
-            raise ResidualDescendants("direct rc observed with residual descendants")
+            raise ResidualDescendants(
+                "direct rc observed with residual descendants: "
+                + _residual_identity_diagnostic(residual)
+            )
         view = memoryview(_RETIRE_TOKEN)
         while view:
             written = os.write(self.retire_fd, view)
@@ -1976,6 +2028,8 @@ class Guardian:
         released = False
         direct_returncode: int | None = None
         terminal_report: FinalizeReport | None = None
+        terminal_cleanup: _TerminalCleanupOutcome | None = None
+        terminal_cleanup_started = False
         clock: GuardianClock | None = None
         try:
             identity = self.inspector.identity(child.leader_pid)
@@ -2029,6 +2083,127 @@ class Guardian:
                     registered_groups=registered_groups,
                     candidate_groups=candidate_groups,
                 )
+
+            def clean_released_topology() -> _TerminalCleanupOutcome:
+                """Immediately freeze, kill, and prove the exact paid topology empty."""
+
+                nonlocal terminal_cleanup, terminal_cleanup_started
+                if terminal_cleanup is not None:
+                    return terminal_cleanup
+                if terminal_cleanup_started:
+                    # This path is synchronous.  Re-entry would mean the first
+                    # terminal signal outcome was lost, so it must not emit a
+                    # second STOP/KILL sequence or claim a clean completion.
+                    return _TerminalCleanupOutcome(
+                        StopReceipt((), (), ()),
+                        tuple(registered_groups.values()),
+                        False,
+                        "terminal cleanup was re-entered after an unknown response",
+                    )
+                terminal_cleanup_started = True
+                failures: list[str] = []
+                durable_pgids = set(registered_groups)
+
+                def discover_stopped_descendants() -> tuple[PaidGroup, ...]:
+                    try:
+                        self._capture_escaped_groups(
+                            root_group=root_group,
+                            registered_groups=registered_groups,
+                            candidate_groups=candidate_groups,
+                        )
+                    except IdentityViolation as capture_error:
+                        # Capture retains every exact group found before an
+                        # ambiguity.  They still join the frozen kill set, but
+                        # the ambiguity prevents a completed terminal claim.
+                        failures.append(str(capture_error))
+                    discovered: list[PaidGroup] = []
+                    for pgid, candidate in candidate_groups.items():
+                        if pgid in proven_empty_pgids:
+                            failures.append(
+                                "terminal cleanup observed reuse of a historically "
+                                "empty PGID: "
+                                + _residual_identity_diagnostic((candidate.identity,))
+                            )
+                        existing = registered_groups.get(pgid)
+                        if (
+                            existing is not None
+                            and existing.identity != candidate.identity
+                        ):
+                            failures.append(
+                                "candidate conflicted with a registered process group"
+                            )
+                            continue
+                        if existing is None:
+                            registered_groups[pgid] = candidate
+                            discovered.append(candidate)
+                            failures.append(
+                                "terminal cleanup captured an unattested paid group: "
+                                + _residual_identity_diagnostic((candidate.identity,))
+                            )
+                    return tuple(discovered)
+
+                stop_failure: GroupStopFailure | None = None
+                try:
+                    receipt = stop_then_kill_groups(
+                        tuple(registered_groups.values()),
+                        inspector=self.inspector,
+                        signaler=self.signaler,
+                        reap=lambda item: (
+                            child.reap()
+                            if item.pid == child.leader_pid
+                            else (
+                                self.reap_group(item)
+                                if self.reap_group is not None
+                                else None
+                            )
+                        ),
+                        # The exact root and every known auxiliary are frozen
+                        # before this callback.  Each newly found setsid group
+                        # is STOPped before discovery repeats to a fixed point.
+                        discover_after_stop=discover_stopped_descendants,
+                    )
+                except GroupStopFailure as stop_error:
+                    stop_failure = stop_error
+                    receipt = stop_error.receipt
+                    failures.append(str(stop_error))
+                except BaseException as stop_error:
+                    receipt = StopReceipt((), (), ())
+                    failures.append(f"{type(stop_error).__name__}:{stop_error}")
+                groups = tuple(
+                    sorted(
+                        registered_groups.values(),
+                        key=lambda item: item.identity.pgid,
+                    )
+                )
+                empty = False
+                try:
+                    wait_for_groups_empty(groups, inspector=self.inspector)
+                    final_pgids = set(registered_groups)
+                    empty = (
+                        stop_failure is None
+                        and not failures
+                        and not candidate_groups
+                        and final_pgids == durable_pgids
+                        and set(receipt.stopped_pgids)
+                        <= (
+                            set(receipt.killed_pgids)
+                            | set(receipt.already_empty_pgids)
+                        )
+                        and durable_pgids
+                        == (
+                            set(receipt.killed_pgids)
+                            | set(receipt.already_empty_pgids)
+                        )
+                    )
+                except BaseException as empty_error:
+                    failures.append(f"{type(empty_error).__name__}:{empty_error}")
+                terminal_cleanup = _TerminalCleanupOutcome(
+                    receipt,
+                    groups,
+                    empty,
+                    ";".join(dict.fromkeys(failures)) if failures else None,
+                )
+                return terminal_cleanup
 
             if clock.hard_stop_due():
                 child.close_without_release()
@@ -2278,31 +2453,84 @@ class Guardian:
                     candidate_first_missing_poll.pop(pgid, None)
                 direct_returncode = child.worker_returncode
                 if direct_returncode is not None:
-                    if candidate_groups:
-                        raise ResidualDescendants(
-                            "root rc observed with unattested paid candidates"
+                    if clock.hard_stop_due():
+                        raise _HardStopDue(
+                            "absolute hard stop before direct-return empty proof"
                         )
-                    _require_auxiliary_groups_empty(
-                        tuple(registered_groups.values()),
-                        root_pgid=root_group.identity.pgid,
-                        inspector=self.inspector,
-                    )
-                    child.retire_after_empty(self.inspector)
-                    if child.reap() is None:
-                        raise IdentityViolation(
-                            "stable leader did not reap after retirement"
+                    cleanup_trigger: ResidualDescendants | None = None
+                    try:
+                        if candidate_groups:
+                            raise ResidualDescendants(
+                                "root rc observed with unattested paid candidates: "
+                                + _residual_identity_diagnostic(
+                                    tuple(
+                                        item.identity
+                                        for item in candidate_groups.values()
+                                    )
+                                )
+                            )
+                        _require_auxiliary_groups_empty(
+                            tuple(registered_groups.values()),
+                            root_pgid=root_group.identity.pgid,
+                            inspector=self.inspector,
                         )
-                    terminal_report = FinalizeReport(
-                        registration_id,
-                        request_sha256,
-                        "completed",
-                        "paid_group_empty",
-                        False,
-                        direct_returncode,
-                        (),
-                        (),
-                        tuple(sorted(proven_empty_pgids | set(registered_groups))),
-                    )
+                        child.retire_after_empty(self.inspector)
+                    except ResidualDescendants as residual_error:
+                        cleanup_trigger = residual_error
+                    if cleanup_trigger is None:
+                        if child.reap() is None:
+                            raise IdentityViolation(
+                                "stable leader did not reap after retirement"
+                            )
+                        if clock.hard_stop_due():
+                            raise _HardStopDue(
+                                "absolute hard stop before natural empty proof"
+                            )
+                        terminal_report = FinalizeReport(
+                            registration_id,
+                            request_sha256,
+                            "completed",
+                            "paid_group_empty",
+                            False,
+                            direct_returncode,
+                            (),
+                            (),
+                            tuple(
+                                sorted(proven_empty_pgids | set(registered_groups))
+                            ),
+                        )
+                    else:
+                        cleanup = clean_released_topology()
+                        if not cleanup.proven_empty:
+                            raise ResidualDescendants(
+                                str(cleanup_trigger)
+                                + ";terminal cleanup failed:"
+                                + str(cleanup.failure_reason or "empty proof unavailable")
+                            )
+                        if clock.hard_stop_due():
+                            raise _HardStopDue(
+                                "absolute hard stop before terminal cleanup empty proof"
+                            )
+                        killed = set(cleanup.receipt.killed_pgids)
+                        terminal_report = FinalizeReport(
+                            registration_id,
+                            request_sha256,
+                            "completed",
+                            "paid_worker_returned_group_cleanup",
+                            False,
+                            direct_returncode,
+                            cleanup.receipt.stopped_pgids,
+                            cleanup.receipt.killed_pgids,
+                            tuple(
+                                sorted(
+                                    (
+                                        proven_empty_pgids
+                                        | set(cleanup.receipt.already_empty_pgids)
+                                    )
+                                    - killed
+                                )
+                            ),
+                        )
                     self._call_with_one_exact_replay(
                         lambda: self.callbacks.finalize(terminal_report),
                         timeout=self.finalize_timeout,
@@ -2333,81 +2561,23 @@ class Guardian:
             groups_proven_empty = False
             cleanup_failure_reason: str | None = None
             if released and (registered_groups or candidate_groups):
-                capture_failures: list[str] = []
-
-                def discover_stopped_descendants() -> tuple[PaidGroup, ...]:
-                    try:
-                        self._capture_escaped_groups(
-                            root_group=root_group,
-                            registered_groups=registered_groups,
-                            candidate_groups=candidate_groups,
+                cleanup = clean_released_topology()
+                killed = set(cleanup.receipt.killed_pgids)
+                stop_receipt = StopReceipt(
+                    cleanup.receipt.stopped_pgids,
+                    cleanup.receipt.killed_pgids,
+                    tuple(
+                        sorted(
+                            (
+                                set(cleanup.receipt.already_empty_pgids)
+                                | proven_empty_pgids
+                            )
+                            - killed
                         )
-                    except IdentityViolation as capture_error:
-                        # Capture accumulates every exact group before raising
-                        # for an ambiguous one.  Return the exact subset so it
-                        # is STOPped even though finalization stays unknown.
-                        capture_failures.append(str(capture_error))
-                    discovered: list[PaidGroup] = []
-                    for pgid, candidate in candidate_groups.items():
-                        existing = registered_groups.get(pgid)
-                        if (
-                            existing is not None
-                            and existing.identity != candidate.identity
-                        ):
-                            capture_failures.append(
-                                "candidate conflicted with a registered process group"
-                            )
-                            continue
-                        if existing is None:
-                            registered_groups[pgid] = candidate
-                            discovered.append(candidate)
-                    return tuple(discovered)
-
-                stop_failure: GroupStopFailure | None = None
-                try:
-                    stop_receipt = stop_then_kill_groups(
-                        tuple(registered_groups.values()),
-                        inspector=self.inspector,
-                        signaler=self.signaler,
-                        reap=lambda item: (
-                            child.reap()
-                            if item.pid == child.leader_pid
-                            else (
-                                self.reap_group(item)
-                                if self.reap_group is not None
-                                else None
-                            )
-                        ),
-                        # The exact root/known groups are SIGSTOPped before
-                        # this first discovery call.  That closes the former
-                        # scan-to-STOP fork window for the trusted topology.
-                        discover_after_stop=discover_stopped_descendants,
-                    )
-                except GroupStopFailure as stop_error:
-                    stop_failure = stop_error
-                    stop_receipt = stop_error.receipt
-                    capture_failures.append(str(stop_error))
-                except BaseException as stop_error:
-                    # An identity mismatch prevents an unsafe signal to every
-                    # group; the external state is execution-unknown.
-                    stop_receipt = StopReceipt((), (), ())
-                    capture_failures.append(f"{type(stop_error).__name__}:{stop_error}")
-                groups_at_stop = tuple(registered_groups.values())
-                cleanup_failure_reason = (
-                    ";".join(dict.fromkeys(capture_failures))
-                    if capture_failures
-                    else None
+                    ),
                 )
-                try:
-                    wait_for_groups_empty(
-                        groups_at_stop,
-                        inspector=self.inspector,
-                    )
-                    groups_proven_empty = stop_failure is None
-                except BaseException:
-                    # Preserve the exact STOP/KILL/empty receipt even if a
-                    # zombie or ambiguous auxiliary cannot be proven reaped.
-                    pass
+                groups_proven_empty = cleanup.proven_empty
+                cleanup_failure_reason = cleanup.failure_reason
             crossed_hard_stop = False
             if clock is not None:
                 try:
@@ -2423,7 +2593,7 @@ class Guardian:
                     set(stop_receipt.killed_pgids)
                     | set(stop_receipt.already_empty_pgids)
                 )
-                == set(registered_groups)
+                == (set(registered_groups) | proven_empty_pgids)
                 and (isinstance(error, _HardStopDue) or crossed_hard_stop)
             )
             report = FinalizeReport(

@@ -712,6 +712,30 @@ def test_root_completion_rejects_absent_aux_leader_with_residual_group_member() 
         )
 
 
+def test_residual_identity_diagnostic_is_sorted_bounded_and_content_bound() -> None:
+    identities = tuple(
+        ProcessIdentity(
+            300 - index,
+            501,
+            200 + (index % 2),
+            f"marker-{index}-" + ("x" * 256),
+        )
+        for index in range(12)
+    )
+
+    forward = guardian_module._residual_identity_diagnostic(identities)  # noqa: SLF001
+    reverse = guardian_module._residual_identity_diagnostic(  # noqa: SLF001
+        tuple(reversed(identities))
+    )
+
+    assert forward == reverse
+    assert forward.startswith("count=12,sha256=")
+    assert forward.count('"pid":') == 8
+    assert "marker-11-" in forward
+    assert "marker-3-" not in forward
+    assert len(forward) < 2_500
+
+
 def test_discovery_happens_after_root_stop_and_before_any_kill() -> None:
     root = ProcessIdentity(101, 501, 101, "root-start")
     escaped = ProcessIdentity(202, 501, 202, "escaped-start")
@@ -1538,6 +1562,391 @@ def test_normal_rc_zero_requires_empty_group_and_durable_finalize() -> None:
         os.close(write_fd)
 
 
+def test_known_worker_rc_residual_uses_one_exact_terminal_cleanup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    uid = os.getuid()
+    root = ProcessIdentity(101, uid, 101, "root-start")
+    residual = ProcessIdentity(102, uid, 101, "helper-start")
+    inspector = FakeInspector([root, residual])
+    now_wall = time.time()
+    callbacks = RecordingCallbacks(
+        projection(
+            start=now_wall,
+            projected_wall=now_wall,
+            projected_monotonic=time.monotonic(),
+            boot=inspector.boot_identity(),
+        )
+    )
+
+    class FakeBlockedChild:
+        leader_pid = root.pid
+        command_sha256 = "b" * 64
+        released = False
+
+        @classmethod
+        def spawn(cls, *_args, **_kwargs):  # noqa: ANN002, ANN003
+            return cls()
+
+        def release(self) -> None:
+            self.released = True
+
+        @property
+        def worker_returncode(self) -> int:
+            return 0
+
+        def retire_after_empty(self, _inspector) -> int:  # noqa: ANN001
+            raise ResidualDescendants(
+                "direct rc observed with residual descendants: "
+                + guardian_module._residual_identity_diagnostic((residual,))  # noqa: SLF001
+            )
+
+        def reap(self, timeout: float = 2.0) -> int:  # noqa: ARG002
+            return 0
+
+        def leader_returncode(self) -> int | None:
+            return None
+
+        def close_without_release(self) -> None:
+            return None
+
+        def close(self) -> None:
+            return None
+
+    class RemovingSignaler(FakeSignaler):
+        def killpg(self, pgid: int, sig: int) -> None:
+            super().killpg(pgid, sig)
+            if sig == signal.SIGKILL:
+                for pid in tuple(inspector.identities):
+                    if inspector.identities[pid].pgid == pgid:
+                        del inspector.identities[pid]
+
+    monkeypatch.setattr(guardian_module, "BlockedProcessGroup", FakeBlockedChild)
+    signaler = RemovingSignaler()
+    read_fd, write_fd = os.pipe()
+    try:
+        report = Guardian(
+            callbacks,
+            inspector=inspector,
+            signaler=signaler,
+            poll_interval=0,
+        ).run([sys.executable, "-c", "pass"], **guardian_kwargs(read_fd))
+    finally:
+        os.close(read_fd)
+        os.close(write_fd)
+
+    assert report.state == "completed"
+    assert report.reason == "paid_worker_returned_group_cleanup"
+    assert report.direct_returncode == 0
+    assert report.forced is False
+    assert report.stopped_pgids == (root.pgid,)
+    assert report.killed_pgids == (root.pgid,)
+    assert report.already_empty_pgids == ()
+    assert signaler.calls == [
+        (root.pgid, signal.SIGSTOP),
+        (root.pgid, signal.SIGKILL),
+    ]
+    assert callbacks.finalized == [report]
+
+
+def test_worker_rc_terminal_cleanup_cannot_launder_unattested_candidate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    uid = os.getuid()
+    root = ProcessIdentity(101, uid, 101, "root-start")
+    candidate = ProcessIdentity(202, uid, 202, "late-setsid-start")
+
+    class CandidateInspector(FakeInspector):
+        def descendants(self, pid: int) -> tuple[ProcessIdentity, ...]:
+            return (candidate,) if pid == root.pid else ()
+
+    inspector = CandidateInspector([root, candidate])
+    now_wall = time.time()
+    callbacks = RecordingCallbacks(
+        projection(
+            start=now_wall,
+            projected_wall=now_wall,
+            projected_monotonic=time.monotonic(),
+            boot=inspector.boot_identity(),
+        )
+    )
+
+    class FakeBlockedChild:
+        leader_pid = root.pid
+        command_sha256 = "b" * 64
+
+        @classmethod
+        def spawn(cls, *_args, **_kwargs):  # noqa: ANN002, ANN003
+            return cls()
+
+        def release(self) -> None:
+            return None
+
+        @property
+        def worker_returncode(self) -> int:
+            return 0
+
+        def retire_after_empty(self, _inspector) -> int:  # noqa: ANN001
+            raise AssertionError("an unattested candidate must preclude retirement")
+
+        def reap(self, timeout: float = 2.0) -> int:  # noqa: ARG002
+            return 0
+
+        def leader_returncode(self) -> int | None:
+            return None
+
+        def close_without_release(self) -> None:
+            return None
+
+        def close(self) -> None:
+            return None
+
+    class RemovingSignaler(FakeSignaler):
+        def killpg(self, pgid: int, sig: int) -> None:
+            super().killpg(pgid, sig)
+            if sig == signal.SIGKILL:
+                for pid in tuple(inspector.identities):
+                    if inspector.identities[pid].pgid == pgid:
+                        del inspector.identities[pid]
+
+    monkeypatch.setattr(guardian_module, "BlockedProcessGroup", FakeBlockedChild)
+    signaler = RemovingSignaler()
+    read_fd, write_fd = os.pipe()
+    try:
+        report = Guardian(
+            callbacks,
+            inspector=inspector,
+            signaler=signaler,
+            poll_interval=0,
+        ).run([sys.executable, "-c", "pass"], **guardian_kwargs(read_fd))
+    finally:
+        os.close(read_fd)
+        os.close(write_fd)
+
+    assert report.state == "execution_unknown"
+    assert "unattested paid candidates" in report.reason
+    assert "terminal cleanup captured an unattested paid group" in report.reason
+    assert report.stopped_pgids == (root.pgid, candidate.pgid)
+    assert report.killed_pgids == (root.pgid, candidate.pgid)
+    assert signaler.calls == [
+        (root.pgid, signal.SIGSTOP),
+        (candidate.pgid, signal.SIGSTOP),
+        (root.pgid, signal.SIGKILL),
+        (candidate.pgid, signal.SIGKILL),
+    ]
+    assert inspector.identities == {}
+
+
+def test_worker_rc_cleanup_crossing_t90_is_watchdog_and_not_resignalled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    uid = os.getuid()
+    root = ProcessIdentity(101, uid, 101, "root-start")
+    residual = ProcessIdentity(102, uid, 101, "helper-start")
+    inspector = FakeInspector([root, residual])
+    wall = MutableClock(1_000.0)
+    monotonic = MutableClock(50.0)
+    projected = projection(
+        start=1_000.0,
+        projected_wall=wall.value,
+        projected_monotonic=monotonic.value,
+        boot=inspector.boot_identity(),
+    )
+    callbacks = RecordingCallbacks(projected)
+
+    class FakeBlockedChild:
+        leader_pid = root.pid
+        command_sha256 = "b" * 64
+
+        @classmethod
+        def spawn(cls, *_args, **_kwargs):  # noqa: ANN002, ANN003
+            return cls()
+
+        def release(self) -> None:
+            return None
+
+        @property
+        def worker_returncode(self) -> int:
+            return 0
+
+        def retire_after_empty(self, _inspector) -> int:  # noqa: ANN001
+            raise ResidualDescendants("known helper remained")
+
+        def reap(self, timeout: float = 2.0) -> int:  # noqa: ARG002
+            return 0
+
+        def leader_returncode(self) -> int | None:
+            return None
+
+        def close_without_release(self) -> None:
+            return None
+
+        def close(self) -> None:
+            return None
+
+    class DeadlineSignaler(FakeSignaler):
+        def killpg(self, pgid: int, sig: int) -> None:
+            super().killpg(pgid, sig)
+            if sig == signal.SIGKILL:
+                inspector.identities.clear()
+                wall.value = projected.hard_stop_wall_epoch
+                monotonic.value = projected.hard_stop_monotonic
+
+    monkeypatch.setattr(guardian_module, "BlockedProcessGroup", FakeBlockedChild)
+    signaler = DeadlineSignaler()
+    read_fd, write_fd = os.pipe()
+    try:
+        report = Guardian(
+            callbacks,
+            inspector=inspector,
+            signaler=signaler,
+            wall_clock=wall,
+            monotonic_clock=monotonic,
+            poll_interval=0,
+        ).run([sys.executable, "-c", "pass"], **guardian_kwargs(read_fd))
+    finally:
+        os.close(read_fd)
+        os.close(write_fd)
+
+    assert report.state == "watchdog_forced"
+    assert report.reason == "absolute_hard_stop"
+    assert report.direct_returncode == 0
+    assert signaler.calls == [
+        (root.pgid, signal.SIGSTOP),
+        (root.pgid, signal.SIGKILL),
+    ]
+    assert callbacks.finalized == [report]
+
+
+def test_cleanup_finalize_response_unknown_never_repeats_stop_or_kill(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    uid = os.getuid()
+    root = ProcessIdentity(101, uid, 101, "root-start")
+    residual = ProcessIdentity(102, uid, 101, "helper-start")
+    inspector = FakeInspector([root, residual])
+    now_wall = time.time()
+
+    class LostFinalizeCallbacks(RecordingCallbacks):
+        def finalize(self, report) -> None:  # noqa: ANN001
+            self.finalized.append(report)
+            raise ConnectionError("finalize response lost")
+
+    callbacks = LostFinalizeCallbacks(
+        projection(
+            start=now_wall,
+            projected_wall=now_wall,
+            projected_monotonic=time.monotonic(),
+            boot=inspector.boot_identity(),
+        )
+    )
+
+    class FakeBlockedChild:
+        leader_pid = root.pid
+        command_sha256 = "b" * 64
+
+        @classmethod
+        def spawn(cls, *_args, **_kwargs):  # noqa: ANN002, ANN003
+            return cls()
+
+        def release(self) -> None:
+            return None
+
+        @property
+        def worker_returncode(self) -> int:
+            return 0
+
+        def retire_after_empty(self, _inspector) -> int:  # noqa: ANN001
+            raise ResidualDescendants("known helper remained")
+
+        def reap(self, timeout: float = 2.0) -> int:  # noqa: ARG002
+            return 0
+
+        def leader_returncode(self) -> int | None:
+            return None
+
+        def close_without_release(self) -> None:
+            return None
+
+        def close(self) -> None:
+            return None
+
+    class RemovingSignaler(FakeSignaler):
+        def killpg(self, pgid: int, sig: int) -> None:
+            super().killpg(pgid, sig)
+            if sig == signal.SIGKILL:
+                inspector.identities.clear()
+
+    monkeypatch.setattr(guardian_module, "BlockedProcessGroup", FakeBlockedChild)
+    signaler = RemovingSignaler()
+    read_fd, write_fd = os.pipe()
+    try:
+        report = Guardian(
+            callbacks,
+            inspector=inspector,
+            signaler=signaler,
+            poll_interval=0,
+        ).run([sys.executable, "-c", "pass"], **guardian_kwargs(read_fd))
+    finally:
+        os.close(read_fd)
+        os.close(write_fd)
+
+    assert report.state == "execution_unknown"
+    assert report.reason == "finalize_response_unknown:HostControlFailure"
+    assert signaler.calls == [
+        (root.pgid, signal.SIGSTOP),
+        (root.pgid, signal.SIGKILL),
+    ]
+    assert len(callbacks.finalized) == 2
+    assert callbacks.finalized[0] == callbacks.finalized[1]
+
+
+@pytest.mark.skipif(os.name != "posix", reason="requires POSIX process groups")
+def test_real_worker_rc_zero_lingering_helper_is_frozen_killed_and_completed(
+    tmp_path: Path,
+) -> None:
+    inspector = SystemProcessInspector()
+    now_wall = time.time()
+    callbacks = RecordingCallbacks(
+        projection(
+            start=now_wall,
+            projected_wall=now_wall,
+            projected_monotonic=time.monotonic(),
+            boot=inspector.boot_identity(),
+        )
+    )
+    helper_path = tmp_path / "lingering-helper.pid"
+    source = (
+        "import subprocess,sys; from pathlib import Path; "
+        "helper=subprocess.Popen([sys.executable,'-c','import time;time.sleep(30)']); "
+        f"Path({str(helper_path)!r}).write_text(str(helper.pid))"
+    )
+    signaler = RecordingOSSignaler()
+    read_fd, write_fd = os.pipe()
+    try:
+        report = Guardian(
+            callbacks,
+            inspector=inspector,
+            signaler=signaler,
+            poll_interval=0.005,
+        ).run([sys.executable, "-c", source], **guardian_kwargs(read_fd))
+        helper_pid = int(helper_path.read_text(encoding="ascii"))
+        assert report.state == "completed", report.reason
+        assert report.reason == "paid_worker_returned_group_cleanup"
+        assert report.direct_returncode == 0
+        assert report.stopped_pgids == report.killed_pgids
+        assert callbacks.request is not None
+        root_pgid = callbacks.request.root_group.identity.pgid
+        assert report.killed_pgids == (root_pgid,)
+        assert (root_pgid, signal.SIGSTOP) in signaler.calls
+        assert (root_pgid, signal.SIGKILL) in signaler.calls
+        assert inspector.identity(helper_pid) is None
+        assert inspector.group_members(root_pgid) == ()
+    finally:
+        os.close(read_fd)
+        os.close(write_fd)
+
+
 @pytest.mark.skipif(os.name != "posix", reason="requires POSIX process groups")
 def test_known_nonzero_worker_rc_is_still_an_exact_completed_terminal() -> None:
     now_wall = time.time()
@@ -1722,7 +2131,15 @@ def test_opaque_candidate_is_promoted_only_after_durable_snapshot_echo_and_exits
             live: list[PaidGroup] = []
             for pgid, group in tuple(self.persisted.items()):
                 current = inspector.identity(group.identity.pid)
-                members = inspector.group_members(pgid)
+                try:
+                    members = inspector.group_members(pgid)
+                except IdentityViolation:
+                    # Darwin can briefly keep an exited process group
+                    # addressable while native enumeration exposes no
+                    # identity.  The production host conservatively keeps
+                    # its durable row live across that observation.
+                    live.append(group)
+                    continue
                 if current == group.identity:
                     live.append(group)
                 elif current is None and not members:

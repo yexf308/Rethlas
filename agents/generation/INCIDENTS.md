@@ -365,3 +365,45 @@ an incident.
   paid authority, and usable by a later handoff consumer only after the host
   re-hashes the complete candidate. A model or shell cannot promote it to
   evidence.
+
+## 2026-08-12: clean worker return left a residual process-group member
+
+- **Classification:** terminal process-cleanup defect found by the fifth fresh
+  guardian soak; fixed by exact durable-topology cleanup semantics.
+- **Trigger:** run `guardian-soak-20260812-fresh-05` completed a real paid model
+  turn and its independent verifier accepted the resulting artifact. The
+  direct worker then returned `rc=0`, but the guardian's retirement check still
+  observed a member of the root paid process group.
+- **Observed effect:** the successful model and verifier work was preserved,
+  but a worker return code did not prove that its process group was empty. The
+  residual check raised `ResidualDescendants`; the guardian recorded
+  `execution_unknown`, the wrapper exited `70`, and cadence remained
+  `operational_blocked`. Later postmortem checks found all production process
+  identities absent, but the exact transient residual PID was not durably
+  recorded and is therefore not inferred.
+- **Remediation:** after a natural `rc=0`, an already-empty registered topology
+  still completes as `paid_group_empty` without signals. If any registered
+  durable group remains, the guardian immediately applies `SIGSTOP` and then
+  `SIGKILL` to the exact durable topology, discovers and revalidates identities
+  while frozen, and proves every represented group empty at a fixed point. It
+  never grants a passive grace period or sends `SIGCONT`. Only that complete,
+  exact receipt may close as
+  `paid_worker_returned_group_cleanup`; the worker itself still returned
+  naturally, so this terminal cleanup is not reported as a watchdog-forced
+  worker return.
+- **Fail-closed cases:** a newly observed candidate that lacks prior durable
+  attestation may be stopped and killed for safety, but it cannot be laundered
+  into successful coverage. A new or ambiguous identity, incomplete signal or
+  reap receipt, coverage mismatch, host revalidation failure, or arrival at
+  the hard deadline remains `execution_unknown` or `watchdog_forced` as the
+  deadline semantics require.
+- **Regression evidence:** tests cover same-group residual cleanup with a real
+  forked helper, exact stopped/killed/empty coverage, rejection of unattested
+  candidates, deadline crossing, idempotent terminal replay without duplicate
+  signaling, and host-side rejection of arbitrary cleanup reasons or partial
+  process coverage.
+- **OS threat boundary:** this guarantee is for the trusted ordinary runtime
+  tree on macOS. Without cgroups or an equivalent kernel containment primitive,
+  it does not claim to contain deliberately malicious code that escapes with
+  `setsid`; such an escape remains outside the release threat model and must
+  not be disguised as proof of exact process containment.
