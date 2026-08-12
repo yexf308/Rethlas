@@ -127,6 +127,552 @@ def test_offline_terminal_receipt_requires_success_proof_flags() -> None:
     )
 
 
+def _queued_guardian_event_stream(
+    *frames: bytes,
+    target_command_sha256: str = "a" * 64,
+    worker_mode: str = "opaque_guarded_command",
+) -> tuple[int, object]:
+    read_fd, write_fd = os.pipe()
+    os.set_blocking(read_fd, False)
+    try:
+        # Model the exact old race: the last select returned empty, then the
+        # daemon wrote its terminal frames and exited before poll() ran.
+        assert not guardian_launcher.select.select([read_fd], [], [], 0)[0]
+        payload = b"".join(frames)
+        assert os.write(write_fd, payload) == len(payload)
+    finally:
+        os.close(write_fd)
+    events = guardian_launcher._GuardianEventStream(  # noqa: SLF001
+        target_command_sha256=target_command_sha256,
+        worker_mode=worker_mode,
+    )
+    guardian_launcher._drain_guardian_events_after_exit(  # noqa: SLF001
+        read_fd, events
+    )
+    return read_fd, events
+
+
+def _event_projection() -> dict[str, object]:
+    return {
+        "cycle_started_wall_epoch": 1.0,
+        "cycle_started_monotonic": 2.0,
+        "internal_interrupt_wall_epoch": 5396.0,
+        "internal_interrupt_monotonic": 5397.0,
+        "hard_stop_wall_epoch": 5401.0,
+        "hard_stop_monotonic": 5402.0,
+        "projected_wall_epoch": 1.0,
+        "projected_monotonic": 2.0,
+        "boot_identity": "boot-event-projection",
+    }
+
+
+def test_post_exit_drain_consumes_registered_release_and_final_frames() -> None:
+    target_sha256 = "a" * 64
+    request_sha256 = "b" * 64
+    registration_id = "registration-queued"
+    registered = {
+        "event": "registered",
+        "registration_ack": {
+            "registration_id": registration_id,
+            "request_sha256": request_sha256,
+            "projection": _event_projection(),
+        },
+    }
+    release = {
+        "command_sha256": target_sha256,
+        "event": "worker_released",
+        "mode": "opaque_guarded_command",
+        "pgid": 43210,
+        "pid": 43210,
+    }
+    report = {
+        "registration_id": registration_id,
+        "request_sha256": request_sha256,
+        "state": "completed",
+        "direct_returncode": 0,
+    }
+    status = {
+        "registration_id": registration_id,
+        "request_sha256": request_sha256,
+    }
+    read_fd, events = _queued_guardian_event_stream(
+        *(
+            (_canonical(frame) + "\n").encode("utf-8")
+            for frame in (
+                registered,
+                release,
+                {"event": "final", "report": report},
+            )
+        ),
+        target_command_sha256=target_sha256,
+    )
+    try:
+        guardian_launcher._validate_terminal_event_stream(  # noqa: SLF001
+            events,
+            status,
+            report,
+            worker_mode="opaque_guarded_command",
+        )
+        assert events.eof is True
+        assert events.registered == registered
+        assert events.release_marker == release
+        assert events.final_report == report
+    finally:
+        os.close(read_fd)
+
+
+def test_post_exit_drain_does_not_lose_queued_daemon_error() -> None:
+    error = {
+        "event": "daemon_error",
+        "error_type": "InjectedDaemonFailure",
+        "error": "queued after the last select",
+    }
+    read_fd, events = _queued_guardian_event_stream(
+        (_canonical(error) + "\n").encode("utf-8"),
+        worker_mode="runner_control",
+    )
+    try:
+        with pytest.raises(
+            guardian_launcher.LauncherError,
+            match="reported an error after terminalization: InjectedDaemonFailure",
+        ):
+            guardian_launcher._validate_terminal_event_stream(  # noqa: SLF001
+                events,
+                {
+                    "registration_id": "registration-error",
+                    "request_sha256": "b" * 64,
+                },
+                {"state": "completed", "direct_returncode": 0},
+                worker_mode="runner_control",
+            )
+    finally:
+        os.close(read_fd)
+
+
+@pytest.mark.parametrize(
+    ("frames", "message"),
+    [
+        ([], "lacks its registration event"),
+        (
+            [{"event": "final", "report": {}}],
+            "final event preceded registration",
+        ),
+        (
+            [{"event": "registered", "registration_ack": {}}],
+            "registration event acknowledgement is malformed",
+        ),
+        (
+            [
+                {
+                    "event": "registered",
+                    "registration_ack": {
+                        "registration_id": "registration-event",
+                        "request_sha256": "b" * 64,
+                        "projection": _event_projection(),
+                    },
+                }
+            ],
+            "registration differs from durable status",
+        ),
+    ],
+)
+def test_terminal_event_stream_requires_exact_registered_binding(
+    frames: list[dict[str, object]], message: str
+) -> None:
+    read_fd, events = _queued_guardian_event_stream(
+        *((_canonical(frame) + "\n").encode("utf-8") for frame in frames),
+        worker_mode="runner_control",
+    )
+    status = {
+        "registration_id": "registration-status",
+        "request_sha256": "c" * 64,
+    }
+    report = {
+        **status,
+        "state": "completed",
+        "direct_returncode": 0,
+    }
+    try:
+        with pytest.raises(guardian_launcher.LauncherError, match=message):
+            guardian_launcher._validate_terminal_event_stream(  # noqa: SLF001
+                events,
+                status,
+                report,
+                worker_mode="runner_control",
+            )
+    finally:
+        os.close(read_fd)
+
+
+def test_terminal_event_stream_rejects_report_registration_mismatch() -> None:
+    registration_id = "registration-exact"
+    request_sha256 = "b" * 64
+    registered = {
+        "event": "registered",
+        "registration_ack": {
+            "registration_id": registration_id,
+            "request_sha256": request_sha256,
+            "projection": _event_projection(),
+        },
+    }
+    read_fd, events = _queued_guardian_event_stream(
+        (_canonical(registered) + "\n").encode("utf-8"),
+        worker_mode="runner_control",
+    )
+    status = {
+        "registration_id": registration_id,
+        "request_sha256": request_sha256,
+    }
+    try:
+        with pytest.raises(
+            guardian_launcher.LauncherError,
+            match="report differs from registration event",
+        ):
+            guardian_launcher._validate_terminal_event_stream(  # noqa: SLF001
+                events,
+                status,
+                {
+                    "registration_id": registration_id,
+                    "request_sha256": "c" * 64,
+                },
+                worker_mode="runner_control",
+            )
+    finally:
+        os.close(read_fd)
+
+
+@pytest.mark.parametrize(
+    "registration_ack",
+    [
+        {
+            "registration_id": "registration-shape",
+            "request_sha256": "b" * 64,
+            "projection": _event_projection(),
+            "extra": True,
+        },
+        {
+            "registration_id": "registration-shape",
+            "request_sha256": "b" * 64,
+                "projection": {
+                    **_event_projection(),
+                    "hard_stop_wall_epoch": "not-a-number",
+                },
+        },
+        {
+            "registration_id": "registration-shape",
+            "request_sha256": "b" * 64,
+            "projection": {
+                key: value
+                for key, value in _event_projection().items()
+                if key != "boot_identity"
+            },
+        },
+    ],
+)
+def test_terminal_event_stream_requires_exact_registration_ack_shape(
+    registration_ack: dict[str, object],
+) -> None:
+    read_fd, events = _queued_guardian_event_stream(
+        (
+            _canonical({"event": "registered", "registration_ack": registration_ack})
+            + "\n"
+        ).encode("utf-8"),
+        worker_mode="runner_control",
+    )
+    status = {
+        "registration_id": "registration-shape",
+        "request_sha256": "b" * 64,
+    }
+    report = {**status, "state": "completed", "direct_returncode": 0}
+    try:
+        with pytest.raises(
+            guardian_launcher.LauncherError,
+            match="registration event (acknowledgement|binding) is malformed",
+        ):
+            guardian_launcher._validate_terminal_event_stream(  # noqa: SLF001
+                events,
+                status,
+                report,
+                worker_mode="runner_control",
+                final_event_required=False,
+            )
+    finally:
+        os.close(read_fd)
+
+
+def test_normal_terminal_requires_final_but_owner_forced_tail_close_does_not() -> None:
+    registration_id = "registration-forced-tail"
+    request_sha256 = "b" * 64
+    registered = {
+        "event": "registered",
+        "registration_ack": {
+            "registration_id": registration_id,
+            "request_sha256": request_sha256,
+            "projection": _event_projection(),
+        },
+    }
+    read_fd, events = _queued_guardian_event_stream(
+        (_canonical(registered) + "\n").encode("utf-8"),
+        worker_mode="runner_control",
+    )
+    status = {
+        "registration_id": registration_id,
+        "request_sha256": request_sha256,
+    }
+    report = {**status, "state": "completed", "direct_returncode": 0}
+    try:
+        with pytest.raises(
+            guardian_launcher.LauncherError,
+            match="terminal guardian run lacks its final event",
+        ):
+            guardian_launcher._validate_terminal_event_stream(  # noqa: SLF001
+                events,
+                status,
+                report,
+                worker_mode="runner_control",
+            )
+        guardian_launcher._validate_terminal_event_stream(  # noqa: SLF001
+            events,
+            status,
+            report,
+            worker_mode="runner_control",
+            final_event_required=False,
+        )
+    finally:
+        os.close(read_fd)
+
+
+def test_post_exit_drain_rejects_partial_frame_at_eof() -> None:
+    registered = {"event": "registered", "registration_ack": {}}
+    read_fd, events = _queued_guardian_event_stream(
+        (_canonical(registered) + "\n").encode("utf-8"),
+        b'{"event":"final"',
+        worker_mode="runner_control",
+    )
+    try:
+        assert events.eof is True
+        assert events.registered == registered
+        with pytest.raises(
+            guardian_launcher.LauncherError,
+            match="event stream ended with a partial frame",
+        ):
+            events.require_clean_eof()
+    finally:
+        os.close(read_fd)
+
+
+def test_post_exit_drain_distinguishes_eagain_from_bounded_true_eof(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    read_fd, write_fd = os.pipe()
+    os.set_blocking(read_fd, False)
+    events = guardian_launcher._GuardianEventStream(  # noqa: SLF001
+        target_command_sha256="a" * 64,
+        worker_mode="runner_control",
+    )
+    try:
+        events.drain_available(read_fd)
+        assert events.eof is False
+        assert events.failure is None
+        monkeypatch.setattr(
+            guardian_launcher, "_DAEMON_EVENT_EOF_TIMEOUT_SECONDS", 0.0
+        )
+        guardian_launcher._drain_guardian_events_after_exit(  # noqa: SLF001
+            read_fd, events
+        )
+        assert events.eof is False
+        with pytest.raises(
+            guardian_launcher.LauncherError,
+            match="did not reach EOF after daemon exit",
+        ):
+            events.require_clean_eof()
+    finally:
+        os.close(write_fd)
+        os.close(read_fd)
+
+
+@pytest.mark.parametrize(
+    ("frames", "message"),
+    [
+        (
+            [
+                {"event": "registered", "registration_ack": {}},
+                {"event": "registered", "registration_ack": {}},
+            ],
+            "registration event replayed",
+        ),
+        (
+            [{"event": "worker_released"}],
+            "release was not strictly after registration",
+        ),
+        (
+            [{"event": "not-a-guardian-event"}],
+            "emitted an unknown event",
+        ),
+        (
+            [
+                {"event": "daemon_error", "error_type": "first"},
+                {"event": "daemon_error", "error_type": "second"},
+            ],
+            "terminal event replayed",
+        ),
+    ],
+)
+def test_guardian_event_stream_rejects_replay_order_and_unknown_events(
+    frames: list[dict[str, object]], message: str
+) -> None:
+    read_fd, events = _queued_guardian_event_stream(
+        *((_canonical(frame) + "\n").encode("utf-8") for frame in frames),
+        worker_mode="runner_control",
+    )
+    try:
+        with pytest.raises(guardian_launcher.LauncherError, match=message):
+            events.require_clean_eof()
+    finally:
+        os.close(read_fd)
+
+
+def test_durable_status_registration_is_authoritative_without_local_event() -> None:
+    assert guardian_launcher._status_has_durable_registration(  # noqa: SLF001
+        {"registration_id": "registration-authoritative"}
+    )
+    assert not guardian_launcher._status_has_durable_registration(  # noqa: SLF001
+        {"registration_id": None}
+    )
+    with pytest.raises(guardian_launcher.LauncherError):
+        guardian_launcher._status_has_durable_registration(  # noqa: SLF001
+            {"registration_id": 7}
+        )
+
+
+@pytest.mark.parametrize(
+    "failure_frame",
+    [
+        b'{"event":"final"',
+        (
+            _canonical(
+                {
+                    "event": "registered",
+                    "registration_ack": {
+                        "registration_id": "registration-offline",
+                        "request_sha256": "b" * 64,
+                        "projection": _event_projection(),
+                    },
+                }
+            )
+            + "\n"
+            + _canonical(
+                {
+                    "event": "registered",
+                    "registration_ack": {
+                        "registration_id": "registration-offline",
+                        "request_sha256": "b" * 64,
+                        "projection": _event_projection(),
+                    },
+                }
+            )
+            + "\n"
+        ).encode("utf-8"),
+    ],
+)
+def test_offline_cleanup_result_does_not_swallow_stream_failure(
+    failure_frame: bytes,
+) -> None:
+    read_fd, events = _queued_guardian_event_stream(
+        failure_frame,
+        worker_mode="runner_control",
+    )
+    status = {
+        "registration_id": "registration-offline",
+        "request_sha256": "b" * 64,
+    }
+    offline = {"registration_id": "registration-offline"}
+    cleanup_completed = False
+
+    def finish_cleanup() -> None:
+        nonlocal cleanup_completed
+        cleanup_completed = True
+
+    try:
+        finish_cleanup()
+        with pytest.raises(guardian_launcher.LauncherError):
+            guardian_launcher._validate_offline_event_stream(  # noqa: SLF001
+                events,
+                status,
+                offline,
+            )
+        assert cleanup_completed is True
+    finally:
+        os.close(read_fd)
+
+
+def test_hard_due_cleanup_waits_then_drains_queued_daemon_error() -> None:
+    registration_id = "registration-hard-due"
+    request_sha256 = "b" * 64
+    frames = [
+        {
+            "event": "registered",
+            "registration_ack": {
+                "registration_id": registration_id,
+                "request_sha256": request_sha256,
+                "projection": _event_projection(),
+            },
+        },
+        {
+            "event": "daemon_error",
+            "error_type": "HardDueCleanup",
+            "error": "queued during cleanup",
+        },
+    ]
+    read_fd, events = _queued_guardian_event_stream(
+        *((_canonical(frame) + "\n").encode("utf-8") for frame in frames),
+        worker_mode="runner_control",
+    )
+
+    class ExitedDaemon:
+        returncode = 70
+
+        def wait(self, *, timeout: float) -> int:
+            assert timeout > 0
+            return self.returncode
+
+    status = {"registration_id": registration_id, "request_sha256": request_sha256}
+    offline = {"registration_id": registration_id}
+    try:
+        assert guardian_launcher._finalize_offline_event_stream(  # noqa: SLF001
+            ExitedDaemon(),  # type: ignore[arg-type]
+            read_fd,
+            events,
+            status,
+            offline,
+            wait_for_daemon=True,
+        ) == 70
+        assert events.daemon_error == frames[1]
+    finally:
+        os.close(read_fd)
+
+
+def test_offline_terminal_receipt_must_match_durable_registration() -> None:
+    read_fd, events = _queued_guardian_event_stream(
+        worker_mode="runner_control",
+    )
+    try:
+        with pytest.raises(
+            guardian_launcher.LauncherError,
+            match="offline terminal receipt differs from durable registration",
+        ):
+            guardian_launcher._validate_offline_event_stream(  # noqa: SLF001
+                events,
+                {
+                    "registration_id": "registration-status",
+                    "request_sha256": "b" * 64,
+                },
+                {"registration_id": "registration-receipt"},
+            )
+    finally:
+        os.close(read_fd)
+
+
 def _policy_contract() -> tuple[dict[str, object], str, str]:
     review_material = {
         "policy_id": "rethlas_route_review_90m_v1",
@@ -473,6 +1019,7 @@ elif command == "guardian-finalize":
 elif command == "guardian-status":
     report = state.get("terminal_report")
     offline = state.get("offline_finalize")
+    registration = state.get("registration_ack")
     print(canonical({
         "disposition": (
             "execution_unknown"
@@ -485,6 +1032,16 @@ elif command == "guardian-status":
         ),
         "terminal_report": report,
         "offline_finalize": offline,
+        "registration_id": (
+            registration["registration_id"]
+            if isinstance(registration, dict)
+            else None
+        ),
+        "request_sha256": (
+            registration["request_sha256"]
+            if isinstance(registration, dict)
+            else None
+        ),
         "cycle_id": state["prepare"]["expected_cycle_id"],
         "clock_sha256": "8" * 64,
     }))

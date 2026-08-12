@@ -18,10 +18,12 @@ import argparse
 import fcntl
 import hashlib
 import json
+import math
 import os
 import re
 import secrets
 import select
+import signal
 import stat
 import subprocess
 import sys
@@ -111,6 +113,8 @@ _MAX_HOST_STDERR_BYTES = 64 * 1024
 _MAX_EVENT_BYTES = 512 * 1024
 _REGISTRATION_WINDOW_SECONDS = 25.0
 _OWNER_MONITOR_INTERVAL_SECONDS = 0.02
+_DAEMON_EVENT_EOF_TIMEOUT_SECONDS = 1.0
+_DURABLE_TERMINAL_EXIT_TIMEOUT_SECONDS = 1.0
 
 
 class LauncherError(RuntimeError):
@@ -601,6 +605,148 @@ def _strict_json(raw: bytes, *, label: str) -> Any:
         )
     except (UnicodeError, json.JSONDecodeError) as error:
         raise LauncherError(f"invalid {label}: {error}") from error
+
+
+class _GuardianEventStream:
+    """Incrementally validate the daemon's exact newline-delimited event stream."""
+
+    def __init__(self, *, target_command_sha256: str, worker_mode: str) -> None:
+        self.target_command_sha256 = target_command_sha256
+        self.worker_mode = worker_mode
+        self.buffer = bytearray()
+        self.registered: dict[str, Any] | None = None
+        self.release_marker: dict[str, Any] | None = None
+        self.final_report: dict[str, Any] | None = None
+        self.daemon_error: dict[str, Any] | None = None
+        self.eof = False
+        self.failure: LauncherError | None = None
+        self._terminal_event: str | None = None
+
+    def _fail(self, error: LauncherError | str) -> None:
+        if self.failure is None:
+            self.failure = (
+                error if isinstance(error, LauncherError) else LauncherError(error)
+            )
+
+    def _consume(self, raw: bytes) -> None:
+        try:
+            event = _strict_json(raw, label="guardian event")
+            if not isinstance(event, dict):
+                raise LauncherError("guardian event is not an object")
+            event_kind = event.get("event")
+            if event_kind == "registered":
+                if (
+                    self.registered is not None
+                    or self.release_marker is not None
+                    or self._terminal_event is not None
+                ):
+                    raise LauncherError("guardian registration event replayed")
+                self.registered = event
+            elif event_kind == "worker_released":
+                if (
+                    self.registered is None
+                    or self.release_marker is not None
+                    or self._terminal_event is not None
+                ):
+                    raise LauncherError(
+                        "worker release was not strictly after registration"
+                    )
+                if (
+                    event.get("command_sha256") != self.target_command_sha256
+                    or event.get("mode") != self.worker_mode
+                    or type(event.get("pid")) is not int
+                    or type(event.get("pgid")) is not int
+                    or event["pid"] <= 1
+                    or event["pgid"] <= 1
+                ):
+                    raise LauncherError("worker release marker is malformed")
+                self.release_marker = event
+            elif event_kind == "final":
+                if self.registered is None:
+                    raise LauncherError("guardian final event preceded registration")
+                if self._terminal_event is not None:
+                    raise LauncherError("guardian terminal event replayed")
+                report = event.get("report")
+                if not isinstance(report, dict):
+                    raise LauncherError("guardian final event is malformed")
+                self.final_report = report
+                self._terminal_event = event_kind
+            elif event_kind == "daemon_error":
+                if self._terminal_event is not None:
+                    raise LauncherError("guardian terminal event replayed")
+                self.daemon_error = event
+                self._terminal_event = event_kind
+            else:
+                raise LauncherError("guardian emitted an unknown event")
+        except LauncherError as error:
+            self._fail(error)
+
+    def drain_available(self, descriptor: int) -> None:
+        """Drain every currently available byte and distinguish EAGAIN from EOF."""
+
+        if self.eof:
+            return
+        while True:
+            try:
+                chunk = os.read(descriptor, 65_536)
+            except BlockingIOError:
+                return
+            if not chunk:
+                self.eof = True
+                if self.buffer and self.failure is None:
+                    self._fail(
+                        "guardian event stream ended with a partial frame"
+                    )
+                self.buffer.clear()
+                return
+            if self.failure is not None:
+                continue
+            self.buffer.extend(chunk)
+            while b"\n" in self.buffer:
+                raw, _, remainder = self.buffer.partition(b"\n")
+                self.buffer = bytearray(remainder)
+                if len(raw) + 1 > _MAX_EVENT_BYTES:
+                    self._fail("guardian event frame exceeded its byte bound")
+                    self.buffer.clear()
+                    break
+                self._consume(raw)
+                if self.failure is not None:
+                    self.buffer.clear()
+                    break
+            if len(self.buffer) > _MAX_EVENT_BYTES:
+                self._fail("guardian event frame exceeded its byte bound")
+                self.buffer.clear()
+
+    def require_clean_eof(self) -> None:
+        if self.failure is not None:
+            raise self.failure
+        if not self.eof:
+            raise LauncherError("guardian event stream did not reach EOF")
+
+
+def _drain_guardian_events_after_exit(
+    descriptor: int,
+    events: _GuardianEventStream,
+) -> None:
+    """Boundedly drain bytes queued before process exit through the true pipe EOF."""
+
+    deadline = time.monotonic() + _DAEMON_EVENT_EOF_TIMEOUT_SECONDS
+    while not events.eof:
+        events.drain_available(descriptor)
+        if events.eof:
+            return
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            events._fail("guardian event stream did not reach EOF after daemon exit")
+            return
+        readable, _, _ = select.select(
+            [descriptor],
+            [],
+            [],
+            min(_OWNER_MONITOR_INTERVAL_SECONDS, remaining),
+        )
+        if not readable:
+            continue
 
 
 class PinnedAdapterClient:
@@ -1579,6 +1725,141 @@ def _status_has_durable_terminal_report(status: Mapping[str, object]) -> bool:
     )
 
 
+def _status_has_durable_registration(status: Mapping[str, object]) -> bool:
+    registration_id = status.get("registration_id")
+    if registration_id is None:
+        return False
+    if not isinstance(registration_id, str) or not registration_id:
+        raise LauncherError("guardian status registration id is malformed")
+    return True
+
+
+def _event_registration_binding(
+    events: _GuardianEventStream,
+) -> tuple[str, str] | None:
+    registered = events.registered
+    if registered is None:
+        return None
+    acknowledgement = registered.get("registration_ack")
+    if (
+        not isinstance(acknowledgement, dict)
+        or set(acknowledgement)
+        != {"registration_id", "request_sha256", "projection"}
+    ):
+        raise LauncherError("guardian registration event acknowledgement is malformed")
+    registration_id = acknowledgement.get("registration_id")
+    request_sha256 = acknowledgement.get("request_sha256")
+    projection = acknowledgement.get("projection")
+    projection_keys = {
+        "cycle_started_wall_epoch",
+        "cycle_started_monotonic",
+        "internal_interrupt_wall_epoch",
+        "internal_interrupt_monotonic",
+        "hard_stop_wall_epoch",
+        "hard_stop_monotonic",
+        "projected_wall_epoch",
+        "projected_monotonic",
+        "boot_identity",
+    }
+    if (
+        not isinstance(registration_id, str)
+        or not registration_id
+        or SHA256_RE.fullmatch(str(request_sha256)) is None
+        or not isinstance(projection, dict)
+        or set(projection) != projection_keys
+        or not isinstance(projection.get("boot_identity"), str)
+        or not projection["boot_identity"]
+        or any(
+            type(projection.get(key)) not in {int, float}
+            or not math.isfinite(float(projection[key]))
+            for key in projection_keys - {"boot_identity"}
+        )
+    ):
+        raise LauncherError("guardian registration event binding is malformed")
+    return registration_id, str(request_sha256)
+
+
+def _validate_registration_status_binding(
+    events: _GuardianEventStream,
+    status: Mapping[str, object],
+    *,
+    required: bool,
+) -> None:
+    binding = _event_registration_binding(events)
+    if binding is None:
+        if required:
+            raise LauncherError("terminal guardian run lacks its registration event")
+        return
+    if (
+        status.get("registration_id") != binding[0]
+        or status.get("request_sha256") != binding[1]
+    ):
+        raise LauncherError("guardian event registration differs from durable status")
+
+
+def _wait_and_drain_guardian_after_cleanup(
+    daemon_process: subprocess.Popen[bytes],
+    descriptor: int,
+    events: _GuardianEventStream,
+) -> int:
+    """After offline cleanup kills/reaps the daemon, drain its final pipe bytes."""
+
+    try:
+        child_status = daemon_process.wait(
+            timeout=_DAEMON_EVENT_EOF_TIMEOUT_SECONDS
+        )
+    except subprocess.TimeoutExpired as error:
+        # Preserve any queued evidence before reporting that cleanup did not
+        # finish the exact child within the bounded observation window.
+        _drain_guardian_events_after_exit(descriptor, events)
+        raise LauncherError(
+            "guardian daemon did not terminate after offline cleanup"
+        ) from error
+    _drain_guardian_events_after_exit(descriptor, events)
+    events.require_clean_eof()
+    return child_status
+
+
+def _validate_offline_event_stream(
+    events: _GuardianEventStream,
+    status: Mapping[str, object],
+    offline: Mapping[str, object],
+) -> None:
+    events.require_clean_eof()
+    _validate_registration_status_binding(events, status, required=False)
+    durable_registration = status.get("registration_id")
+    if (
+        not isinstance(durable_registration, str)
+        or not durable_registration
+        or offline.get("registration_id") != durable_registration
+    ):
+        raise LauncherError("offline terminal receipt differs from durable registration")
+    if events.daemon_error is not None and events.registered is not None:
+        # A post-registration daemon error is valid evidence explaining why
+        # offline cleanup was needed; the cleanup receipt stays authoritative.
+        return
+
+
+def _finalize_offline_event_stream(
+    daemon_process: subprocess.Popen[bytes],
+    descriptor: int,
+    events: _GuardianEventStream,
+    status: Mapping[str, object],
+    offline: Mapping[str, object],
+    *,
+    wait_for_daemon: bool,
+) -> int | None:
+    """Validate pipe evidence only after the durable offline cleanup completes."""
+
+    child_status = (
+        _wait_and_drain_guardian_after_cleanup(daemon_process, descriptor, events)
+        if wait_for_daemon
+        else daemon_process.returncode
+    )
+    _validate_offline_event_stream(events, status, offline)
+    return child_status
+
+
 def _validated_offline_finalize_status(
     status: Mapping[str, object],
 ) -> dict[str, object] | None:
@@ -1648,6 +1929,38 @@ def _terminal_reports_reconcile(
     } == {
         key: value for key, value in durable_report.items() if key not in ignored
     }
+
+
+def _validate_terminal_event_stream(
+    events: _GuardianEventStream,
+    status: Mapping[str, object],
+    terminal_report: Mapping[str, object],
+    *,
+    worker_mode: str,
+    final_event_required: bool = True,
+) -> None:
+    events.require_clean_eof()
+    if events.daemon_error is not None:
+        raise LauncherError(
+            "guardian daemon reported an error after terminalization: "
+            + str(events.daemon_error.get("error_type"))
+        )
+    _validate_registration_status_binding(events, status, required=True)
+    binding = _event_registration_binding(events)
+    assert binding is not None
+    if (
+        terminal_report.get("registration_id") != binding[0]
+        or terminal_report.get("request_sha256") != binding[1]
+    ):
+        raise LauncherError("terminal guardian report differs from registration event")
+    if worker_mode == "opaque_guarded_command" and events.release_marker is None:
+        raise LauncherError("terminal guardian run lacks its post-release marker")
+    if final_event_required and events.final_report is None:
+        raise LauncherError("terminal guardian run lacks its final event")
+    if events.final_report is not None and not _terminal_reports_reconcile(
+        events.final_report, terminal_report
+    ):
+        raise LauncherError("daemon final event differs from durable host status")
 
 
 def _offline_stop(
@@ -2854,67 +3167,42 @@ def launch(
         guardian_token = ""
         runner_token = ""
         os.set_blocking(event_read, False)
-        buffer = bytearray()
-        registered: dict[str, Any] | None = None
-        release_marker: dict[str, Any] | None = None
-        final_report: dict[str, Any] | None = None
-        daemon_error: dict[str, Any] | None = None
+        events = _GuardianEventStream(
+            target_command_sha256=target_command_sha256,
+            worker_mode=configuration.worker_mode,
+        )
         child_status: int | None = None
+        durable_terminal_seen_at: float | None = None
         while True:
-            readable, _, _ = select.select(
-                [event_read], [], [], _OWNER_MONITOR_INTERVAL_SECONDS
-            )
+            readable = []
+            if not events.eof:
+                readable, _, _ = select.select(
+                    [event_read], [], [], _OWNER_MONITOR_INTERVAL_SECONDS
+                )
             if readable:
-                while True:
-                    try:
-                        chunk = os.read(event_read, 65_536)
-                    except BlockingIOError:
-                        break
-                    if not chunk:
-                        break
-                    buffer.extend(chunk)
-                    if len(buffer) > _MAX_EVENT_BYTES:
-                        raise LauncherError("guardian event stream exceeded its bound")
-                while b"\n" in buffer:
-                    raw, _, remainder = buffer.partition(b"\n")
-                    buffer = bytearray(remainder)
-                    event = _strict_json(raw, label="guardian event")
-                    if not isinstance(event, dict):
-                        raise LauncherError("guardian event is not an object")
-                    if event.get("event") == "registered":
-                        if registered is not None or release_marker is not None:
-                            raise LauncherError("guardian registration event replayed")
-                        registered = event
-                    elif event.get("event") == "worker_released":
-                        if registered is None or release_marker is not None:
-                            raise LauncherError(
-                                "worker release was not strictly after registration"
-                            )
-                        if (
-                            event.get("command_sha256") != target_command_sha256
-                            or event.get("mode") != configuration.worker_mode
-                            or type(event.get("pid")) is not int
-                            or type(event.get("pgid")) is not int
-                            or event["pid"] <= 1
-                            or event["pgid"] <= 1
-                        ):
-                            raise LauncherError("worker release marker is malformed")
-                        release_marker = event
-                    elif event.get("event") == "final":
-                        report = event.get("report")
-                        if not isinstance(report, dict):
-                            raise LauncherError("guardian final event is malformed")
-                        final_report = report
-                    elif event.get("event") == "daemon_error":
-                        daemon_error = event
-                    else:
-                        raise LauncherError("guardian emitted an unknown event")
+                events.drain_available(event_read)
             returncode = daemon_process.poll()
             if returncode is not None:
                 child_status = returncode
+                # poll() only reaps the daemon.  Bytes written between the
+                # preceding readiness check and this observation remain queued
+                # in the pipe and must be consumed through its real EOF.
+                _drain_guardian_events_after_exit(event_read, events)
                 break
-            if registered is not None:
-                projection = registered["registration_ack"]["projection"]
+            if events.eof:
+                try:
+                    child_status = daemon_process.wait(
+                        timeout=_DAEMON_EVENT_EOF_TIMEOUT_SECONDS
+                    )
+                except subprocess.TimeoutExpired as error:
+                    raise LauncherError(
+                        "guardian event stream reached EOF before daemon exit"
+                    ) from error
+                break
+            if events.failure is not None:
+                raise events.failure
+            if events.registered is not None:
+                projection = events.registered["registration_ack"]["projection"]
                 hard_due = bool(
                     time.time() >= float(projection["hard_stop_wall_epoch"])
                     or (
@@ -2924,7 +3212,87 @@ def launch(
                 )
                 if hard_due:
                     status = _status(host, configuration, owner_token)
-                    if not _status_has_durable_terminal_report(status):
+                    if _status_has_durable_terminal_report(status):
+                        if durable_terminal_seen_at is None:
+                            durable_terminal_seen_at = time.monotonic()
+                        elif (
+                            time.monotonic() - durable_terminal_seen_at
+                            >= _DURABLE_TERMINAL_EXIT_TIMEOUT_SECONDS
+                        ):
+                            offline_terminal = _validated_offline_finalize_status(
+                                status
+                            )
+                            # The durable terminal winner has already revoked
+                            # Guardian authority.  Stop the exact daemon group
+                            # if it remains stuck before emitting/closing its
+                            # terminal pipe.
+                            try:
+                                os.killpg(daemon_pid, signal.SIGKILL)
+                            except ProcessLookupError:
+                                pass
+                            child_status = _wait_and_drain_guardian_after_cleanup(
+                                daemon_process,
+                                event_read,
+                                events,
+                            )
+                            if offline_terminal is not None:
+                                _validate_offline_event_stream(
+                                    events, status, offline_terminal
+                                )
+                                return {
+                                    "schema_version": (
+                                        "rethlas_guardian_launcher_result_v1"
+                                    ),
+                                    "run_id": configuration.run_id,
+                                    "watchdog_id": configuration.watchdog_id,
+                                    "launch_manifest_sha256": canonical_sha256(
+                                        manifest
+                                    ),
+                                    "registration": events.registered,
+                                    "release_marker": events.release_marker,
+                                    "release_marker_sha256": (
+                                        canonical_sha256(events.release_marker)
+                                        if events.release_marker is not None
+                                        else None
+                                    ),
+                                    "report": None,
+                                    "offline_finalize": offline_terminal,
+                                    "daemon_wait_status": child_status,
+                                    "state": str(offline_terminal["state"]),
+                                }
+                            terminal_report = status.get("terminal_report")
+                            if not isinstance(terminal_report, dict):
+                                raise LauncherError(
+                                    "durable terminal status omitted its report"
+                                )
+                            _validate_terminal_event_stream(
+                                events,
+                                status,
+                                terminal_report,
+                                worker_mode=configuration.worker_mode,
+                                final_event_required=False,
+                            )
+                            return {
+                                "schema_version": (
+                                    "rethlas_guardian_launcher_result_v1"
+                                ),
+                                "run_id": configuration.run_id,
+                                "watchdog_id": configuration.watchdog_id,
+                                "launch_manifest_sha256": canonical_sha256(manifest),
+                                "registration": events.registered,
+                                "release_marker": events.release_marker,
+                                "release_marker_sha256": (
+                                    canonical_sha256(events.release_marker)
+                                    if events.release_marker is not None
+                                    else None
+                                ),
+                                "report": terminal_report,
+                                "offline_finalize": None,
+                                "daemon_wait_status": child_status,
+                                "state": str(terminal_report.get("state")),
+                            }
+                    else:
+                        durable_terminal_seen_at = None
                         offline = _offline_stop(
                             guardian,
                             host,
@@ -2940,27 +3308,38 @@ def launch(
                             raise LauncherError(
                                 "offline stop returned no durable receipt"
                             )
+                        child_status = _finalize_offline_event_stream(
+                            daemon_process,
+                            event_read,
+                            events,
+                            status,
+                            offline,
+                            wait_for_daemon=True,
+                        )
                         return {
                             "schema_version": "rethlas_guardian_launcher_result_v1",
                             "run_id": configuration.run_id,
                             "watchdog_id": configuration.watchdog_id,
                             "launch_manifest_sha256": canonical_sha256(manifest),
-                            "registration": registered,
-                            "release_marker": release_marker,
+                            "registration": events.registered,
+                            "release_marker": events.release_marker,
                             "release_marker_sha256": (
-                                canonical_sha256(release_marker)
-                                if release_marker is not None
+                                canonical_sha256(events.release_marker)
+                                if events.release_marker is not None
                                 else None
                             ),
                             "report": None,
                             "offline_finalize": offline,
+                            "daemon_wait_status": child_status,
                             "state": str(
                                 offline.get("state", "execution_unknown")
                             ),
                         }
         status = _status(host, configuration, owner_token)
         if not _status_has_durable_terminal_report(status):
-            if registered is None:
+            durable_registration = _status_has_durable_registration(status)
+            if not durable_registration and events.registered is None:
+                events.require_clean_eof()
                 raise LauncherError(
                     "guardian daemon exited before durable registration; zero release proven"
                 )
@@ -2977,16 +3356,24 @@ def launch(
             )
             if offline is None:
                 raise LauncherError("offline stop returned no durable receipt")
+            _finalize_offline_event_stream(
+                daemon_process,
+                event_read,
+                events,
+                status,
+                offline,
+                wait_for_daemon=False,
+            )
             return {
                 "schema_version": "rethlas_guardian_launcher_result_v1",
                 "run_id": configuration.run_id,
                 "watchdog_id": configuration.watchdog_id,
                 "launch_manifest_sha256": canonical_sha256(manifest),
-                "registration": registered,
-                "release_marker": release_marker,
+                "registration": events.registered,
+                "release_marker": events.release_marker,
                 "release_marker_sha256": (
-                    canonical_sha256(release_marker)
-                    if release_marker is not None
+                    canonical_sha256(events.release_marker)
+                    if events.release_marker is not None
                     else None
                 ),
                 "report": None,
@@ -2995,16 +3382,17 @@ def launch(
             }
         offline_terminal = _validated_offline_finalize_status(status)
         if offline_terminal is not None:
+            _validate_offline_event_stream(events, status, offline_terminal)
             return {
                 "schema_version": "rethlas_guardian_launcher_result_v1",
                 "run_id": configuration.run_id,
                 "watchdog_id": configuration.watchdog_id,
                 "launch_manifest_sha256": canonical_sha256(manifest),
-                "registration": registered,
-                "release_marker": release_marker,
+                "registration": events.registered,
+                "release_marker": events.release_marker,
                 "release_marker_sha256": (
-                    canonical_sha256(release_marker)
-                    if release_marker is not None
+                    canonical_sha256(events.release_marker)
+                    if events.release_marker is not None
                     else None
                 ),
                 "report": None,
@@ -3015,29 +3403,23 @@ def launch(
         terminal_report = status.get("terminal_report")
         if not isinstance(terminal_report, dict):
             raise LauncherError("terminal guardian status omitted its report")
-        if (
-            configuration.worker_mode == "opaque_guarded_command"
-            and release_marker is None
-        ):
-            raise LauncherError("terminal guardian run lacks its post-release marker")
-        if final_report is not None and not _terminal_reports_reconcile(
-            final_report, terminal_report
-        ):
-            raise LauncherError("daemon final event differs from durable host status")
-        if daemon_error is not None:
-            raise LauncherError(
-                "guardian daemon reported an error after terminalization: "
-                + str(daemon_error.get("error_type"))
-            )
+        _validate_terminal_event_stream(
+            events,
+            status,
+            terminal_report,
+            worker_mode=configuration.worker_mode,
+        )
         return {
             "schema_version": "rethlas_guardian_launcher_result_v1",
             "run_id": configuration.run_id,
             "watchdog_id": configuration.watchdog_id,
             "launch_manifest_sha256": canonical_sha256(manifest),
-            "registration": registered,
-            "release_marker": release_marker,
+            "registration": events.registered,
+            "release_marker": events.release_marker,
             "release_marker_sha256": (
-                canonical_sha256(release_marker) if release_marker is not None else None
+                canonical_sha256(events.release_marker)
+                if events.release_marker is not None
+                else None
             ),
             "report": terminal_report,
             "offline_finalize": None,

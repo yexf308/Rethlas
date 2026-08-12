@@ -176,14 +176,16 @@ def test_external_retrieval_requires_named_gap_and_two_query_budget() -> None:
 def test_checkpoint_recovery_requires_unknown_primary_and_identical_payload() -> None:
     _policy_value, agents = _policy()
     timeout_60s = (
-        "tool call failed for "
-        "`reasoning_checkpoint_primary/memory_append_batch`: "
-        "timed out awaiting tools/call after 60s"
+        "tool call error: tool call failed for "
+        "`reasoning_checkpoint_primary/memory_append_batch`\n\n"
+        "Caused by:\n"
+        "    timed out awaiting tools/call after 60s"
     )
     timeout_60000ms = (
-        "tool call failed for "
-        "`reasoning_checkpoint_primary/memory_append_batch`: "
-        "timed out awaiting tools/call after 60000ms"
+        "tool call error: tool call failed for "
+        "`reasoning_checkpoint_primary/memory_append_batch`\n\n"
+        "Caused by:\n"
+        "    timed out awaiting tools/call after 60000ms"
     )
     checkpoint_contract = agents.split(
         "Checkpoint batches use the two dedicated", 1
@@ -204,8 +206,20 @@ def test_checkpoint_recovery_requires_unknown_primary_and_identical_payload() ->
     assert checkpoint_contract.count(
         "memory_append_batch(\n      checkpointArgs\n    )"
     ) == 2
-    assert f'failure === "{timeout_60s}"' in checkpoint_contract
-    assert f'failure === "{timeout_60000ms}"' in checkpoint_contract
+    assert "const retryablePrimaryTimeout = (failure) =>" in checkpoint_contract
+    assert 'exactObject(failure, ["content", "isError"])' in checkpoint_contract
+    assert "failure.isError === true" in checkpoint_contract
+    assert "failure.content.length === 1" in checkpoint_contract
+    assert (
+        'exactObject(failure.content[0], ["type", "text"])'
+        in checkpoint_contract
+    )
+    assert 'failure.content[0].type === "text"' in checkpoint_contract
+    assert json.dumps(timeout_60s) in checkpoint_contract
+    assert json.dumps(timeout_60000ms) in checkpoint_contract
+    assert "if (!retryablePrimaryTimeout(failure)) throw failure;" in (
+        checkpoint_contract
+    )
     assert "failure.includes" not in checkpoint_contract
     assert "failure.match" not in checkpoint_contract
     assert "RegExp" not in checkpoint_contract
@@ -219,10 +233,12 @@ def test_checkpoint_recovery_requires_unknown_primary_and_identical_payload() ->
     assert 'publication.state !== "accepted"' in agents
     assert 'publication.publication_class !== "reasoning_checkpoint"' in agents
     assert "!sameJson(textBody, body)" in agents
-    assert "never make a\nthird call, poll the unknown primary" in agents
+    assert "never\nmake a third call, poll the unknown primary" in agents
     assert "long\n`reasoning_agent` server must never call" in agents
     assert "entire recovery\nallowlist" in checkpoint_contract
-    assert "Compare with `===` only" in checkpoint_contract
+    assert "Compare the two text values with `===` only" in checkpoint_contract
+    assert "never accept a primitive string" in checkpoint_contract
+    assert "`structuredContent`, `_meta`, substring" in checkpoint_contract
     assert "yields `Script running with cell ID`" in checkpoint_contract
     assert "use `functions.wait` on that exact same cell" in checkpoint_contract
     assert "bounded\nto at most 120 seconds" in checkpoint_contract
@@ -233,27 +249,225 @@ def test_checkpoint_recovery_requires_unknown_primary_and_identical_payload() ->
         checkpoint_contract
     )
 
-    def retryable(failure: object) -> bool:
-        return type(failure) is str and failure in (timeout_60s, timeout_60000ms)
 
-    class EqualityImpostor:
-        def __eq__(self, _other: object) -> bool:
-            return True
+def test_checkpoint_recovery_state_machine_executes_exact_envelope_only() -> None:
+    _policy_value, agents = _policy()
+    checkpoint_contract = agents.split(
+        "Checkpoint batches use the two dedicated", 1
+    )[1].split("## Phase-boundary routing", 1)[0]
+    program = checkpoint_contract.split("```javascript\n", 1)[1].split(
+        "\n```", 1
+    )[0]
+    checkpoint_line = "const checkpointArgs = Object.freeze({problem_id, items});"
+    classifier_and_machine = "const retryablePrimaryTimeout = " + program.split(
+        "const retryablePrimaryTimeout = ", 1
+    )[1].split("\ntext(JSON.stringify(receipt));", 1)[0]
+    state_machine = checkpoint_line + "\n" + classifier_and_machine
+    timeout_60s = (
+        "tool call error: tool call failed for "
+        "`reasoning_checkpoint_primary/memory_append_batch`\n\n"
+        "Caused by:\n"
+        "    timed out awaiting tools/call after 60s"
+    )
+    timeout_60000ms = timeout_60s.replace("after 60s", "after 60000ms")
+    harness = r'''
+const successReceipt = Object.freeze({status: "test-success"});
+const exactEnvelope = (message) => ({
+  content: [{type: "text", text: message}],
+  isError: true
+});
 
-    assert retryable(timeout_60s)
-    assert retryable(timeout_60000ms)
-    for semantic_or_unclassified in (
-        {"isError": True, "content": ["semantic rejection"]},
-        "validation failed",
-        "transport unknown",
-        "timed out awaiting tools/call after 60000ms",
-        "prefix " + timeout_60000ms,
-        timeout_60000ms + " suffix",
-        timeout_60000ms.replace("primary", "recovery"),
-        EqualityImpostor(),
-        None,
-    ):
-        assert not retryable(semantic_or_unclassified)
+async function runCase(primaryOutcome, recoveryOutcome = successReceipt) {
+  const problem_id = "frontiermath/chowla-cosine";
+  const items = Object.freeze([{channel: "proof_steps", record: {claim: "x"}}]);
+  const primaryArgs = [];
+  const recoveryArgs = [];
+  const tools = {
+    mcp__reasoning_checkpoint_primary__memory_append_batch: async (args) => {
+      primaryArgs.push(args);
+      return primaryOutcome;
+    },
+    mcp__reasoning_checkpoint_recovery__memory_append_batch: async (args) => {
+      recoveryArgs.push(args);
+      if (recoveryOutcome instanceof Error) throw recoveryOutcome;
+      return recoveryOutcome;
+    }
+  };
+  const checkedReceipt = (value) => {
+    if (
+      value !== null &&
+      typeof value === "object" &&
+      !Array.isArray(value) &&
+      value.isError === true
+    ) {
+      throw value;
+    }
+    if (value !== successReceipt) {
+      throw new TypeError("invalid durable checkpoint receipt");
+    }
+    return value;
+  };
+  let propagated = null;
+  try {
+STATE_MACHINE
+  } catch (failure) {
+    propagated = failure;
+  }
+  return {
+    primaryCalls: primaryArgs.length,
+    recoveryCalls: recoveryArgs.length,
+    sameIdentity:
+      primaryArgs.length === 1 &&
+      recoveryArgs.length === 1 &&
+      primaryArgs[0] === recoveryArgs[0],
+    frozen:
+      primaryArgs.length === 1 &&
+      Object.isFrozen(primaryArgs[0]),
+    propagated: propagated !== null
+  };
+}
+
+(async () => {
+  const failed = [];
+  for (const message of [timeout60, timeout60000]) {
+    const outcome = await runCase(exactEnvelope(message));
+    if (
+      outcome.primaryCalls !== 1 ||
+      outcome.recoveryCalls !== 1 ||
+      !outcome.sameIdentity ||
+      !outcome.frozen ||
+      outcome.propagated
+    ) {
+      failed.push("exact timeout envelope: " + JSON.stringify(outcome));
+    }
+  }
+
+  const semantic = "authorization rejected";
+  const rejected = [
+    timeout60,
+    "prefix " + timeout60,
+    timeout60 + " suffix",
+    undefined,
+    null,
+    false,
+    0,
+    [],
+    [exactEnvelope(timeout60)],
+    {},
+    {isError: true},
+    {content: [{type: "text", text: timeout60}]},
+    {content: null, isError: true},
+    {content: {type: "text", text: timeout60}, isError: true},
+    {content: [], isError: true},
+    {content: [null], isError: true},
+    {content: [timeout60], isError: true},
+    {content: [{type: "text", text: timeout60}], isError: false},
+    {content: [{type: "text", text: timeout60}], isError: "true"},
+    {content: [{text: timeout60}], isError: true},
+    {content: [{type: "text"}], isError: true},
+    {content: [{type: "text", text: 60}], isError: true},
+    {content: [{type: "text", text: semantic}], isError: true},
+    {content: [{type: "text", text: timeout60 + "x"}], isError: true},
+    {
+      content: [{
+        type: "text",
+        text: timeout60.replace("tool call error: ", "")
+      }],
+      isError: true
+    },
+    {
+      content: [{
+        type: "text",
+        text: timeout60.replace("\n\nCaused by:\n", ": ")
+      }],
+      isError: true
+    },
+    {
+      content: [{type: "text", text: timeout60.replace("\n\n", "\n")}],
+      isError: true
+    },
+    {
+      content: [{type: "text", text: timeout60.replace("    timed", " timed")}],
+      isError: true
+    },
+    {content: [{type: "text", text: timeout60}], isError: true, extra: 1},
+    {
+      content: [{type: "text", text: timeout60}],
+      isError: true,
+      structuredContent: null
+    },
+    {
+      content: [{type: "text", text: timeout60}],
+      isError: true,
+      _meta: {}
+    },
+    {content: [{type: "image", text: timeout60}], isError: true},
+    {content: [{type: "text", text: timeout60, extra: 1}], isError: true},
+    {
+      content: [
+        {type: "text", text: timeout60},
+        {type: "text", text: timeout60}
+      ],
+      isError: true
+    },
+    {
+      content: [{type: "text", text: timeout60.replace("primary", "recovery")}],
+      isError: true
+    }
+  ];
+  for (let index = 0; index < rejected.length; index += 1) {
+    const outcome = await runCase(rejected[index]);
+    if (outcome.recoveryCalls !== 0) {
+      failed.push("rejected case " + index + ": " + JSON.stringify(outcome));
+    }
+  }
+
+  const primarySuccess = await runCase(successReceipt);
+  if (
+    primarySuccess.primaryCalls !== 1 ||
+    primarySuccess.recoveryCalls !== 0 ||
+    primarySuccess.propagated
+  ) {
+    failed.push("primary success: " + JSON.stringify(primarySuccess));
+  }
+
+  const recoveryFailure = await runCase(
+    exactEnvelope(timeout60),
+    new Error("recovery failed")
+  );
+  if (
+    recoveryFailure.primaryCalls !== 1 ||
+    recoveryFailure.recoveryCalls !== 1 ||
+    !recoveryFailure.sameIdentity ||
+    !recoveryFailure.propagated
+  ) {
+    failed.push("recovery failure: " + JSON.stringify(recoveryFailure));
+  }
+
+  process.stdout.write(JSON.stringify({failed, rejectedCount: rejected.length}));
+})().catch((failure) => {
+  process.stderr.write(String(failure));
+  process.exitCode = 1;
+});
+'''
+    script = (
+        "const timeout60 = "
+        + json.dumps(timeout_60s)
+        + ";\nconst timeout60000 = "
+        + json.dumps(timeout_60000ms)
+        + ";\n"
+        + harness.replace("STATE_MACHINE", state_machine)
+    )
+    completed = subprocess.run(
+        [str(_node_binary())],
+        input=script,
+        text=True,
+        capture_output=True,
+        check=False,
+        timeout=5,
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert json.loads(completed.stdout) == {"failed": [], "rejectedCount": 35}
 
 
 def test_checkpoint_receipt_validator_executes_fail_closed_mutation_matrix() -> None:

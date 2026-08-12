@@ -488,3 +488,71 @@ an incident.
   trusted ordinary runtime tree. They do not expand the macOS guardian threat
   model and do not claim containment of deliberately malicious code that
   escapes with `setsid`.
+
+## 2026-08-12: checkpoint timeout envelope and daemon event tail were mishandled
+
+- **Classification:** two independent flow defects exposed by the eighth fresh
+  guardian soak: an exact checkpoint-recovery classifier mismatch and an owner
+  launcher terminal-event drain gap. The guardian's offline safety cleanup
+  still succeeded. No mathematical content from this run is recorded here.
+- **Trigger:** fresh single-wrapper run
+  `guardian-soak-20260812-fresh-08` used the three-role MCP topology on the
+  Chowla cosine problem with one wrapper iteration. The checkpoint primary
+  actually timed out, but Codex returned the failure as an MCP
+  `{content, isError}` envelope. The then-current recovery classifier accepted
+  only either of two primitive timeout strings, so it rejected the real
+  envelope and did not call the independent recovery role.
+- **Checkpoint and turn outcome:** the protected turn propagated that failure
+  and stopped at the pre-critic safety gate. It returned a clean app-server
+  `completed` terminal with no trusted checkpoint receipt and therefore no
+  official checkpoint, review, verification, or solution publication. The
+  clean turn terminal does not imply that the guardian terminal protocol also
+  completed.
+- **Guardian terminal outcome:** after the final durable poll reported all
+  dynamic paid groups terminal and only the stable root remained, the owner
+  launcher's `select` readiness check was followed by `daemon_process.poll()`.
+  The old loop broke as soon as `poll()` observed daemon exit and did not drain
+  bytes queued between those two observations through the event pipe's true
+  EOF. No durable guardian terminal report existed, so the launcher took the
+  registered offline-stop path. The iter artifact consequently recorded
+  `report=null`, `offline_finalize.state=watchdog_forced`, and wrapper exit
+  `70`.
+- **Attribution limit:** the missing tail could have contained a `final` frame,
+  a `daemon_error` frame, or malformed/partial terminal bytes. Neither that
+  frame nor the daemon wait status was retained in the run artifacts, so the
+  concrete daemon-side error is unknown and must not be inferred. The evidence
+  proves only the post-final-poll/pre-offline-stop failure window and the
+  launcher's failure to consume and validate the complete pipe tail.
+- **Safety result:** authoritative offline cleanup captured the durable
+  registration and exact paid topology, proved complete coverage and every
+  group empty, killed no process, and left no wrapper, verifier, guardian,
+  app-server, MCP group, escaped descendant, or verifier listener behind. Exit
+  `70` was therefore an operational fail-closed result, not a cleanup escape.
+- **Checkpoint remediation:** classify only either exact version-pinned MCP
+  timeout envelope: exactly the top-level keys `content` and `isError`,
+  `isError: true`, and exactly one `{type: "text", text: ...}` block whose text
+  is one of the two complete 60-second timeout spellings for
+  `reasoning_checkpoint_primary/memory_append_batch`. Permit at most one call
+  to the recovery role with the same frozen arguments. Primitive strings,
+  extra or missing fields, `_meta`, `structuredContent`, near matches, semantic
+  failures, and every other error remain non-retryable; a durable returned
+  receipt is still required before claiming checkpoint success.
+- **Launcher remediation:** parse the guardian event stream incrementally and,
+  after observing daemon exit, boundedly drain all available bytes through a
+  clean EOF before interpreting terminal state. Distinguish `EAGAIN` from EOF;
+  reject partial, oversized, replayed, out-of-order, or unknown frames. For
+  offline cleanup, the host's durable registration is authoritative even if
+  the local registration event was absent from the observed pipe; lack of a
+  local frame must not suppress cleanup of an already registered topology.
+- **Regression evidence:** checkpoint tests cover both exact timeout-envelope
+  spellings, one byte-identical recovery replay, rejection of the former
+  primitive strings and all inexact envelopes, no third call, and receipt-only
+  success. Launcher tests queue registration/release/final or `daemon_error`
+  frames after the last readiness observation, require clean EOF consumption,
+  distinguish bounded `EAGAIN`, reject a partial terminal frame and event
+  replay/order violations, and require durable host registration to authorize
+  offline cleanup when local event observation is incomplete.
+- **Outer observation cadence:** a read-only outer soak observer may sample as
+  infrequently as every five minutes to reduce observation noise. That cadence
+  has no control authority and does not replace, delay, or weaken the
+  guardian's internal safety polling, durable deadlines, or terminal cleanup.

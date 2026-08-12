@@ -668,6 +668,28 @@ const checkedReceipt = (receipt) => {
   }
   return body;
 };
+const retryablePrimaryTimeout = (failure) => {
+  const exactObject = (value, keys) =>
+    value !== null &&
+    typeof value === "object" &&
+    !Array.isArray(value) &&
+    Object.keys(value).length === keys.length &&
+    keys.every((key) => Object.prototype.hasOwnProperty.call(value, key));
+  return (
+    exactObject(failure, ["content", "isError"]) &&
+    failure.isError === true &&
+    Array.isArray(failure.content) &&
+    failure.content.length === 1 &&
+    exactObject(failure.content[0], ["type", "text"]) &&
+    failure.content[0].type === "text" &&
+    (
+      failure.content[0].text ===
+        "tool call error: tool call failed for `reasoning_checkpoint_primary/memory_append_batch`\n\nCaused by:\n    timed out awaiting tools/call after 60s" ||
+      failure.content[0].text ===
+        "tool call error: tool call failed for `reasoning_checkpoint_primary/memory_append_batch`\n\nCaused by:\n    timed out awaiting tools/call after 60000ms"
+    )
+  );
+};
 let receipt;
 try {
   receipt = checkedReceipt(
@@ -676,10 +698,7 @@ try {
     )
   );
 } catch (failure) {
-  const retryable =
-    failure === "tool call failed for `reasoning_checkpoint_primary/memory_append_batch`: timed out awaiting tools/call after 60s" ||
-    failure === "tool call failed for `reasoning_checkpoint_primary/memory_append_batch`: timed out awaiting tools/call after 60000ms";
-  if (!retryable) throw failure;
+  if (!retryablePrimaryTimeout(failure)) throw failure;
   receipt = checkedReceipt(
     await tools.mcp__reasoning_checkpoint_recovery__memory_append_batch(
       checkpointArgs
@@ -707,17 +726,23 @@ cross-schema fields, rejected/control-only publications, mismatched text and
 structured content, or any malformed binding fail closed and are not
 checkpoint success.
 
-Those two complete, version-pinned primitive strings are the entire recovery
-allowlist. Compare with `===` only: never use a substring, regular expression,
-prefix/suffix, error-name, generic timeout, or transport match. Every
-`isError: true` result and every semantic, validation, authorization,
-idempotency, object, generic, or unclassified failure propagates without
-recovery. After the one recovery call, propagate its failure: never make a
-third call, poll the unknown primary, load-balance, or start a second semantic
-attempt. A successful primary result also forbids recovery. The single frozen
-`checkpointArgs` identity guarantees byte-identical `problem_id` and
-`items` arguments across the one permitted replay. Do not claim that a
-fallback or checkpoint succeeded unless its durable receipt was returned.
+Those two complete, version-pinned error envelopes are the entire recovery
+allowlist. Each has exactly the two top-level keys `content` and `isError`,
+`isError: true`, and one exact `{type: "text", text: ...}` content block. Its
+text includes the complete `tool call error:` prefix, tool identity, blank
+line, `Caused by:` line, four-space indentation, and exact 60-second spelling.
+Compare the two text values with `===` only: never accept a primitive string,
+extra or missing envelope field, `structuredContent`, `_meta`, substring,
+regular expression, prefix/suffix, error-name, generic timeout, or transport
+match. Every other `isError: true` result and every semantic, validation,
+authorization, idempotency, generic, or unclassified failure propagates
+without recovery. After the one recovery call, propagate its failure: never
+make a third call, poll the unknown primary, load-balance, or start a second
+semantic attempt. A successful primary result also forbids recovery. The
+single frozen `checkpointArgs` identity guarantees byte-identical
+`problem_id` and `items` arguments across the one permitted replay. Do not
+claim that a fallback or checkpoint succeeded unless its durable receipt was
+returned.
 If the outer `functions.exec` invocation yields `Script running with cell ID`,
 use `functions.wait` on that exact same cell until it returns a result, bounded
 to at most 120 seconds. This is continuation of the one outer cell, not an MCP
