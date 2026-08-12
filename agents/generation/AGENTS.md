@@ -199,6 +199,37 @@ frontier-changing output together in that bounded checkpoint. Do not turn every
 algebraic rewrite, skill return, speculative sentence, tool result, or abandoned
 micro-idea into a memory record.
 
+Before every scheduled review boundary, the latest pre-due checkpoint for that
+review window must leave one and only one active route commitment in
+`branch_states`. The first such commitment is persisted before T+30m; after an
+official review and fresh-epoch handoff, persist the continued or host-switched
+route commitment before the next boundary. Its outer record is
+exactly
+`{"branch_id": route_id, "state": {"schema_version":
+"rethlas_active_route_commitment_v1", "route_id": route_id, "status":
+"active", "core_bridge": core_bridge, "obligations": obligations}}`. Keep
+`branch_id` and the inner `route_id` identical and stable. `obligations` is a
+nonempty, duplicate-free list of at most 16 concrete strings (each at most
+2,048 UTF-8 bytes). A route later superseded may be marked `inactive` with the
+same exact keys. At most one distinct fallback may use `status="fallback"` and
+adds a nonempty, duplicate-free `evidence_record_ids` list of at most 16 active
+mathematical records. The latest pre-boundary states must leave exactly one
+active route. Before that designation, at most two host-admitted proof children
+may explore predeclared scope-disjoint mechanisms; the root must predeclare
+both mechanisms' roles at spawn and may update the active/fallback commitment
+once by host CAS before the due instant using already returned evidence. At the
+boundary the host locks the final pre-due commitment, interrupts the root and
+children, obtains their terminal receipts, and only then constructs the critic
+snapshot. Any post-due attempt to designate or switch the reviewed route is
+rejected. The scheduled critic reviews only the active route, never two
+simultaneous official routes. If effective red causes the host to select the
+exact fallback, it becomes the single active route for the following work
+segment and later official review.
+Review-boundary APIs do not accept a model-supplied route id: the
+trusted host selects this durable active commitment and binds its route,
+bridge, obligations, record/batch/timestamp, and canonical commitment digest
+into the frontier manifest.
+
 After the first checkpoint, retrieve externally only for an explicit knowledge
 gap whose answer could change the active proof route. Use at most two targeted
 queries for that gap before returning to independent reasoning. Search volume,
@@ -214,6 +245,181 @@ When a complete candidate proof exists, enter the candidate fast lane: freeze
 new retrieval, decomposition plans, and sub-agent spawning; assemble the
 blueprint and invoke the verifier. Leave the fast lane only for a concrete
 verifier defect that requires mathematical repair.
+
+## Durable route-review cadence
+
+<!-- rethlas-durable-route-review-policy
+{
+  "review_policy_id": "rethlas_route_review_90m_v1",
+  "context_policy_id": "rethlas_context_guard_v1",
+  "requires_hotjoin_scheduler": true,
+  "review_due_seconds": [1800, 3600],
+  "review_deadline_seconds": [2100, 3900],
+  "close_notice_due_seconds": 5220,
+  "hard_stop_due_seconds": 5400,
+  "hard_stop_never_extends": true,
+  "critic_is_independent": true,
+  "review_is_not_fact_check": true,
+  "two_yellow_without_progress_is_red": true,
+  "context_handoff_max_utf8_bytes": 32768,
+  "compaction_counts_as_progress": false,
+  "new_paid_cycle_disposition": "continue_next_cycle",
+  "enforcement_scope": "runner_and_durable_hotjoin_scheduler_not_model_self_timing"
+}
+-->
+
+When the runner selects `rethlas_route_review_90m_v1`, the owner-side hot-join
+scheduler, not this prompt and not the model's estimate of elapsed time, owns
+the cycle clock. The cycle has one durable absolute `T0`; wrapper restarts,
+model turns, reviews, context handoffs, retries, and an early model return do
+not reset or extend it.
+
+The hash-bound host policy must first report the exact boolean
+`guardian_enforcement_ready=true`. False, missing, or malformed is an
+unreleased enforcement state: the runner starts no control mutation,
+reviewer, recovery, or root process. No prompt or environment value can
+override that gate.
+
+The first exception is an explicit owner-side non-fresh *diagnostic* on a
+distinct owner-only byte copy of a legacy SQLite ledger. It may read `status`
+and `cadence-control-state` through the content-attested adapter and report the
+existing thread plus a recovery/migration disposition. It must exit before
+`init`, capability binding, recovery, reviewer, or Codex discovery; it never
+sets `resume_admitted`, never creates a fresh thread, and never treats a
+diagnostic exit as proof or resume success. The source ledger's before/after
+digest must match. The separate explicit stale-reconcile mode may then use a
+fresh copy-scoped capability and one pinned non-model app-server solely for
+`initialize` plus the exact old `thread/read`. A terminal result quarantines
+the copy as `operational_blocked`; an in-progress result records only the
+guardian-interrupt intent. Neither result authorizes a paid turn or resume.
+Only a trusted host may later derive a bounded handoff candidate from the
+authenticated terminal receipt; the model cannot promote it to proof evidence
+or control authority.
+
+The stale-recovery bearer token remains only in the owner wrapper's memory. A
+wrapper crash strands only its disposable ledger copy: discard that copy and
+create a new pristine byte-identical copy. Never persist the raw token in the
+ledger or rotate a new token into the abandoned active capability.
+
+The fixed boundaries are:
+
+- `T0` through `T+30m`: free construction on the active route.
+- At `T+30m`: a fresh independent critic receives an immutable bounded
+  snapshot and performs a three-to-five-minute route review. After the
+  official review closes, rehydrate its bounded handoff in a fresh root thread
+  epoch; the cycle `T0` does not change.
+- `T+30m` through `T+60m`: continue after green, or work only on the one fatal
+  doubt named by yellow.
+- At `T+60m`: a second fresh independent critic reviews a new immutable
+  snapshot. Its official close likewise hands the final work segment to a
+  fresh root thread epoch without resetting the cycle clock.
+- At `T+87m`: close the phase, persist frontier-changing work, and prepare the
+  bounded handoff needed for any later cycle.
+- At `T+90m`: hard stop. Review latency, context maintenance, model claims,
+  verifier work, adapter recovery, and wrapper restart never move this
+  deadline.
+
+Each route review answers only these five questions: the route's load-bearing
+bridge; whether its premises really match the target; whether the preceding
+period materially reduced uncertainty; any known obstruction or
+counterexample risk; and one testable milestone for the next period. Its
+strict verdict is:
+
+- `green`: continue only toward the stated next milestone.
+- `yellow`: allow one bounded period only for the single specified fatal
+  doubt and its test.
+- `red`: freeze this route after preserving its valid conclusions. The host
+  may switch only to the exact pre-due fallback commitment with its bound
+  evidence; without one, the route remains frozen and no paid root
+  continuation is authorized.
+
+Two consecutive yellow reviews on the same route become an effective red when
+the second snapshot contains no critic-confirmed new lemma, counterexample
+exclusion, or material uncertainty reduction. The host derives that effective
+verdict from durable records; the root cannot reset the streak by renaming the
+same route or asserting progress. A red verdict freezes a mathematical route.
+It is not `waiting_owner_advisor_decision`, does not authorize an advisor
+request, and is not a legal generation yield. The existing evidence-backed
+advisor checkpoint plus `generation_yield` remains the only path to that owner
+wait state.
+With no exact pre-due fallback commitment, the host closes red as
+`route_frozen`. Treat that as a normal unsolved terminal: start no further paid
+work, preserve and report the frozen-route reason, and exit `1`. It is not an
+operational failure and wrapper restart cannot turn it into an owner/advisor
+wait.
+
+The critic is independent, ephemeral, read-only, and tool-free. Route review
+is not fact checking or full proof verification. A due review is driven by
+trusted host orchestration; it must never be emulated by starting an ordinary
+full-capability root turn with a restrictive prompt or MCP allowlist. Only
+when the critic marks a specific load-bearing claim may the ordinary verifier
+be asked the exact targeted question; do not fragment the main line into
+routine verification calls. A malformed, timed-out, or execution-unknown
+review is an operational block, never green and never permission to start
+another paid cycle.
+
+The scheduler may supply a durable cadence disposition and a bounded context
+handoff. Obey the allowed action in that disposition. If an ordinary model
+turn ends cleanly before a boundary, the host may authorize exactly one more
+turn in the same active cycle and same thread epoch; that authorization keeps
+the original absolute `T0` and cannot cross a review or hard-stop deadline.
+Once an official T+30m/T+60m review boundary is crossed, however, further root
+work requires the review's authenticated handoff and a fresh thread epoch. A
+closed 90-minute cycle can start another paid cycle only after the host has
+recorded `continue_next_cycle`, authenticated a handoff, and bound a strictly
+newer app-server thread epoch. That next cycle has its own durable
+pre-dispatch `T0` and absolute actions; it neither resets nor extends the
+immutable prior cycle. Never infer a missing disposition, treat
+stale-active state as live permission, or use a prompt saying "continue" to
+bypass the scheduler.
+`resume_active_cycle` and `terminal_observed_pending_finalization` authorize
+only fail-closed adapter recovery of an already dispatched operation; their
+`paid_turn_allowed` value remains false and they must never create a new
+`turn/start`.
+`review_boundary_recovery_required` is narrower still: it may only
+read, interrupt, and reap the exact pre-existing root/descendant turns. After
+their bound terminal receipts, `review_drive_required` can be consumed only by
+the owner-side, zero-root `review-drive` command and never by an ordinary root
+`run-generator`. The request is bound only to the authenticated boundary id;
+the host derives the cycle, review identity, terminal root, and closed
+descendant set. The driver executable and its exact ten-file dependency closure
+are content-attested before use. A completed review first projects
+the cycle's internal `post_review_handoff_required` action, and the same
+owner-host operation prepares and authenticates its bounded handoff before
+returning. Only then may status expose
+`continue_reviewed_cycle_fresh_epoch` with a pending strictly newer thread
+epoch. The adapter atomically consumes that exact handoff before `thread/start`
+and replaces the bootstrap text with its canonical rehydration prompt before
+`turn/start`; the original cycle `T0` and deadlines are unchanged. If handoff
+preparation is incomplete, top-level `post_review_handoff_required` remains
+paid-disabled.
+A finalized `hard_stopped` disposition is a normal unsolved terminal, not an
+operational block: do not recover it and do not start another paid cycle. An
+unfinalized or still-pending terminal is not permission to reason; only the
+host's exact recovery disposition may reconcile it, once, without resetting
+the cycle clock.
+
+### Context guard
+
+Under `rethlas_context_guard_v1`, occupancy is
+`last.inputTokens / modelContextWindow`; cached input is already part of that
+input count and must not be subtracted. The host applies the first threshold
+whose occupancy or remaining-headroom arm fires:
+
+- observe at 60% occupancy or 112,000 tokens of headroom;
+- require a durable checkpoint at 65% or 96,000 tokens of headroom;
+- require a fresh-thread handoff at 70% or 80,000 tokens of headroom;
+- emergency stop/handoff at 82% or 48,000 tokens of headroom.
+
+A context handoff is a content-addressed record of at most 32 KiB. It carries
+the authoritative statement/blueprint bindings, absolute phase deadlines,
+active route and bridge, last effective review and allowed action, new durable
+record ids, pending gates, obligations, and exactly one next action. It never
+contains a transcript or hidden reasoning. Automatic context compaction is a
+transport safeguard, not mathematical progress, a checkpoint, uncertainty
+reduction, or permission to continue. Once compaction is observed, persist the
+handoff and move to a brand-new thread epoch before the next mathematical
+action. Absolute review and hard-stop deadlines survive that move.
 
 ## Required Memory Policy
 
@@ -350,11 +556,35 @@ invokes the runner again.
 8. The final target `## statement` must reproduce the complete input statement.
 
 Relevant tools are `memory_init`, `memory_append_batch`, `memory_append`,
-`memory_search`, `branch_update`, `generation_yield`, `search_arxiv_theorems`,
-`advisor_report_get`, and `verify_blueprint_service`. The verifier is only for
-a complete whole-problem draft in `blueprint.md`; it reads the authoritative
-statement from `data/{problem_id}.md` and does not echo the blueprint into
-model context.
+`memory_search`, `branch_update`, `generation_yield`, `search_matlas_theorems`,
+`search_arxiv_theorems`,
+`advisor_report_get`, `review_frontier_status`, `route_review_prepare`,
+`route_review_wait`, `route_review_status`, `verify_review_claim`,
+`route_review_close`, `context_handoff_prepare`, `context_handoff_get`,
+`context_handoff_status`, `route_cycle_close`, and
+`verify_blueprint_service`. Invoke the review/handoff tools only for the exact
+durable scheduler cycle and bindings it announces; their control receipts do
+not become mathematical evidence. `context_handoff_prepare` must use the
+host-announced purpose (`context_guard`, `owner_yield`, or `cycle_close`). A
+legal owner yield first prepares the host-bound `owner_yield` handoff; the host
+admits `generation_yield` before its wait record is written and the runner
+closes that exact handoff after the terminal. Reviewer red alone cannot enter
+an owner wait. The whole-proof verifier is only for a complete draft in
+`blueprint.md`; it reads the authoritative statement from
+`data/{problem_id}.md` and does not echo the blueprint into model context.
+`search_matlas_theorems` searches the official Matlas corpus of published
+journals and books through `https://matlas.ai/api/search`.
+`search_arxiv_theorems` is a distinct legacy Danus/LeanSearch arXiv provider,
+not an alias or implicit fallback. Both return bounded external leads, not full
+articles/PDFs and not proof evidence. A provider retrieval failure must be
+recorded as operational; for the same named gap, at most one authorized
+web/arXiv fallback may be used without exceeding the existing two-query limit.
+For official Matlas results, preserve `candidate_id`, use a nonempty DOI as
+`paper_id` (otherwise title/authors/year plus a web-verification obligation),
+and use `entity_name` as `theorem_id`. Preserve `candidate_id` as the provider
+candidate ID; do not treat it as the bibliographic theorem number. Legacy
+results retain `arxiv_id` and `theorem_id`. Unread primary text always remains
+a lead.
 
 ## Output Contract
 

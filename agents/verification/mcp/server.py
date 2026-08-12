@@ -25,11 +25,83 @@ MEMORY_ROOT = REPO_ROOT / "memory"
 RESULTS_ROOT = REPO_ROOT / "results"
 SCHEMA_PATH = REPO_ROOT / "schemas" / "verification_output.schema.json"
 
-THEOREM_SEARCH_URL = "https://leansearch.net/thm/search"
+MATLAS_SEARCH_URL = "https://matlas.ai/api/search"
+LEGACY_ARXIV_THEOREM_URL = "https://leansearch.net/thm/search"
 THEOREM_SEARCH_TASK = (
     "Given a math statement, retrieve useful references, such as theorems, "
     "lemmas, and definitions, that are useful for solving the given problem."
 )
+MAX_EXTERNAL_QUERY_UTF8_BYTES = 8_192
+MAX_EXTERNAL_SUCCESS_UTF8_BYTES = 32_768
+MAX_EXTERNAL_RAW_RESPONSE_BYTES = 262_144
+
+
+class _ExternalResponseTooLarge(ValueError):
+    pass
+
+
+class _ExternalResponseCloseError(requests.RequestException):
+    pass
+
+
+def _normalize_external_query(query: Any) -> str:
+    if not isinstance(query, str):
+        raise ValueError("query must be a string")
+    normalized = query.strip()
+    if not normalized:
+        raise ValueError("query must be non-empty")
+    try:
+        encoded = normalized.encode("utf-8")
+    except UnicodeEncodeError as error:
+        raise ValueError("query must be valid UTF-8") from error
+    if len(encoded) > MAX_EXTERNAL_QUERY_UTF8_BYTES:
+        raise ValueError("query exceeds external retrieval byte limit")
+    return normalized
+
+
+def _validate_external_result_count(num_results: Any) -> int:
+    if (
+        isinstance(num_results, bool)
+        or not isinstance(num_results, int)
+        or not 1 <= num_results <= 200
+    ):
+        raise ValueError("num_results must be an integer between 1 and 200")
+    return num_results
+
+
+def _external_fields_are_utf8(item: Dict[str, str], fields: Iterable[str]) -> bool:
+    try:
+        for field in fields:
+            item[field].encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+    return True
+
+
+def _read_bounded_external_json(response: requests.Response) -> Any:
+    headers = getattr(response, "headers", {})
+    content_length = headers.get("Content-Length") if hasattr(headers, "get") else None
+    if isinstance(content_length, str) and content_length.isdigit():
+        if int(content_length) > MAX_EXTERNAL_RAW_RESPONSE_BYTES:
+            raise _ExternalResponseTooLarge
+
+    iter_content = getattr(response, "iter_content", None)
+    if not callable(iter_content):
+        return response.json()
+
+    chunks: List[bytes] = []
+    total = 0
+    for chunk in iter_content(chunk_size=16_384):
+        if not chunk:
+            continue
+        if not isinstance(chunk, bytes):
+            raise ValueError("external response chunk must be bytes")
+        total += len(chunk)
+        if total > MAX_EXTERNAL_RAW_RESPONSE_BYTES:
+            raise _ExternalResponseTooLarge
+        chunks.append(chunk)
+    return json.loads(b"".join(chunks))
+
 
 CHANNEL_FILES: Dict[str, str] = {
     "statement_checks": "statement_checks.jsonl",
@@ -92,48 +164,260 @@ def _iter_jsonl(path: Path) -> Iterable[Dict[str, Any]]:
                 yield payload
 
 
-def search_arxiv_theorems(
+def search_matlas_theorems(
     query: str,
     num_results: int = 10,
-    endpoint: str = THEOREM_SEARCH_URL,
+    endpoint: str = MATLAS_SEARCH_URL,
     timeout_seconds: int = 30,
 ) -> Dict[str, Any]:
-    if not query.strip():
-        raise ValueError("query must be non-empty")
-    if num_results <= 0:
-        raise ValueError("num_results must be > 0")
+    normalized_query = _normalize_external_query(query)
+    num_results = _validate_external_result_count(num_results)
 
+    # Matlas 0.1 accepts between 10 and 200 results. Preserve a smaller MCP
+    # request by querying for ten and truncating only the returned list.
+    upstream_count = max(10, num_results)
     payload = {
-        "query": query,
-        "task": THEOREM_SEARCH_TASK,
-        "num_results": num_results,
+        "query": normalized_query,
+        "num_results": upstream_count,
     }
-
-    response = requests.post(endpoint, json=payload, timeout=timeout_seconds)
-    response.raise_for_status()
-    data = response.json()
+    envelope: Dict[str, Any] = {
+        "schema_version": "rethlas_external_retrieval_v1",
+        "provider": "matlas_official_v0_1",
+        "provider_protocol": "matlas_openapi_0_1_0",
+        "endpoint": endpoint,
+        "query": normalized_query,
+        "requested_count": num_results,
+        "count": 0,
+        "results": [],
+        "scope": "published_mathematical_statements",
+        "mathematical_evidence_authority": False,
+        "fallback_used": False,
+    }
+    try:
+        response = requests.post(
+            endpoint,
+            json=payload,
+            headers={
+                "Accept": "application/json",
+                "Content-Type": "application/json",
+                "User-Agent": "rethlas/1.0",
+            },
+            timeout=timeout_seconds,
+            stream=True,
+        )
+        primary_error_pending = True
+        try:
+            response.raise_for_status()
+            data = _read_bounded_external_json(response)
+            primary_error_pending = False
+        finally:
+            close = getattr(response, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except Exception as error:
+                    if not primary_error_pending:
+                        raise _ExternalResponseCloseError from error
+    except _ExternalResponseTooLarge:
+        return {**envelope, "retrieval_status": "error", "error": "response_too_large"}
+    except _ExternalResponseCloseError:
+        return {
+            **envelope,
+            "retrieval_status": "error",
+            "error": "network response_close_failed",
+        }
+    except requests.HTTPError as error:
+        status = error.response.status_code if error.response is not None else "unknown"
+        return {
+            **envelope,
+            "retrieval_status": "error",
+            "error": f"http {status}",
+        }
+    except ValueError:
+        return {
+            **envelope,
+            "retrieval_status": "error",
+            "error": "invalid_json",
+        }
+    except requests.RequestException as error:
+        return {
+            **envelope,
+            "retrieval_status": "error",
+            "error": f"network {type(error).__name__}",
+        }
     if not isinstance(data, list):
-        raise ValueError("The theorem endpoint must return a JSON list")
+        return {
+            **envelope,
+            "retrieval_status": "error",
+            "error": f"invalid_response_type:{type(data).__name__}",
+        }
 
+    required_string_fields = (
+        "entity_name",
+        "doi",
+        "title",
+        "authors",
+        "journal",
+        "year",
+        "statement",
+        "candidate_id",
+    )
     normalized: List[Dict[str, str]] = []
-    for item in data:
+    for index, item in enumerate(data):
         if not isinstance(item, dict):
-            continue
+            return {
+                **envelope,
+                "retrieval_status": "error",
+                "error": f"invalid_result:{index}:not_object",
+            }
+        source_type = item.get("type")
+        if not isinstance(source_type, str) or source_type not in {"book", "paper"}:
+            return {
+                **envelope,
+                "retrieval_status": "error",
+                "error": f"invalid_result:{index}:type",
+            }
+        if any(
+            not isinstance(item.get(field), str) for field in required_string_fields
+        ):
+            return {
+                **envelope,
+                "retrieval_status": "error",
+                "error": f"invalid_result:{index}:fields",
+            }
+        if not _external_fields_are_utf8(item, required_string_fields):
+            return {
+                **envelope,
+                "retrieval_status": "error",
+                "error": f"invalid_result:{index}:encoding",
+            }
         normalized.append(
             {
-                "title": str(item.get("title", "")),
-                "theorem": str(item.get("theorem", "")),
-                "arxiv_id": str(item.get("arxiv_id", "")),
-                "theorem_id": str(item.get("theorem_id", "")),
+                "type": source_type,
+                **{field: item[field] for field in required_string_fields},
             }
         )
 
-    return {
-        "query": query,
+    normalized = normalized[:num_results]
+    result = {
+        **envelope,
         "count": len(normalized),
         "results": normalized,
-        "endpoint": endpoint,
+        "retrieval_status": "ok",
     }
+    if len(_canonical_json(result).encode("utf-8")) > MAX_EXTERNAL_SUCCESS_UTF8_BYTES:
+        return {**envelope, "retrieval_status": "error", "error": "response_too_large"}
+    return result
+
+
+def search_arxiv_theorems(
+    query: str,
+    num_results: int = 10,
+    endpoint: str = LEGACY_ARXIV_THEOREM_URL,
+    timeout_seconds: int = 30,
+) -> Dict[str, Any]:
+    """Query the historical arXiv theorem service without implicit fallback."""
+
+    normalized_query = _normalize_external_query(query)
+    num_results = _validate_external_result_count(num_results)
+
+    envelope: Dict[str, Any] = {
+        "schema_version": "rethlas_external_retrieval_v1",
+        "provider": "danus_legacy_arxiv_theorem_v1",
+        "provider_protocol": "danus_legacy_arxiv_theorem_search_v1",
+        "endpoint": endpoint,
+        "query": normalized_query,
+        "requested_count": num_results,
+        "count": 0,
+        "results": [],
+        "scope": "arxiv_theorem_snippets",
+        "mathematical_evidence_authority": False,
+        "fallback_used": False,
+    }
+    try:
+        response = requests.post(
+            endpoint,
+            json={
+                "query": normalized_query,
+                "task": THEOREM_SEARCH_TASK,
+                "num_results": num_results,
+            },
+            headers={
+                "Accept": "application/json",
+                "Content-Type": "application/json",
+                "User-Agent": "rethlas/1.0",
+            },
+            timeout=timeout_seconds,
+            stream=True,
+        )
+        primary_error_pending = True
+        try:
+            response.raise_for_status()
+            data = _read_bounded_external_json(response)
+            primary_error_pending = False
+        finally:
+            close = getattr(response, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except Exception as error:
+                    if not primary_error_pending:
+                        raise _ExternalResponseCloseError from error
+    except _ExternalResponseTooLarge:
+        return {**envelope, "retrieval_status": "error", "error": "response_too_large"}
+    except _ExternalResponseCloseError:
+        return {
+            **envelope,
+            "retrieval_status": "error",
+            "error": "network response_close_failed",
+        }
+    except requests.HTTPError as error:
+        status = error.response.status_code if error.response is not None else "unknown"
+        return {**envelope, "retrieval_status": "error", "error": f"http {status}"}
+    except ValueError:
+        return {**envelope, "retrieval_status": "error", "error": "invalid_json"}
+    except requests.RequestException as error:
+        return {
+            **envelope,
+            "retrieval_status": "error",
+            "error": f"network {type(error).__name__}",
+        }
+    if not isinstance(data, list):
+        return {
+            **envelope,
+            "retrieval_status": "error",
+            "error": f"invalid_response_type:{type(data).__name__}",
+        }
+
+    required_fields = ("title", "theorem", "arxiv_id", "theorem_id")
+    normalized: List[Dict[str, str]] = []
+    for index, item in enumerate(data):
+        if not isinstance(item, dict) or any(
+            not isinstance(item.get(field), str) for field in required_fields
+        ):
+            return {
+                **envelope,
+                "retrieval_status": "error",
+                "error": f"invalid_result:{index}",
+            }
+        if not _external_fields_are_utf8(item, required_fields):
+            return {
+                **envelope,
+                "retrieval_status": "error",
+                "error": f"invalid_result:{index}:encoding",
+            }
+        normalized.append({field: item[field] for field in required_fields})
+
+    normalized = normalized[:num_results]
+    result = {
+        **envelope,
+        "count": len(normalized),
+        "results": normalized,
+        "retrieval_status": "ok",
+    }
+    if len(_canonical_json(result).encode("utf-8")) > MAX_EXTERNAL_SUCCESS_UTF8_BYTES:
+        return {**envelope, "retrieval_status": "error", "error": "response_too_large"}
+    return result
 
 
 def memory_init(run_id: str, meta: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
@@ -238,7 +522,11 @@ def memory_query(
 
     if contains:
         needle = contains.lower()
-        items = [item for item in items if needle in json.dumps(item, ensure_ascii=False).lower()]
+        items = [
+            item
+            for item in items
+            if needle in json.dumps(item, ensure_ascii=False).lower()
+        ]
 
     if reverse:
         items = list(reversed(items))
@@ -320,7 +608,9 @@ def validate_verification_output(payload: Dict[str, Any]) -> Dict[str, Any]:
 
     if verdict == "correct":
         if has_any_finding:
-            errors.append("verdict='correct' is invalid when critical_errors or gaps are non-empty")
+            errors.append(
+                "verdict='correct' is invalid when critical_errors or gaps are non-empty"
+            )
         if repair_hints != "":
             errors.append("repair_hints must be empty when verdict='correct'")
     elif verdict == "wrong":
@@ -337,7 +627,9 @@ def validate_verification_output(payload: Dict[str, Any]) -> Dict[str, Any]:
 def write_verification_output(run_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
     validation = validate_verification_output(payload)
     if not validation["valid"]:
-        raise ValueError("verification output validation failed: " + "; ".join(validation["errors"]))
+        raise ValueError(
+            "verification output validation failed: " + "; ".join(validation["errors"])
+        )
 
     resolved_run_id = sanitize_run_id(run_id)
     output_dir = RESULTS_ROOT / resolved_run_id
@@ -371,16 +663,30 @@ def build_mcp_app() -> Optional[Any]:
 
     app = FastMCP("verification_agent")
 
+    @app.tool(name="search_matlas_theorems")
+    def _tool_search_matlas_theorems(
+        query: str, num_results: int = 10
+    ) -> Dict[str, Any]:
+        """Search official Matlas for published mathematical statements."""
+        return search_matlas_theorems(query=query, num_results=num_results)
+
     @app.tool(name="search_arxiv_theorems")
-    def _tool_search_arxiv_theorems(query: str, num_results: int = 10) -> Dict[str, Any]:
+    def _tool_search_arxiv_theorems(
+        query: str, num_results: int = 10
+    ) -> Dict[str, Any]:
+        """Search the separate legacy arXiv theorem service."""
         return search_arxiv_theorems(query=query, num_results=num_results)
 
     @app.tool(name="memory_init")
-    def _tool_memory_init(run_id: str, meta: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    def _tool_memory_init(
+        run_id: str, meta: Optional[Dict[str, Any]] = None
+    ) -> Dict[str, Any]:
         return memory_init(run_id=run_id, meta=meta)
 
     @app.tool(name="memory_append")
-    def _tool_memory_append(run_id: str, channel: str, record: Dict[str, Any]) -> Dict[str, Any]:
+    def _tool_memory_append(
+        run_id: str, channel: str, record: Dict[str, Any]
+    ) -> Dict[str, Any]:
         return memory_append(run_id=run_id, channel=channel, record=record)
 
     @app.tool(name="memory_query")

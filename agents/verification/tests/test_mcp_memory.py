@@ -98,6 +98,7 @@ def test_production_mcp_surface_has_no_verdict_validation_or_write_tools(
 
     assert app is not None
     assert set(app.tool_names) == {
+        "search_matlas_theorems",
         "search_arxiv_theorems",
         "memory_init",
         "memory_append",

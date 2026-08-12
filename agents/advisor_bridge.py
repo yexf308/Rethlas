@@ -2420,15 +2420,25 @@ class AdvisorLedger:
             from .hotjoin_adapter import (  # type: ignore[import-not-found]  # noqa: PLC0415
                 AdvisorDeliveryRejected,
                 ConversationLedger,
+                HotJoinError,
+                _acquire_database_lifecycle_guard,
+                _release_database_lifecycle_guard,
             )
         except ImportError:  # direct ``python agents/advisor_bridge.py`` execution
             from hotjoin_adapter import (  # type: ignore[no-redef]  # noqa: PLC0415
                 AdvisorDeliveryRejected,
                 ConversationLedger,
+                HotJoinError,
+                _acquire_database_lifecycle_guard,
+                _release_database_lifecycle_guard,
             )
 
-        hotjoin = ConversationLedger(hotjoin_db)
+        hotjoin_guard = None
         try:
+            hotjoin_guard = _acquire_database_lifecycle_guard(
+                hotjoin_db, exclusive=False
+            )
+            hotjoin = ConversationLedger(hotjoin_db)
             accepted = hotjoin.enqueue_advisor_notice(
                 str(row["run_id"]),
                 problem_id=str(row["problem_id"]),
@@ -2477,6 +2487,12 @@ class AdvisorLedger:
             raise AdvisorError(
                 "advisor report delivery was terminally rejected; later steer is forbidden"
             ) from exc
+        except HotJoinError as exc:
+            raise AdvisorError(
+                f"hot-join delivery is unavailable: {_redacted_reason(str(exc))}"
+            ) from exc
+        finally:
+            _release_database_lifecycle_guard(hotjoin_guard)
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             current = self._job(connection, request_id)

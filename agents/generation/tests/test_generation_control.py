@@ -32,7 +32,27 @@ def control_runtime(
     )
     monkeypatch.setenv("RETHLAS_EXPECTED_PROBLEM_ID", "example")
     monkeypatch.setenv("RETHLAS_EXPECTED_STATEMENT_SHA256", digest)
+    monkeypatch.setenv("RETHLAS_EXPECTED_HOTJOIN_RUN_ID", "run-1")
     monkeypatch.setenv("RETHLAS_GENERATION_CONTROL_TOKEN", INSTANCE_A)
+    monkeypatch.setattr(
+        server,
+        "_adapter_generation_yield_prepare",
+        lambda *, state, reason_sha256, evidence_record_ids: {
+            "schema_version": "rethlas_generation_yield_admission_v1",
+            "operation": "generation_yield_prepare",
+            "admission_id": "yieldadm_" + "1" * 32,
+            "run_id": "run-1",
+            "cycle_id": "cycle-1",
+            "handoff_id": "handoff_" + "2" * 64,
+            "content_sha256": "2" * 64,
+            "to_thread_epoch": 2,
+            "root_thread_id": "thread-1",
+            "root_turn_id": "turn-1",
+            "state": state,
+            "reason_sha256": reason_sha256,
+            "evidence_record_ids": list(evidence_record_ids),
+        },
+    )
     return digest, problem_path
 
 
@@ -95,6 +115,19 @@ def test_generation_control_instances_cannot_overwrite_each_other(
         "running"
     )
     assert len(list(server.GENERATION_CONTROL_ROOT.glob("*.json"))) == 2
+
+
+def test_generation_control_receipt_is_canonical_and_content_bound(
+    control_runtime: tuple[str, Path],
+) -> None:
+    receipt = server.generation_control_receipt("example", INSTANCE_A)
+    control = receipt["control"]
+    assert set(receipt) == {"schema_version", "control", "record_sha256"}
+    assert receipt["schema_version"] == "rethlas_generation_control_receipt_v1"
+    assert control["state"] == "running"
+    assert receipt["record_sha256"] == hashlib.sha256(
+        server.canonical_json_bytes(control)
+    ).hexdigest()
 
 
 def test_generation_yield_rejects_phantom_or_mismatched_evidence_without_record(
@@ -180,6 +213,62 @@ def test_generation_yield_requires_runner_bound_instance(
         server.generation_yield(
             "example", "waiting_cost_gate", "missing instance", evidence
         )
+
+
+def test_generation_yield_missing_owner_handoff_writes_nothing(
+    control_runtime: tuple[str, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    evidence = _wait_evidence("example", "waiting_cost_gate")
+    monkeypatch.setattr(
+        server,
+        "_adapter_generation_yield_prepare",
+        lambda **kwargs: (_ for _ in ()).throw(ValueError("owner_yield handoff missing")),
+    )
+    path = server._generation_control_path("example", INSTANCE_A)
+    with pytest.raises(ValueError, match="handoff missing"):
+        server.generation_yield(
+            "example", "waiting_cost_gate", "owner decision required", evidence
+        )
+    assert not path.exists()
+
+
+def test_generation_yield_post_replace_failure_replays_same_admission(
+    control_runtime: tuple[str, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    evidence = _wait_evidence("example", "waiting_cost_gate")
+    original_admit = server._adapter_generation_yield_prepare
+    admissions: list[dict[str, object]] = []
+
+    def record_admission(**kwargs):
+        admissions.append(dict(kwargs))
+        return original_admit(**kwargs)
+
+    monkeypatch.setattr(server, "_adapter_generation_yield_prepare", record_admission)
+    original_fsync = server.os.fsync
+    fsync_calls = 0
+
+    def fail_directory_fsync(descriptor: int) -> None:
+        nonlocal fsync_calls
+        fsync_calls += 1
+        if fsync_calls == 2:
+            raise OSError("injected yield directory fsync failure")
+        original_fsync(descriptor)
+
+    with monkeypatch.context() as scoped:
+        scoped.setattr(server.os, "fsync", fail_directory_fsync)
+        with pytest.raises(OSError, match="yield directory fsync failure"):
+            server.generation_yield(
+                "example", "waiting_cost_gate", "owner decision required", evidence
+            )
+
+    assert server.generation_control_status("example", INSTANCE_A)["state"] == (
+        "waiting_cost_gate"
+    )
+    retry = server.generation_yield(
+        "example", "waiting_cost_gate", "owner decision required", evidence
+    )
+    assert retry["state"] == "waiting_cost_gate"
+    assert admissions[0] == admissions[1]
 
 
 def test_generation_control_post_replace_fsync_failure_is_retry_safe(

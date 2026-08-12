@@ -8,6 +8,7 @@ import ipaddress
 import json
 import os
 import re
+import signal
 import shutil
 import stat
 import subprocess
@@ -17,7 +18,7 @@ import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Mapping
 
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse
@@ -46,6 +47,18 @@ CODEX_REASONING_EFFORT = os.getenv("CODEX_REASONING_EFFORT", "xhigh")
 VERIFICATION_FILENAME = "verification.json"
 _TOKEN_USAGE_RE = re.compile(r"tokens\s+used\s*\n?\s*([0-9][0-9,]*)", re.IGNORECASE)
 _MCP_RUNTIME_MODULES = ("fastmcp", "requests", "jsonschema")
+_TARGETED_TICKET_SCHEMA = "rethlas_targeted_claim_ticket_v2"
+_TARGETED_RECEIPT_SCHEMA = "rethlas_targeted_claim_verification_receipt_v1"
+_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+_REVIEW_ID_RE = re.compile(r"^review_[0-9a-f]{32}$")
+_TICKET_ID_RE = re.compile(r"^claim_[0-9a-f]{32}$")
+_ITEM_ID_RE = re.compile(r"^pi_[0-9a-f]{24}$")
+_PROCESS_GROUP_TERM_GRACE_SECONDS = 1.0
+_PROCESS_GROUP_KILL_GRACE_SECONDS = 2.0
+
+
+class VerifierExecutionUnknown(RuntimeError):
+    """The model may have run, but its trusted supervisor terminal was lost."""
 
 
 def _positive_env(name: str, default: int) -> int:
@@ -108,6 +121,7 @@ class VerifyRequest(BaseModel):
 
     statement: str = Field(..., min_length=1)
     proof: str = Field(..., min_length=1)
+    verification_deadline_utc: str
 
     @field_validator("statement", "proof")
     @classmethod
@@ -129,6 +143,27 @@ class VerifyRequest(BaseModel):
         if len(value) > VERIFY_MAX_PROOF_CHARS:
             raise ValueError("proof exceeds VERIFY_MAX_PROOF_CHARS")
         return value
+
+    @field_validator("verification_deadline_utc")
+    @classmethod
+    def _canonical_deadline(cls, value: str) -> str:
+        try:
+            parsed = datetime.fromisoformat(value)
+        except ValueError as exc:
+            raise ValueError("verification deadline must be canonical UTC") from exc
+        if (
+            parsed.tzinfo is None
+            or parsed.utcoffset() != timezone.utc.utcoffset(parsed)
+            or value != parsed.astimezone(timezone.utc).isoformat()
+        ):
+            raise ValueError("verification deadline must be canonical UTC")
+        return value
+
+
+class TargetedClaimRequest(VerifyRequest):
+    """One exact official-review ticket plus its authoritative source bytes."""
+
+    ticket: Dict[str, Any]
 
 
 def _utc_timestamp() -> str:
@@ -225,6 +260,82 @@ def _canonical_json(value: Any) -> str:
         sort_keys=True,
         separators=(",", ":"),
     )
+
+
+def _targeted_exact_object(
+    value: Any, expected: set[str], *, label: str
+) -> Dict[str, Any]:
+    if not isinstance(value, dict) or set(value) != expected:
+        raise ValueError(f"{label} has an unsupported shape")
+    return value
+
+
+def _validate_targeted_ticket(ticket: Mapping[str, Any]) -> Dict[str, Any]:
+    """Validate the review-owned, content-addressed single-claim capability."""
+
+    keys = {
+        "schema_version",
+        "ticket_id",
+        "review_id",
+        "snapshot_sha256",
+        "route_id",
+        "blueprint_sha256",
+        "blueprint_item_id",
+        "claim",
+        "verification_mode",
+        "publication_authority",
+        "whole_blueprint_verdict_authority",
+    }
+    raw = _targeted_exact_object(dict(ticket), keys, label="targeted claim ticket")
+    claim = _targeted_exact_object(
+        raw["claim"],
+        {"blueprint_item_label", "claim_sha256", "reason"},
+        label="targeted claim",
+    )
+    if raw["schema_version"] != _TARGETED_TICKET_SCHEMA:
+        raise ValueError("targeted claim ticket schema is invalid")
+    if not isinstance(raw["ticket_id"], str) or _TICKET_ID_RE.fullmatch(raw["ticket_id"]) is None:
+        raise ValueError("targeted claim ticket_id is invalid")
+    if not isinstance(raw["review_id"], str) or _REVIEW_ID_RE.fullmatch(raw["review_id"]) is None:
+        raise ValueError("targeted claim review_id is invalid")
+    if not isinstance(raw["snapshot_sha256"], str) or _SHA256_RE.fullmatch(raw["snapshot_sha256"]) is None:
+        raise ValueError("targeted claim snapshot_sha256 is invalid")
+    if not isinstance(raw["blueprint_sha256"], str) or _SHA256_RE.fullmatch(raw["blueprint_sha256"]) is None:
+        raise ValueError("targeted claim blueprint_sha256 is invalid")
+    if not isinstance(raw["blueprint_item_id"], str) or _ITEM_ID_RE.fullmatch(raw["blueprint_item_id"]) is None:
+        raise ValueError("targeted claim blueprint_item_id is invalid")
+    for name in ("route_id",):
+        value = raw[name]
+        if not isinstance(value, str) or not value.strip() or len(value.encode("utf-8")) > 256:
+            raise ValueError(f"targeted claim {name} is invalid")
+    label = claim["blueprint_item_label"]
+    reason = claim["reason"]
+    if not isinstance(label, str) or not label.strip() or len(label.encode("utf-8")) > 256:
+        raise ValueError("targeted claim blueprint item label is invalid")
+    if not isinstance(claim["claim_sha256"], str) or _SHA256_RE.fullmatch(claim["claim_sha256"]) is None:
+        raise ValueError("targeted claim digest is invalid")
+    if not isinstance(reason, str) or not reason.strip() or len(reason.encode("utf-8")) > 8_192:
+        raise ValueError("targeted claim reason is invalid")
+    if (
+        raw["verification_mode"] != "targeted_nonpublishing"
+        or raw["publication_authority"] is not False
+        or raw["whole_blueprint_verdict_authority"] is not False
+    ):
+        raise ValueError("targeted claim ticket may not publish or verify a blueprint")
+    seed = {
+        "review_id": raw["review_id"],
+        "snapshot_sha256": raw["snapshot_sha256"],
+        "route_id": raw["route_id"],
+        "blueprint_sha256": raw["blueprint_sha256"],
+        "blueprint_item_id": raw["blueprint_item_id"],
+        "claim": claim,
+    }
+    expected_ticket_id = "claim_" + hashlib.sha256(
+        _canonical_json(seed).encode("utf-8")
+    ).hexdigest()[:32]
+    if raw["ticket_id"] != expected_ticket_id:
+        raise ValueError("targeted claim ticket content address mismatch")
+    return json.loads(_canonical_json(raw))
 
 
 def build_prompt(
@@ -571,6 +682,242 @@ def _validate_context_envelope(
         raise ValueError("expanded proof character accounting is invalid")
 
 
+def _terminate_process_group(process: subprocess.Popen[Any]) -> None:
+    """Terminate the verifier and every descendant in its isolated group."""
+
+    if process.poll() is None:
+        if os.name == "posix":
+            try:
+                os.killpg(process.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+        else:  # pragma: no cover - production is POSIX
+            process.terminate()
+    try:
+        process.wait(timeout=_PROCESS_GROUP_TERM_GRACE_SECONDS)
+    except subprocess.TimeoutExpired:
+        pass
+
+    # The direct process may have exited while a tool/child remains in the
+    # same group. Always address the group again before declaring timeout.
+    if os.name == "posix":
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    elif process.poll() is None:  # pragma: no cover - production is POSIX
+        process.kill()
+    try:
+        process.wait(timeout=_PROCESS_GROUP_KILL_GRACE_SECONDS)
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError("verifier process group did not terminate") from exc
+
+
+_CHILD_PROCESS_GUARD_KEYS = {
+    "schema_version",
+    "service_pid",
+    "wrapper_pid",
+    "wrapper_pgid",
+    "child_pid",
+    "child_pgid",
+    "child_start_identity",
+    "deadline_utc",
+    "command_sha256",
+    "state",
+}
+
+
+def _process_start_identity(pid: int) -> str | None:
+    completed = subprocess.run(
+        ["ps", "-o", "lstart=", "-p", str(pid)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        check=False,
+        text=True,
+    )
+    identity = completed.stdout.strip()
+    return identity if completed.returncode == 0 and identity else None
+
+
+def _terminate_guarded_child_group(
+    guard_path: Path, *, expected_wrapper_pid: int
+) -> None:
+    """Clean a separately supervised model PG after wrapper exit/SIGKILL."""
+
+    try:
+        raw = _read_verification_output(guard_path)
+    except FileNotFoundError:
+        # The blocked launcher starts no model unless this guard was durable.
+        return
+    if not isinstance(raw, dict) or set(raw) != _CHILD_PROCESS_GUARD_KEYS:
+        raise RuntimeError("verifier child process guard is malformed")
+    if (
+        raw["schema_version"] != "rethlas_verifier_child_process_guard_v1"
+        or raw["service_pid"] != os.getpid()
+        or raw["wrapper_pid"] != expected_wrapper_pid
+        or raw["state"]
+        not in {
+            "release_intent_durable",
+            "released",
+            "completed",
+            "timed_out",
+            "execution_unknown",
+        }
+    ):
+        raise RuntimeError("verifier child process guard binding changed")
+    child_pid = raw["child_pid"]
+    child_pgid = raw["child_pgid"]
+    if (
+        type(child_pid) is not int
+        or type(child_pgid) is not int
+        or child_pid <= 1
+        or child_pgid != child_pid
+        or not isinstance(raw["child_start_identity"], str)
+        or not raw["child_start_identity"]
+    ):
+        raise RuntimeError("verifier child process identity is invalid")
+    try:
+        current_pgid = os.getpgid(child_pid)
+    except ProcessLookupError:
+        current_pgid = None
+    if current_pgid is not None and (
+        current_pgid != child_pgid
+        or _process_start_identity(child_pid) != raw["child_start_identity"]
+    ):
+        raise RuntimeError("verifier child pid was reused before cleanup")
+    # The guard belongs to this live invocation.  Address the persisted PGID
+    # even if its original leader exited while a tool descendant remains.
+    try:
+        os.killpg(child_pgid, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    time.sleep(min(_PROCESS_GROUP_TERM_GRACE_SECONDS, 0.1))
+    try:
+        os.killpg(child_pgid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+
+
+def _run_codex_process_group(
+    cmd: List[str],
+    *,
+    cwd: Path,
+    input: str,
+    stdout: Any,
+    stderr: Any,
+    text: bool,
+    timeout: int,
+    check: bool,
+    env: Mapping[str, str],
+    guard_path: Path | None = None,
+    guard_run_id: str | None = None,
+) -> subprocess.CompletedProcess[str]:
+    """Run one Codex invocation with a deadline covering its full process tree."""
+
+    if guard_path is None:
+        raise ValueError("verifier process group requires a durable guard path")
+    deadline_epoch = time.time() + float(timeout)
+    supervisor = Path(__file__).with_name("process_supervisor.py").resolve(strict=True)
+    child_guard_path = guard_path.with_name("process_child_guard.json")
+    wrapped_command = [
+        sys.executable,
+        "-I",
+        "-B",
+        str(supervisor),
+        str(os.getpid()),
+        f"{deadline_epoch:.6f}",
+        str(child_guard_path.resolve()),
+        "--",
+        *cmd,
+    ]
+    process = subprocess.Popen(
+        wrapped_command,
+        cwd=cwd,
+        stdin=subprocess.PIPE,
+        stdout=stdout,
+        stderr=stderr,
+        text=text,
+        env=dict(env),
+        start_new_session=os.name == "posix",
+    )
+    guard = None
+    if guard_path is not None:
+        guard = {
+            "schema_version": "rethlas_verifier_process_guard_v1",
+            "run_id": guard_run_id,
+            "wrapper_pid": process.pid,
+            "wrapper_pgid": (
+                os.getpgid(process.pid) if os.name == "posix" else process.pid
+            ),
+            "service_pid": os.getpid(),
+            "child_guard_path": str(child_guard_path.resolve()),
+            "deadline_utc": datetime.fromtimestamp(
+                deadline_epoch, tz=timezone.utc
+            ).isoformat(),
+            "command_sha256": hashlib.sha256(
+                json.dumps(
+                    cmd,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            ).hexdigest(),
+            "state": "blocked_release_pending",
+        }
+        try:
+            _write_json_atomic(guard_path, guard)
+        except BaseException:
+            _terminate_process_group(process)
+            raise
+    try:
+        try:
+            process.communicate(input=input, timeout=timeout)
+        except subprocess.TimeoutExpired:
+            _terminate_process_group(process)
+            # Drain only after the complete wrapper group is dead. The model
+            # group is independently reaped from its durable child guard.
+            try:
+                process.communicate(timeout=_PROCESS_GROUP_KILL_GRACE_SECONDS)
+            except (subprocess.TimeoutExpired, ValueError):
+                pass
+            if guard is not None:
+                _write_json_atomic(guard_path, {**guard, "state": "timed_out"})
+            raise
+    finally:
+        _terminate_guarded_child_group(
+            child_guard_path, expected_wrapper_pid=process.pid
+        )
+    if process.returncode == 124:
+        if guard is not None:
+            _write_json_atomic(guard_path, {**guard, "state": "timed_out"})
+        raise subprocess.TimeoutExpired(cmd, timeout)
+    if process.returncode is not None and process.returncode < 0:
+        if guard is not None:
+            _write_json_atomic(
+                guard_path,
+                {
+                    **guard,
+                    "state": "execution_unknown",
+                    "returncode": process.returncode,
+                },
+            )
+        raise VerifierExecutionUnknown(
+            "verifier supervisor terminal was lost after durable dispatch intent"
+        )
+    if guard is not None:
+        _write_json_atomic(
+            guard_path,
+            {
+                **guard,
+                "state": "completed",
+                "returncode": process.returncode,
+            },
+        )
+    completed = subprocess.CompletedProcess(cmd, process.returncode)
+    if check and completed.returncode:
+        raise subprocess.CalledProcessError(completed.returncode, cmd)
+    return completed
+
+
 def run_codex_item_verification(
     *,
     run_id: str,
@@ -633,7 +980,7 @@ def run_codex_item_verification(
         with tempfile.TemporaryFile(mode="w+b") as raw_stream:
             invocation_started = time.perf_counter()
             try:
-                completed = subprocess.run(
+                completed = _run_codex_process_group(
                     cmd,
                     cwd=isolated_work_dir,
                     input=prompt,
@@ -643,6 +990,8 @@ def run_codex_item_verification(
                     timeout=effective_timeout,
                     check=False,
                     env=_codex_environment(),
+                    guard_path=results_dir / "process_guard.json",
+                    guard_run_id=run_id,
                 )
             except subprocess.TimeoutExpired as exc:
                 elapsed_seconds = time.perf_counter() - invocation_started
@@ -655,6 +1004,23 @@ def run_codex_item_verification(
                 raise HTTPException(
                     status_code=504,
                     detail=f"codex exec timed out after {exc.timeout} seconds for item {item_id}",
+                ) from exc
+            except VerifierExecutionUnknown as exc:
+                elapsed_seconds = time.perf_counter() - invocation_started
+                _append_run_metrics(
+                    log_path,
+                    elapsed_seconds=elapsed_seconds,
+                    tokens_used=_read_codex_usage(raw_stream),
+                )
+                _append_run_status(
+                    log_path, stage="codex", status="execution_unknown"
+                )
+                raise HTTPException(
+                    status_code=502,
+                    detail={
+                        "code": "verifier_execution_unknown",
+                        "item_id": item_id,
+                    },
                 ) from exc
             except OSError as exc:
                 elapsed_seconds = time.perf_counter() - invocation_started
@@ -683,6 +1049,11 @@ def run_codex_item_verification(
             status="completed" if completed.returncode == 0 else "failed",
             returncode=completed.returncode,
         )
+        if completed.returncode == 124:
+            raise HTTPException(
+                status_code=504,
+                detail=f"codex exec reached its hard deadline for item {item_id}",
+            )
         if completed.returncode != 0:
             raise HTTPException(
                 status_code=500,
@@ -958,6 +1329,156 @@ def run_adaptive_item_verification(
         round_index += 1
 
 
+def _parse_targeted_manifest(statement: str, proof: str) -> ProofManifest:
+    try:
+        return parse_blueprint(proof)
+    except ProofParseError:
+        # Legacy unstructured drafts have one deterministic synthetic item.
+        return parse_blueprint(proof, target_statement=statement)
+
+
+def _monotonic_verification_deadline(
+    verification_deadline_utc: str, *, label: str
+) -> float:
+    try:
+        wall_deadline = datetime.fromisoformat(verification_deadline_utc)
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=422, detail=f"invalid {label} deadline") from exc
+    if (
+        wall_deadline.tzinfo is None
+        or wall_deadline.utcoffset() != timezone.utc.utcoffset(wall_deadline)
+        or verification_deadline_utc
+        != wall_deadline.astimezone(timezone.utc).isoformat()
+    ):
+        raise HTTPException(status_code=422, detail=f"invalid {label} deadline")
+    remaining_wall_seconds = (
+        wall_deadline - datetime.now(timezone.utc)
+    ).total_seconds()
+    if remaining_wall_seconds <= 0:
+        raise HTTPException(
+            status_code=504,
+            detail=f"{label} deadline expired before model dispatch",
+        )
+    return time.monotonic() + min(
+        remaining_wall_seconds, float(VERIFY_REQUEST_TIMEOUT_SECONDS)
+    )
+
+
+def verify_targeted_claim(
+    statement: str,
+    proof: str,
+    ticket: Mapping[str, Any],
+    verification_deadline_utc: str,
+) -> Dict[str, Any]:
+    """Verify one digest-bound item without publishing a blueprint verdict."""
+
+    monotonic_deadline = _monotonic_verification_deadline(
+        verification_deadline_utc, label="targeted verification"
+    )
+
+    try:
+        normalized_ticket = _validate_targeted_ticket(ticket)
+        observed_blueprint_sha = hashlib.sha256(proof.encode("utf-8")).hexdigest()
+        if observed_blueprint_sha != normalized_ticket["blueprint_sha256"]:
+            raise ValueError("targeted claim blueprint changed after official review")
+        manifest = _parse_targeted_manifest(statement, proof)
+        if manifest.proof_digest != observed_blueprint_sha:
+            raise ValueError("targeted claim parser digest disagrees with source bytes")
+        claim = normalized_ticket["claim"]
+        label_matches = [
+            item
+            for item in manifest.items
+            if item.label == claim["blueprint_item_label"]
+        ]
+        if len(label_matches) != 1:
+            raise ValueError("targeted claim label is not one unique blueprint item")
+        item = label_matches[0]
+        if (
+            item.item_id != normalized_ticket["blueprint_item_id"]
+            or item.digest != claim["claim_sha256"]
+        ):
+            raise ValueError("targeted claim item commitment disagrees with blueprint")
+        context = build_item_context(
+            manifest,
+            item.item_id,
+            max_chars=VERIFY_CONTEXT_MAX_CHARS,
+        )
+        _validate_context_envelope(
+            context,
+            expected_item_id=item.item_id,
+            expected_proof_digest=manifest.proof_digest,
+        )
+        prompt_size = len(
+            build_prompt(
+                run_id="x" * 128,
+                target_statement=statement,
+                proof_digest=manifest.proof_digest,
+                context=context,
+            ).encode("utf-8")
+        )
+        if prompt_size > VERIFY_MAX_PROMPT_BYTES:
+            raise ValueError("targeted claim prompt exceeds VERIFY_MAX_PROMPT_BYTES")
+    except (ProofContextError, ValueError) as exc:
+        raise HTTPException(
+            status_code=422, detail=f"invalid targeted claim context: {exc}"
+        ) from exc
+
+    # No model process or persistent run is created until every ticket, digest,
+    # label, item id, and proof-item digest check above succeeds.
+    _require_mcp_runtime()
+    base_run_id = _allocate_run_id(statement)
+    output, final_context, round_audits = run_adaptive_item_verification(
+        manifest=manifest,
+        item_id=item.item_id,
+        run_id_prefix=f"{base_run_id}__targeted_{item.item_id[:12]}",
+        target_statement=statement,
+        deadline=monotonic_deadline,
+        prompt_budget={"used": 0},
+    )
+    seed: Dict[str, Any] = {
+        "schema_version": _TARGETED_RECEIPT_SCHEMA,
+        "ticket_id": normalized_ticket["ticket_id"],
+        "review_id": normalized_ticket["review_id"],
+        "snapshot_sha256": normalized_ticket["snapshot_sha256"],
+        "route_id": normalized_ticket["route_id"],
+        "blueprint_sha256": normalized_ticket["blueprint_sha256"],
+        "blueprint_item_id": item.item_id,
+        "blueprint_item_label": item.label,
+        "claim_sha256": item.digest,
+        "verification_deadline_utc": verification_deadline_utc,
+        "verification_status": output["verification_status"],
+        "verdict": output["verdict"],
+        "verification_report": output["verification_report"],
+        "repair_hints": output["repair_hints"],
+        "checked_item_ids": output["checked_item_ids"],
+        "context_attestation": _context_attestation(
+            final_context,
+            disposition="verified",
+            verdict=output["verdict"],
+        ),
+        "publication_authority": False,
+        "whole_blueprint_verdict_authority": False,
+    }
+    receipt = {
+        **seed,
+        "receipt_sha256": hashlib.sha256(
+            _canonical_json(seed).encode("utf-8")
+        ).hexdigest(),
+    }
+    audit_dir = _results_dir(base_run_id)
+    _write_json_atomic(audit_dir / "targeted_verification.json", receipt)
+    _write_json_atomic(
+        audit_dir / "targeted_manifest.json",
+        {
+            "ticket_id": normalized_ticket["ticket_id"],
+            "proof_digest": manifest.proof_digest,
+            "checked_item_ids": [item.item_id],
+            "adaptive_rounds": round_audits,
+        },
+    )
+    return receipt
+
+
 def _write_json_atomic(path: Path, payload: Dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary_path: Path | None = None
@@ -987,7 +1508,18 @@ def _write_json_atomic(path: Path, payload: Dict[str, Any]) -> None:
             temporary_path.unlink()
 
 
-def verify_blueprint(statement: str, proof: str) -> Dict[str, Any]:
+def verify_blueprint(
+    statement: str,
+    proof: str,
+    verification_deadline_utc: str | None = None,
+) -> Dict[str, Any]:
+    deadline = (
+        time.monotonic() + VERIFY_REQUEST_TIMEOUT_SECONDS
+        if verification_deadline_utc is None
+        else _monotonic_verification_deadline(
+            verification_deadline_utc, label="whole verification"
+        )
+    )
     try:
         manifest = parse_blueprint(proof, target_statement=statement)
         if (
@@ -1057,7 +1589,6 @@ def verify_blueprint(statement: str, proof: str) -> Dict[str, Any]:
     # and leaves no misleading audit record.
     _require_mcp_runtime()
     base_run_id = _allocate_run_id(statement)
-    deadline = time.monotonic() + VERIFY_REQUEST_TIMEOUT_SECONDS
     item_outputs: Dict[str, Dict[str, Any]] = {}
     final_contexts: Dict[str, Dict[str, Any]] = {}
     item_round_audits: Dict[str, List[Dict[str, Any]]] = {}
@@ -1095,6 +1626,12 @@ def verify_blueprint(statement: str, proof: str) -> Dict[str, Any]:
         final_contexts[item_id] = final_context
         item_round_audits[item_id] = round_audits
         dispositions[item_id] = "verified"
+
+    if time.monotonic() >= deadline:
+        raise HTTPException(
+            status_code=504,
+            detail="overall verification request deadline exceeded",
+        )
 
     critical_errors: List[Dict[str, str]] = []
     gaps: List[Dict[str, str]] = []
@@ -1182,7 +1719,7 @@ def _loopback_client(request: Request) -> bool:
 
 @app.middleware("http")
 async def protect_verification_endpoint(request: Request, call_next: Any) -> Any:
-    if request.url.path != "/verify":
+    if request.url.path not in {"/verify", "/verify-targeted-claim"}:
         return await call_next(request)
     authorization = request.headers.get("authorization")
     if VERIFY_API_TOKEN:
@@ -1254,6 +1791,32 @@ def verify(
     if not _REQUEST_SLOTS.acquire(blocking=False):
         raise HTTPException(status_code=429, detail="verification service is busy")
     try:
-        return verify_blueprint(request.statement, request.proof)
+        return verify_blueprint(
+            request.statement,
+            request.proof,
+            request.verification_deadline_utc,
+        )
+    finally:
+        _REQUEST_SLOTS.release()
+
+
+@app.post("/verify-targeted-claim")
+def verify_targeted(
+    request: TargetedClaimRequest,
+    authorization: str | None = Header(default=None),
+) -> Dict[str, Any]:
+    if VERIFY_API_TOKEN:
+        expected = f"Bearer {VERIFY_API_TOKEN}"
+        if authorization is None or not hmac.compare_digest(authorization, expected):
+            raise HTTPException(status_code=401, detail="invalid verification API token")
+    if not _REQUEST_SLOTS.acquire(blocking=False):
+        raise HTTPException(status_code=429, detail="verification service is busy")
+    try:
+        return verify_targeted_claim(
+            request.statement,
+            request.proof,
+            request.ticket,
+            request.verification_deadline_utc,
+        )
     finally:
         _REQUEST_SLOTS.release()

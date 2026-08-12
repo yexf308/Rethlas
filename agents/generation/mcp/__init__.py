@@ -9,6 +9,7 @@ from .server import (
     memory_search,
     sanitize_problem_id,
     search_arxiv_theorems,
+    search_matlas_theorems,
     verify_proof_service,
     verify_blueprint_service,
 )
@@ -24,6 +25,7 @@ __all__ = [
     "memory_search",
     "sanitize_problem_id",
     "search_arxiv_theorems",
+    "search_matlas_theorems",
     "verify_proof_service",
     "verify_blueprint_service",
 ]

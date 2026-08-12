@@ -162,12 +162,29 @@ environment's `bin` directory and `/usr/bin:/bin:/usr/sbin:/sbin`, so `python`
 and `python3` resolve to that same preflighted interpreter without exposing the
 host PATH or other host environment variables. Basic system tools such as the
 system `curl` may be present, but shell network access is not a supported
-retrieval path; use Codex web search when enabled. PDF extraction remains a
-runner-side optional preprocessing step using `pdftotext` from the operator's
-launch environment. If it is unavailable, the runner warns and ignores PDF
-references; install it separately or provide `.md`, `.tex`, or `.txt`
-references. `pdftotext` and non-system tools such as `rg` are not added to the
-model shell PATH implicitly.
+retrieval path. For a named knowledge gap about a theorem, lemma, or definition
+from published journals or books, prefer the trusted
+`search_matlas_theorems` MCP tool. It calls the official Matlas search API at
+`https://matlas.ai/api/search` (OAS 0.1.0; no authentication; `query` plus
+`num_results`, whose minimum is 10). The distinct legacy
+`search_arxiv_theorems` tool queries the Danus/LeanSearch arXiv provider at
+`https://leansearch.net/thm/search`; it is neither an alias nor an implicit
+fallback for Matlas. Both surfaces return bounded external leads, not proof
+evidence, articles, or PDFs. If the selected provider reports an operational
+retrieval error such as the observed TLS/CUJO `ConnectionError`, one
+authorized web/arXiv fallback may be used for the same named gap. The overall
+two-query-per-gap limit still applies. For an official Matlas result, retain
+`candidate_id`; map `paper_id` to its nonempty DOI, or otherwise to
+title/authors/year with an explicit web-verification obligation; and map
+`theorem_id` to `entity_name`. Preserve `candidate_id` as the provider
+candidate ID; do not treat it as the bibliographic theorem number.
+Legacy results retain their `arxiv_id`/`theorem_id` pair. Anything whose
+primary text has not been read remains only a lead. Use an authorized
+web/arXiv path when a full article or PDF is required. PDF extraction remains a runner-side optional
+preprocessing step using `pdftotext` from the operator's launch environment.
+If it is unavailable, the runner warns and ignores PDF references; install it
+separately or provide `.md`, `.tex`, or `.txt` references. `pdftotext` and
+non-system tools such as `rg` are not added to the model shell PATH implicitly.
 
 Operational failures found in paid or mock generation runs are recorded in
 [`agents/generation/INCIDENTS.md`](agents/generation/INCIDENTS.md), including
@@ -194,13 +211,21 @@ This script uses the machine-readable `rethlas_reasoning_first_v1` contract:
   generation workspace, so a cost/advisor wait cannot silently start another
   paid turn
 
-The deep-work duration is an instruction-level target, not a claim that the
-runner can measure private model reasoning time. Set it from 10 through 90
-minutes when a problem calls for a different uninterrupted window:
+For a legacy non-hot-join run, the deep-work duration is an instruction-level
+target, not a claim that the runner can measure private model reasoning time.
+Set it from 10 through 90 minutes when a problem calls for a different
+uninterrupted window:
 
 ```bash
 RETHLAS_DEEP_WORK_MINUTES=45 ./tests/run_example.sh
 ```
+
+Hot-join runs default to the durable `rethlas_route_review_90m_v1` policy. In
+that mode the first construction interval is fixed at 30 minutes and
+`RETHLAS_DEEP_WORK_MINUTES` must remain 30; setting it to 90 does not create a
+reliable 90-minute turn and is rejected before Codex starts. The trusted
+owner-side scheduler enforces the complete 30/60/90-minute cycle described
+below.
 
 The script also:
 
@@ -216,9 +241,30 @@ The script also:
   bytecode caches, symlinks, and special files in that trusted tree are rejected
   before Codex starts, and the MCP interpreter runs with bytecode writes disabled
 - pins the MCP command to an attested runtime snapshot outside the writable
-  generation workspace, so an MCP restart cannot load temporarily modified code;
-  these per-run snapshots live under `agents/.trusted_generation_runtime/`
-  and are ignored by Git
+  generation workspace and starts it through isolated Python plus a fixed
+  secure loader. The loader opens every executable MCP/review module with
+  `O_NOFOLLOW`, verifies its inode/metadata/content digest, reads all module
+  bytes before execution, and compiles only those captured bytes. An MCP
+  restart therefore cannot execute a same-UID mutate/restore race through a
+  pathname. Per-run snapshots live under
+  `agents/.trusted_generation_runtime/` and are ignored by Git
+- includes the complete `agents/review/` contract package in that same
+  manifest/snapshot; the adapter receives and inode-attests the exact absolute
+  `review/contract_cli.py` path, its byte SHA-256, and the whole runtime
+  manifest digest, and invokes it only with the trusted interpreter in isolated
+  mode. Stable generator identity commits the helper role/content and runtime
+  digest, not the per-wrapper temporary snapshot path
+- creates a fresh scoped 64-hex review-control token and supplies it only in
+  the host adapter process environment; the adapter digest-binds this owner
+  master capability but never injects it into a reasoning MCP, CLI argument,
+  policy JSON, log, model shell, or stable generator fingerprint. Instead the
+  adapter derives a distinct least-privilege token for each root thread epoch,
+  injects only that epoch token into the matching trusted MCP configuration,
+  and revokes it at T+30m/T+60m handoff. The separate capability record may
+  rotate its master token, temporary helper path, and generation-control
+  instance only at a fail-closed wrapper boundary with no live lease,
+  unresolved external-effect intent, or pending owner-yield close; its
+  model/policy/runtime/helper/Codex content commitments cannot rotate
 - injects the trusted `reasoning_agent` MCP as one complete CLI object
   (`command`, `args`, `cwd`, `env`, `required=true`, `tool_timeout_sec`, and
   `default_tools_approval_mode="approve"`), rather than relying on workspace
@@ -233,14 +279,157 @@ The script also:
 
 ### Optional human hot-join for the generator
 
-Set an explicit run id to replace only the generator's `codex exec` transport
-with a persistent Codex app-server thread. The mathematical skills, reasoning
-MCP, memory files, verifier API, and publication checks are unchanged:
+Set an explicit run id to replace the generator's `codex exec` transport with
+the durable Codex app-server scheduler. The mathematical skills, reasoning MCP,
+memory files, verifier API, and publication checks are unchanged. Hot-join
+selects `rethlas_route_review_90m_v1` and `rethlas_context_guard_v1` by default:
 
 ```bash
 cd agents/generation
 RETHLAS_HOTJOIN_RUN_ID=example-live ./tests/run_example.sh
 ```
+
+The runner first asks the adapter for its immutable policy contract and binds
+that contract digest, both policy ids, and the fixed constants into the run's
+generator fingerprint. Cadence cannot be enabled without hot-join. A failed or
+unknown policy preflight starts zero Codex processes. Legacy `codex exec` runs
+remain available only with cadence disabled; they do not claim durable review
+or context scheduling.
+
+#### Durable 90-minute route cycle
+
+The adapter owns one absolute cycle clock. Prompt wording, model self-timing,
+wrapper restart, review latency, a context handoff, verifier work, or an early
+model return never resets or extends it:
+
+- `T0–T+30m`: free construction on one active route.
+- `T+30m`: a fresh, independent, read-only, tool-free critic receives an
+  immutable bounded snapshot for a three-to-five-minute review. Official close
+  produces a bounded handoff; the next root work segment rehydrates it in a
+  fresh thread epoch while retaining the same cycle `T0`.
+- `T+30m–T+60m`: continue after green, or spend the period only on yellow's one
+  fatal doubt.
+- `T+60m`: a second fresh critic reviews a new snapshot, then hands the final
+  work segment to another fresh root thread epoch without resetting `T0`.
+- `T+60m–T+87m`: final route work; at `T+87m` the scheduler closes and persists
+  the frontier and any required handoff.
+- `T+90m`: unconditional hard stop. It is never extended.
+
+Each review answers five questions: the core bridge; premise/target fit;
+material uncertainty reduction in the preceding period; obstruction or
+counterexample risk; and one testable next milestone. `green` continues toward
+that milestone. `yellow` permits exactly one bounded period for its specified
+fatal doubt. `red` freezes the route after preserving valid conclusions. Two
+consecutive yellow reviews of the same route become effective red when the
+second snapshot has no critic-confirmed new lemma, counterexample exclusion,
+or uncertainty reduction. Renaming the route or merely asserting progress does
+not reset that streak. Effective red can switch routes only to the exact
+pre-due fallback commitment with its bound active evidence. Without that
+fallback, the active route freezes and no paid root continuation is admitted.
+
+Before each scheduled review boundary, the latest pre-due checkpoint for that
+review window must leave exactly one active `branch_states` commitment using
+schema `rethlas_active_route_commitment_v1`, with identical stable `branch_id` and
+`route_id`, the load-bearing `core_bridge`, and a nonempty bounded list of
+concrete obligations. The first commitment is due before T+30m; after an
+official review and fresh-epoch handoff, the continued or host-switched route
+must be committed again before the next review. At most one separately
+evidenced fallback may be precommitted. Before the boundary, at most two
+host-admitted proof children may explore predeclared scope-disjoint mechanisms;
+their active/fallback roles are predeclared at spawn, and the root may update
+the commitment once by host CAS before the due instant using already returned
+evidence. At the boundary the host locks the last pre-due commitment,
+interrupts root and children, obtains terminal receipts, and only then builds
+the critic snapshot. Post-due route designation is rejected. The scheduled
+critic reviews only that active route. A fallback selected after effective red
+becomes the single active route in the next work segment. Boundary APIs do not
+accept a route id from the model. The
+trusted host derives the unique active pre-due route and exact ordered
+frontier/progress ids, commits its source record/batch/timestamp and canonical
+digest in the frontier manifest, and supplies that manifest to review
+orchestration.
+
+Review is route governance, not fact checking. Only a specifically identified
+load-bearing claim may trigger a targeted verifier call; the ordinary fresh
+whole-proof verifier and publication gate remain authoritative. Malformed,
+timed-out, or execution-unknown review results are operationally blocked and
+never count as permission to continue.
+
+A due review is host-orchestrated. Rethlas never turns an ordinary
+full-capability root continuation into a supposed "review-only" process by
+prompt wording or an MCP allowlist, because those mechanisms do not remove the
+root's built-in shell, web, or collaboration capabilities. Until the host has
+durably completed the exact review action, no ordinary root continuation is
+admitted. A red/frozen route likewise cannot receive an active-cycle root
+continuation merely because its prior transport turn ended cleanly.
+
+After every adapter exit, the runner reads the durable cadence disposition. A
+legal `generation_yield` or verified publication stops. Only a closed cycle
+with `continue_next_cycle` may start another paid cycle, and then only with an
+authenticated handoff and a strictly newer app-server thread epoch.
+`hard_stopped_unfinalized`, `operational_blocked`, an unknown disposition, or
+stale-active state starts zero additional paid turns. Absolute `T0` and all
+cycle records survive wrapper restart. A red route verdict alone is not
+`waiting_owner_advisor_decision`; that owner wait still requires the existing
+evidence-backed advisor checkpoint and final `generation_yield`.
+If red has no exact pre-due fallback commitment, `route_frozen` is a normal
+unsolved terminal: the runner starts no further paid work, reports the frozen
+route reason, and exits `1`. It is not an operational error and cannot be
+reinterpreted as an owner/advisor wait on wrapper restart.
+
+A clean root terminal before a review boundary is not itself permission to
+stop or restart the clock. When durable generation control still says
+`running`, the host may issue a one-shot `continue_active_cycle`
+authorization for another turn in the same app-server thread epoch. It keeps
+the original `T0`, expires at the next scheduler boundary, and is revalidated
+immediately before dispatch. This same-cycle continuation is not counted as a
+new 90-minute cycle and is not truncated by the wrapper's owner-configured
+cycle count. A separate defense-in-depth guard allows at most 128 paid root
+invocations per authenticated durable cycle. It resets only after an initial
+start or `continue_next_cycle` has actually established a different valid
+`cycle_id`; review/context rollovers and clean-turn continuations in the same
+cycle keep accumulating against it. A same-cycle authorization cannot cross an
+official T+30m/T+60m review: after each review close, the next root work segment
+consumes the review handoff in a fresh thread epoch. Every
+`continue_next_cycle` likewise uses its validated handoff and a fresh thread
+epoch.
+
+An unfinished owner wait uses a separate authenticated handshake. The root
+prepares an `owner_yield`-purpose handoff, the host admits the exact
+evidence-bound `generation_yield`, and, after the matching transport terminal,
+the runner closes that exact cycle/handoff to `owner_wait_cost` or
+`owner_wait_advisor`. A crash between the wait write and close is recovery
+state: the next wrapper must close the existing wait receipt before any owner
+resume can overwrite it. Explicit owner resume then consumes the pending
+handoff and admits `continue_next_cycle` in a fresh epoch. Reviewer red alone
+never qualifies for this path.
+
+A finalized `hard_stopped` disposition is a normal but unsolved terminal: the
+runner starts neither recovery nor another paid cycle and returns the existing
+unverified-result exit status `1`. It is not an operational failure. An
+unfinalized hard stop, a still-pending terminal, quarantine, or stale/unknown
+control state remains fail-closed; only the adapter's explicitly admitted
+recovery dispositions may reconcile an already dispatched operation, and a
+recovery that stays pending returns operational status `70` without retrying.
+
+#### Context guard and fresh-thread handoff
+
+The scheduler computes context occupancy as
+`last.inputTokens / modelContextWindow`. Cached tokens are already part of the
+input count and are not subtracted. It observes at 60% occupancy or 112,000
+tokens of remaining headroom, requires a durable checkpoint at 65% or 96,000,
+requires a fresh-thread handoff at 70% or 80,000, and enters emergency
+stop/handoff at 82% or 48,000. Either arm of a threshold is sufficient.
+
+The content-addressed handoff is at most 32 KiB. It contains statement and
+blueprint bindings, absolute phase deadlines, active route/core bridge, the
+last effective review and allowed action, newly persisted record ids, pending
+gates/obligations, and one next action—never a transcript or hidden reasoning.
+Automatic model-context compaction is a transport safeguard, not mathematical
+progress, a checkpoint, uncertainty reduction, or a deadline reset. Once
+compaction is observed, the scheduler requires the durable handoff and a
+brand-new thread epoch before further mathematical work. A same-thread next
+turn, resume, or fork does not satisfy that requirement.
 
 While that run is active, the local repository owner can add a first-class user
 turn from another shell. Reuse `--client-message-id` safely after a lost CLI
@@ -263,9 +452,107 @@ python3 agents/hotjoin_adapter.py send \
   --text 'Explore the extremal-measure reformulation before more searching.'
 
 python3 agents/hotjoin_adapter.py status --run-id example-live
+python3 agents/hotjoin_adapter.py policy-contract
+python3 agents/hotjoin_adapter.py cadence-control-state --run-id example-live
+python3 agents/hotjoin_adapter.py review-status --run-id example-live
+python3 agents/hotjoin_adapter.py review-tail --run-id example-live --after-sequence 0
 python3 agents/hotjoin_adapter.py tail --run-id example-live --after-sequence 0
 python3 agents/hotjoin_adapter.py verify-ledger --run-id example-live
 ```
+
+`policy-contract` is read-only and does not open the run database.
+For cadence-on runs, its hash-bound review policy must carry the exact boolean
+`guardian_enforcement_ready=true`. False, missing, or non-boolean means the
+guardian release is still on hold: the runner exits operationally before
+`init`, capability binding, recovery, review driving, or any Codex/root work.
+An environment variable cannot override this host policy. Legacy cadence-off
+runs do not claim the guardian guarantee and remain available.
+
+An unreleased guardian can still be used for one strictly observational
+non-fresh diagnosis of an existing legacy thread. Make an owner-only,
+byte-identical copy of the old SQLite ledger, then run:
+
+```bash
+RETHLAS_HOTJOIN_RUN_ID=old-run-id \
+RETHLAS_NONFRESH_RESUME_DRY_RUN=1 \
+RETHLAS_NONFRESH_RESUME_DB_COPY=/absolute/owner-only/messages.copy.sqlite3 \
+  agents/generation/tests/run_example.sh
+```
+
+The source must be quiescent with no non-empty WAL (an idle SHM/empty WAL is
+not copied). The copy must be a distinct regular inode, have mode `0600`,
+contain no pre-existing sidecar, and byte-match the original before inspection.
+The runner executes only the content-attested adapter's read/status projection
+against that copy and exits before statement preparation, runtime snapshot,
+`init`, capability binding, recovery, review driving, Codex discovery, or any
+paid process. Its canonical JSON explicitly reports the old thread/turn,
+guardian release bit, cadence disposition, whether the copy was migrated, and
+a `recovery_migration_disposition`. A successful diagnostic command is not a
+successful resume: `resume_admitted` and `paid_processes_started` remain
+`false`, no fresh thread is synthesized, and an old stale-active run requires
+the runtime's authenticated reconcile receipt. The runner hashes the original
+ledger before and after and fails if it changed; any schema migration is
+confined to the disposable copy.
+
+After confirming the exact old thread and turn, the owner may perform that
+one-shot reconcile on another pristine `0600` copy while the guardian release
+gate remains false:
+
+```bash
+RETHLAS_HOTJOIN_RUN_ID=old-run-id \
+RETHLAS_NONFRESH_STALE_RECONCILE=1 \
+RETHLAS_NONFRESH_RESUME_DB_COPY=/absolute/owner-only/messages.copy.sqlite3 \
+RETHLAS_NONFRESH_EXPECTED_THREAD_ID=old-thread-id \
+RETHLAS_NONFRESH_EXPECTED_TURN_ID=old-turn-id \
+  agents/generation/tests/run_example.sh
+```
+
+This exception uses a fresh, dedicated stale-recovery capability bound to the
+source/copy inodes and hashes, exact thread/turn, and attested Codex bytes. It
+does not use the owner review capability. The pinned Codex executable starts
+only a non-model app-server and performs `initialize` plus one
+`thread/read(includeTurns=true)`; it cannot call `thread/resume`, `turn/start`,
+interrupt, reviewer, or verifier. A terminal observation closes only the copy
+as `operational_blocked` with an immutable quarantine and exits `70`. The
+receipt may identify one host-generated bounded handoff candidate, but it
+never authorizes resume, a fresh thread, proof evidence, or paid work. An
+in-progress observation instead records the recovery-only guardian interrupt
+intent and remains paid-disabled.
+
+The stale-recovery bearer token is intentionally memory-only. If the wrapper
+exits before committing its final receipt, discard that disposable copy and
+make a new pristine byte-identical copy from the still-attested source; a new
+token must never take over an active capability in the abandoned copy.
+
+`cadence-control-state` is the fail-closed admission projection used by the
+runner; `paid_turn_allowed=true` applies only to an initial start, a one-shot
+same-cycle continuation, or an exact `continue_next_cycle`. `resume_active_cycle` and
+`terminal_observed_pending_finalization` may authorize adapter recovery of an
+already dispatched turn while keeping `paid_turn_allowed=false`; they never
+authorize a new `turn/start`. The same is true of
+`review_boundary_recovery_required`: it may only read/interrupt/reap the exact
+pre-existing root and descendant turns. Once their authenticated terminal
+receipts are complete, `review_drive_required` forbids ordinary
+`run-generator`; only the owner-side, zero-root `review-drive` command may
+consume the bound boundary id. The adapter derives all review and terminal
+identities, securely attests the driver plus its exact dependency-package
+manifest, and returns a content-bound disposition. Successful review driving
+records the internal `post_review_handoff_required` cycle action and
+synchronously prepares its content-bound handoff. Only a completed handoff can
+make status expose `continue_reviewed_cycle_fresh_epoch`, with paid admission
+and an exact pending newer thread epoch. `run-generator` consumes that handoff
+atomically, starts a fresh thread, and replaces bootstrap input with the host's
+canonical rehydration prompt before `turn/start`; the same cycle's absolute
+`T0` remains unchanged. An incomplete top-level
+`post_review_handoff_required` stays paid-disabled. Review status/tail report
+immutable route-review state and receipts without turning the critic into a
+verifier.
+
+An exact `continue_next_cycle` starts a distinct durable cycle in the bound
+fresh thread epoch. The host records that cycle's new pre-dispatch `T0` and
+absolute review/close/hard-stop actions before any paid turn; this never resets
+or extends the already closed prior cycle. In contrast, a same-cycle clean-turn
+continuation or post-review/context rollover preserves its existing `T0`.
 
 `steer` uses `turn/steer` with the exact active turn id, so the user text joins
 the current reasoning turn. `queue` waits and starts a later turn without

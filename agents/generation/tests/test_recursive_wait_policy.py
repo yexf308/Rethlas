@@ -147,9 +147,16 @@ def test_recursive_wait_contract_uses_long_backoff_and_early_wake_reset() -> Non
         "max_consecutive_no_progress_timeouts": 4,
         "max_orchestration_resumptions": 16,
         "max_observed_orchestration_input_tokens": 3_000_000,
+        "cost_gate_policy_env": "RETHLAS_COST_GATE_POLICY",
+        "cost_gate_policy_values": ["owner_gated", "disabled_by_owner"],
+        "default_cost_gate_policy": "owner_gated",
+        "disabled_by_owner_keeps_telemetry": True,
+        "disabled_by_owner_may_yield_waiting_cost_gate": False,
         "max_status_queries_without_mailbox_change": 0,
         "reset_timeout_on_mailbox_progress": True,
-        "enforcement_scope": ("instruction_and_runner_integrity_not_runtime_mediated"),
+        "enforcement_scope": (
+            "instruction_runner_integrity_and_host_generation_yield_preflight"
+        ),
     }
     assert _replay_wait_schedule(
         policy,
@@ -168,6 +175,7 @@ def test_recursive_wait_contract_uses_long_backoff_and_early_wake_reset() -> Non
 
 def test_recursive_wait_contract_forbids_no_change_status_poll_and_auto_human() -> None:
     policy, text = _policy()
+    flattened = " ".join(text.split())
 
     assert policy["max_status_queries_without_mailbox_change"] == 0
     assert "With no new state, the permitted\n   status-query count is zero" in text
@@ -176,15 +184,18 @@ def test_recursive_wait_contract_forbids_no_change_status_poll_and_auto_human() 
     assert "do not open Chrome" in text
     assert "Only the repository owner may initiate" in text
     assert "one multi-tool response" in text
+    assert "Under `owner_gated`, either threshold stops **all** new" in flattened
     assert (
-        "Stop **all** new collaboration calls, including\n"
-        "   `wait_agent`, `list_agents`, `send_message`, and `spawn_agent`" in text
+        "including `wait_agent`, `list_agents`, `send_message`, and `spawn_agent`"
+        in flattened
     )
-    assert "continue or end locally without another poll" in text
-    assert '"status": "running|completed|waiting_cost_gate"' in text
+    assert "Under `disabled_by_owner`, those thresholds are telemetry only" in flattened
+    assert "It is never\n   `waiting_cost_gate`" in text
+    assert "continue or end locally without another poll" in flattened
+    assert '"status": "running|completed|liveness_stopped|waiting_cost_gate"' in text
     assert "waiting_cost_gate" in text
     assert "generation_yield" in text
-    assert "built-in collaboration calls bypass repository\ncode" in text
+    assert "built-in collaboration calls bypass repository code" in flattened
     assert "not a runtime interceptor" in text
 
 
@@ -376,7 +387,14 @@ def test_recursive_wait_contract_is_integrity_bound_by_runner_and_agents() -> No
     assert "Repeated 60-second polling is forbidden" in agents
     assert "only the repository owner decides" in agents
     assert 'root / "AGENTS.md"' in runner
-    assert 'trees = [root / ".codex", root / ".agents", root / "mcp"]' in runner
+    for binding in (
+        '(root / ".codex", Path(".codex"))',
+        '(root / ".agents", Path(".agents"))',
+        '(root / "mcp", Path("mcp"))',
+        '(review_root, Path("review"))',
+    ):
+        assert binding in runner
+    assert '(root / "tests" / "run_example.sh", Path("tests/run_example.sh"))' in runner
 
 
 def test_executable_policy_replay_backs_off_resets_and_stops_exactly() -> None:

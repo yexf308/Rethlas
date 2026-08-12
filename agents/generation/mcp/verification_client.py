@@ -9,6 +9,7 @@ import os
 import re
 import secrets
 import stat
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict
 from urllib.parse import urlsplit
@@ -59,9 +60,55 @@ _ITEM_CONTEXT_ATTESTATION_FIELDS = {
     "context_digest",
     "verdict",
 }
+_TARGETED_RECEIPT_FIELDS = {
+    "schema_version",
+    "ticket_id",
+    "review_id",
+    "snapshot_sha256",
+    "route_id",
+    "blueprint_sha256",
+    "blueprint_item_id",
+    "blueprint_item_label",
+    "claim_sha256",
+    "verification_deadline_utc",
+    "verification_status",
+    "verdict",
+    "verification_report",
+    "repair_hints",
+    "checked_item_ids",
+    "context_attestation",
+    "publication_authority",
+    "whole_blueprint_verdict_authority",
+    "receipt_sha256",
+}
+TARGETED_RECEIPT_SCHEMA = "rethlas_targeted_claim_verification_receipt_v1"
+MAX_TARGETED_RECEIPT_BYTES = 131_072
 MAX_BLUEPRINT_CHARS = int(os.getenv("VERIFY_MAX_PROOF_CHARS", "2000000"))
 MAX_BLUEPRINT_BYTES = int(os.getenv("VERIFY_MAX_PROOF_BYTES", "8000000"))
 _LOOPBACK_HTTP_HOSTS = {"127.0.0.1", "localhost", "::1"}
+
+
+class VerificationExecutionUnknown(requests.RequestException):
+    """The verifier crossed dispatch but lost its trusted process terminal."""
+
+
+def _raise_for_verification_service_error(response: Any) -> None:
+    if getattr(response, "status_code", None) == 502:
+        try:
+            payload = response.json()
+        except ValueError:
+            payload = None
+        detail = payload.get("detail") if isinstance(payload, dict) else None
+        if (
+            isinstance(detail, dict)
+            and detail.get("code") == "verifier_execution_unknown"
+        ):
+            # Deliberately leave ``response`` unset.  The durable caller maps
+            # this post-dispatch ambiguity to execution_unknown/no retry.
+            raise VerificationExecutionUnknown(
+                "verification supervisor terminal was lost after dispatch"
+            )
+    response.raise_for_status()
 
 
 def _nonnegative_limit(name: str, default: int) -> int:
@@ -607,12 +654,212 @@ def validate_service_response(
     return payload
 
 
+def _parse_targeted_manifest(statement: str, proof: str) -> ProofManifest:
+    try:
+        return parse_blueprint(proof)
+    except ValueError:
+        return parse_blueprint(proof, target_statement=statement)
+
+
+def validate_targeted_claim_receipt(
+    payload: object,
+    *,
+    ticket: Dict[str, Any],
+    statement: str,
+    proof: str,
+    verification_deadline_utc: str,
+) -> Dict[str, Any]:
+    """Validate one nonpublishing verifier receipt against local source bytes."""
+
+    if not isinstance(payload, dict) or set(payload) != _TARGETED_RECEIPT_FIELDS:
+        raise ValueError("targeted verifier returned an invalid receipt shape")
+    if payload["schema_version"] != TARGETED_RECEIPT_SCHEMA:
+        raise ValueError("targeted verifier returned an unsupported receipt schema")
+    claim = ticket.get("claim")
+    if not isinstance(claim, dict):
+        raise ValueError("targeted verifier ticket lacks an exact claim")
+    expected = {
+        "ticket_id": ticket.get("ticket_id"),
+        "review_id": ticket.get("review_id"),
+        "snapshot_sha256": ticket.get("snapshot_sha256"),
+        "route_id": ticket.get("route_id"),
+        "blueprint_sha256": ticket.get("blueprint_sha256"),
+        "blueprint_item_id": ticket.get("blueprint_item_id"),
+        "blueprint_item_label": claim.get("blueprint_item_label"),
+        "claim_sha256": claim.get("claim_sha256"),
+    }
+    if any(payload[key] != value for key, value in expected.items()):
+        raise ValueError("targeted verifier receipt binding mismatch")
+    try:
+        deadline = datetime.fromisoformat(verification_deadline_utc)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("targeted verification deadline is invalid") from exc
+    if (
+        deadline.tzinfo is None
+        or deadline.utcoffset() != timedelta(0)
+        or verification_deadline_utc
+        != deadline.astimezone(timezone.utc).isoformat()
+        or payload["verification_deadline_utc"] != verification_deadline_utc
+    ):
+        raise ValueError("targeted verifier receipt deadline binding mismatch")
+    observed_blueprint_sha = proof_digest(proof)
+    if observed_blueprint_sha != expected["blueprint_sha256"]:
+        raise ValueError("targeted verifier blueprint changed before response validation")
+    manifest = _parse_targeted_manifest(statement, proof)
+    item_matches = [
+        item for item in manifest.items if item.label == expected["blueprint_item_label"]
+    ]
+    if len(item_matches) != 1:
+        raise ValueError("targeted verifier claim label is not unique in blueprint")
+    item = item_matches[0]
+    if item.item_id != expected["blueprint_item_id"] or item.digest != expected["claim_sha256"]:
+        raise ValueError("targeted verifier claim commitment disagrees with blueprint")
+    if payload["verification_status"] != "final" or payload["verdict"] not in {
+        "correct",
+        "wrong",
+    }:
+        raise ValueError("targeted verifier receipt lacks a final verdict")
+    report = payload["verification_report"]
+    if not isinstance(report, dict) or set(report) != _REPORT_FIELDS:
+        raise ValueError("targeted verification_report has an invalid shape")
+    if not isinstance(report["summary"], str):
+        raise ValueError("targeted verification_report summary must be a string")
+    critical_errors = _validate_findings(
+        report["critical_errors"], "targeted verification_report.critical_errors"
+    )
+    gaps = _validate_findings(report["gaps"], "targeted verification_report.gaps")
+    repair_hints = payload["repair_hints"]
+    if not isinstance(repair_hints, str):
+        raise ValueError("targeted repair_hints must be a string")
+    has_findings = bool(critical_errors or gaps)
+    if payload["verdict"] == "correct" and (has_findings or repair_hints != ""):
+        raise ValueError("targeted correct verdict conflicts with findings")
+    if payload["verdict"] == "wrong" and (not has_findings or not repair_hints.strip()):
+        raise ValueError("targeted wrong verdict requires findings and repair hints")
+    if payload["checked_item_ids"] != [item.item_id]:
+        raise ValueError("targeted verifier checked an unexpected item set")
+    attestation = payload["context_attestation"]
+    if not isinstance(attestation, dict) or set(attestation) != _ITEM_CONTEXT_ATTESTATION_FIELDS:
+        raise ValueError("targeted verifier context attestation has an invalid shape")
+    if (
+        attestation["item_id"] != item.item_id
+        or attestation["disposition"] != "verified"
+        or attestation["verdict"] != payload["verdict"]
+        or isinstance(attestation["final_round"], bool)
+        or not isinstance(attestation["final_round"], int)
+        or not 0 <= attestation["final_round"] <= MAX_EXPANSION_ROUNDS
+        or not isinstance(attestation["max_chars"], int)
+        or not 0 < attestation["max_chars"] <= VERIFY_CONTEXT_MAX_CHARS
+    ):
+        raise ValueError("targeted verifier context attestation is inconsistent")
+    expanded_ids = attestation["expanded_proof_ids"]
+    if (
+        not isinstance(expanded_ids, list)
+        or len(expanded_ids) > MAX_EXPANDED_PROOFS
+        or len(set(expanded_ids)) != len(expanded_ids)
+        or any(not isinstance(value, str) or _ITEM_ID_RE.fullmatch(value) is None for value in expanded_ids)
+    ):
+        raise ValueError("targeted verifier expanded proof ids are invalid")
+    rebuilt = build_item_context(
+        manifest,
+        item.item_id,
+        max_chars=attestation["max_chars"],
+        expanded_proof_ids=expanded_ids,
+        round_index=attestation["final_round"],
+    )
+    if (
+        rebuilt["digest"] != attestation["context_digest"]
+        or rebuilt["expanded_proof_ids"] != expanded_ids
+        or rebuilt["missing"]
+        or rebuilt["omitted"]
+    ):
+        raise ValueError("targeted verifier context cannot be rebuilt exactly")
+    if (
+        payload["publication_authority"] is not False
+        or payload["whole_blueprint_verdict_authority"] is not False
+    ):
+        raise ValueError("targeted verifier receipt attempted to acquire publication authority")
+    seed = dict(payload)
+    receipt_sha = seed.pop("receipt_sha256")
+    if not isinstance(receipt_sha, str) or _HEX_DIGEST_RE.fullmatch(receipt_sha) is None:
+        raise ValueError("targeted verifier receipt digest is invalid")
+    encoded = json.dumps(
+        seed,
+        allow_nan=False,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    if len(encoded) > MAX_TARGETED_RECEIPT_BYTES:
+        raise ValueError("targeted verifier receipt exceeds its byte bound")
+    if hashlib.sha256(encoded).hexdigest() != receipt_sha:
+        raise ValueError("targeted verifier receipt content address mismatch")
+    return dict(payload)
+
+
+def verify_targeted_claim_service(
+    *,
+    statement: str,
+    proof: str,
+    ticket: Dict[str, Any],
+    verification_deadline_utc: str,
+    endpoint: str,
+    timeout_seconds: int = 3600,
+    api_token: str | None = None,
+) -> Dict[str, Any]:
+    """Invoke the isolated service once for one prevalidated official ticket."""
+
+    if not isinstance(statement, str) or not statement.strip():
+        raise ValueError("statement must be non-empty")
+    if not isinstance(proof, str) or not proof.strip():
+        raise ValueError("blueprint must be non-empty")
+    if timeout_seconds <= 0:
+        raise ValueError("timeout_seconds must be > 0")
+    try:
+        deadline = datetime.fromisoformat(verification_deadline_utc)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("verification_deadline_utc is invalid") from exc
+    if (
+        deadline.tzinfo is None
+        or deadline.utcoffset() != timedelta(0)
+        or verification_deadline_utc
+        != deadline.astimezone(timezone.utc).isoformat()
+    ):
+        raise ValueError("verification_deadline_utc must be canonical UTC")
+    endpoint = _validate_endpoint(endpoint)
+    request_kwargs: Dict[str, Any] = {
+        "json": {
+            "statement": statement,
+            "proof": proof,
+            "ticket": ticket,
+            "verification_deadline_utc": verification_deadline_utc,
+        },
+        "timeout": timeout_seconds,
+    }
+    if api_token:
+        request_kwargs["headers"] = {"Authorization": f"Bearer {api_token}"}
+    response = requests.post(endpoint, **request_kwargs)
+    _raise_for_verification_service_error(response)
+    try:
+        raw_payload = response.json()
+    except ValueError as exc:
+        raise ValueError("targeted verification service returned non-JSON") from exc
+    return validate_targeted_claim_receipt(
+        raw_payload,
+        ticket=ticket,
+        statement=statement,
+        proof=proof,
+        verification_deadline_utc=verification_deadline_utc,
+    )
+
+
 def verify_blueprint_file(
     *,
     statement: str,
     draft_path: Path,
     verified_path: Path,
     endpoint: str,
+    verification_deadline_utc: str | None = None,
     timeout_seconds: int = 3600,
     api_token: str | None = None,
     receipt_path: Path | None = None,
@@ -625,6 +872,27 @@ def verify_blueprint_file(
         raise ValueError("statement must be non-empty")
     if timeout_seconds <= 0:
         raise ValueError("timeout_seconds must be > 0")
+    if verification_deadline_utc is None:
+        verification_deadline_utc = (
+            datetime.now(timezone.utc) + timedelta(seconds=timeout_seconds)
+        ).isoformat()
+    try:
+        deadline = datetime.fromisoformat(verification_deadline_utc)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("verification_deadline_utc is invalid") from exc
+    if (
+        deadline.tzinfo is None
+        or deadline.utcoffset() != timedelta(0)
+        or verification_deadline_utc
+        != deadline.astimezone(timezone.utc).isoformat()
+    ):
+        raise ValueError("verification_deadline_utc must be canonical UTC")
+    remaining_seconds = (deadline - datetime.now(timezone.utc)).total_seconds()
+    if remaining_seconds <= 0:
+        raise ValueError("verification_deadline_utc has already expired")
+    transport_timeout = min(
+        float(timeout_seconds), max(1.0, remaining_seconds + 5.0)
+    )
     endpoint = _validate_endpoint(endpoint)
     draft_path = _absolute_path(draft_path)
     verified_path = _absolute_path(verified_path)
@@ -733,13 +1001,17 @@ def verify_blueprint_file(
         expected_context_digest = aggregate_context_digest(expected_manifest)
 
         request_kwargs: Dict[str, Any] = {
-            "json": {"statement": statement, "proof": proof},
-            "timeout": timeout_seconds,
+            "json": {
+                "statement": statement,
+                "proof": proof,
+                "verification_deadline_utc": verification_deadline_utc,
+            },
+            "timeout": transport_timeout,
         }
         if api_token:
             request_kwargs["headers"] = {"Authorization": f"Bearer {api_token}"}
         response = requests.post(endpoint, **request_kwargs)
-        response.raise_for_status()
+        _raise_for_verification_service_error(response)
         try:
             raw_payload = response.json()
         except ValueError as exc:

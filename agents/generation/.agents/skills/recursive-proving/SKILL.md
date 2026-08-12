@@ -16,9 +16,14 @@ Use this skill when direct proving has failed on the current decomposition plans
   "max_consecutive_no_progress_timeouts": 4,
   "max_orchestration_resumptions": 16,
   "max_observed_orchestration_input_tokens": 3000000,
+  "cost_gate_policy_env": "RETHLAS_COST_GATE_POLICY",
+  "cost_gate_policy_values": ["owner_gated", "disabled_by_owner"],
+  "default_cost_gate_policy": "owner_gated",
+  "disabled_by_owner_keeps_telemetry": true,
+  "disabled_by_owner_may_yield_waiting_cost_gate": false,
   "max_status_queries_without_mailbox_change": 0,
   "reset_timeout_on_mailbox_progress": true,
-  "enforcement_scope": "instruction_and_runner_integrity_not_runtime_mediated"
+  "enforcement_scope": "instruction_runner_integrity_and_host_generation_yield_preflight"
 }
 -->
 
@@ -76,7 +81,13 @@ code: this is an instruction-level flow contract, not a runtime interceptor. It
 budgets root-agent orchestration resumptions, not mathematical work performed
 inside a sub-agent. The collaboration runtime does not expose a trustworthy
 orchestration-only token counter, so the input-token gate applies when usage is
-observable; the resumption gate is the mandatory proxy otherwise.
+observable; the resumption counter is the mandatory proxy otherwise. The
+durable owner policy `RETHLAS_COST_GATE_POLICY` decides whether those two
+thresholds stop orchestration. It defaults to `owner_gated` and cannot be
+changed by the model or a wrapper restart. Under `disabled_by_owner`, keep
+recording the counters and threshold crossings, but do not stop, yield, prune a
+proof lane, or ask for owner input because of token, resumption, elapsed-time,
+or model-cost telemetry.
 
 ## Input Contract
 
@@ -149,16 +160,23 @@ to rediscover it.
    periodic "still working?" prompts. One follow-up fanout batch is the default
    maximum for a recursive round.
 6. Count every root-model resumption after a collaboration tool result as one
-   orchestration resumption. Stop **all** new collaboration calls, including
-   `wait_agent`, `list_agents`, `send_message`, and `spawn_agent`, when either
-   16 resumptions or 3,000,000 observed orchestration input tokens is reached.
-   Also stop after four consecutive no-progress timeouts. Persist the exact
-   gate reason, then continue or end locally without another poll, and leave
-   the recursive round incomplete; do not invent missing reports or convert
-   the gate into a mathematical verdict.
-7. A cost gate is deterministic flow control, not a request for human input.
-   Never invent or inject a human hot-join message, and never decide on the
-   owner's behalf that human intervention should occur.
+   orchestration resumption, and always persist whether 16 resumptions or
+   3,000,000 observed orchestration input tokens has been crossed. Under
+   `owner_gated`, either threshold stops **all** new collaboration calls,
+   including `wait_agent`, `list_agents`, `send_message`, and `spawn_agent`.
+   Under `disabled_by_owner`, those thresholds are telemetry only: continue the
+   completion-driven protocol without a cost yield. Independently of cost
+   policy, stop the recursive round after four consecutive no-progress
+   timeouts, persist that liveness failure, and continue or end locally without
+   another poll. This is a route/liveness decision: return the bounded evidence
+   to the root or the already scheduled critic. It is never
+   `waiting_cost_gate`, never a self-issued review verdict, never a new `T0`,
+   and never permission to work through a review or hard-stop boundary. Never
+   invent missing reports or convert a cost/liveness gate into a mathematical
+   verdict.
+7. An enabled cost gate is deterministic flow control, not a request for human
+   input. Never invent or inject a human hot-join message, and never decide on
+   the owner's behalf that human intervention should occur.
    It also never authorizes an advisor request: do not open Chrome, invoke a
    browser advisor, prepare/authorize/retry an advisor job, or ask another agent
    to do so. Only the repository owner may initiate that separate workflow.
@@ -258,15 +276,17 @@ Append an `events` record for the recursive round:
   "shared_stuck_points": {
     "plan_id": ["..."]
   },
-  "status": "running|completed|waiting_cost_gate",
+  "status": "running|completed|liveness_stopped|waiting_cost_gate",
   "successful_plan_ids": ["..."],
   "failed_plan_ids": ["..."],
   "candidate_preempted_wait_all": false,
   "expansion_cost_justification": null,
   "orchestration_cost": {
     "policy_id": "rethlas_recursive_wait_v1",
+    "cost_gate_policy": "owner_gated|disabled_by_owner",
     "orchestration_resumptions": 0,
     "observed_orchestration_input_tokens": null,
+    "observed_thresholds": [],
     "wait_timeouts_ms": [],
     "no_progress_timeouts": 0,
     "status_queries": 0,
@@ -278,12 +298,20 @@ Append an `events` record for the recursive round:
 ```
 
 Update `branch_states` with the recursive round status and per-plan outcomes.
-If a cost gate fires, use `status="waiting_cost_gate"`, keep unfinished plan IDs
-out of both outcome lists, and persist the same `orchestration_cost` object.
-Retain the recursive-round event and branch-state record ids, then call
+After four consecutive no-progress timeouts, use `status="liveness_stopped"`,
+persist the bounded reports and missing agent ids, issue no generation yield,
+and return control to the root or scheduled route review under the unchanged
+cycle clock.
+Only under `owner_gated`, if a cost threshold fires, use
+`status="waiting_cost_gate"`, keep unfinished plan IDs out of both outcome
+lists, and persist the same `orchestration_cost` object. Retain the
+recursive-round event and branch-state record ids, then call
 `generation_yield(problem_id, state="waiting_cost_gate", reason=...,
 evidence_record_ids=[recursive_event_id, branch_state_id])` as the final tool
-action. Do not issue another collaboration or reasoning call afterward.
+action. Do not issue another collaboration or reasoning call afterward. Under
+`disabled_by_owner`, record the threshold in `observed_thresholds` but never
+write `waiting_cost_gate` and never call that yield; the trusted MCP/host
+preflight rejects such a call before any control record is written.
 
 ## Tools
 
@@ -292,7 +320,17 @@ action. Do not issue another collaboration or reasoning call afterward.
 - `memory_append_batch`
 - `branch_update`
 - `generation_yield`
-- `search_arxiv_theorems`
+- `search_matlas_theorems` (official Matlas published-journal/book search) and
+  the distinct legacy `search_arxiv_theorems` Danus/LeanSearch arXiv provider;
+  neither is an implicit fallback, and results are leads rather than proof
+  evidence or full articles/PDFs. Record provider errors as operational and
+  use at most one authorized web/arXiv fallback for the same named gap within
+  the two-query limit.
+  For official results retain `candidate_id`, map `paper_id` to a nonempty DOI
+  (or title/authors/year with a web-verification obligation), and map
+  `theorem_id` to `entity_name`. Preserve `candidate_id` as the provider
+  candidate ID; do not treat it as the bibliographic theorem number. Legacy
+  results keep `arxiv_id`/`theorem_id`, and unread primary text stays a lead.
 - Codex sub-agent tools: `spawn_agent`, `send_message`, `wait_agent`,
   `list_agents`, and `interrupt_agent` when available (exact availability
   varies by host)

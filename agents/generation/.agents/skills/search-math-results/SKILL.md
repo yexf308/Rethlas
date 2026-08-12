@@ -29,13 +29,17 @@ Read:
 1. State the named gap and why resolving it could change the active route. If
    that cannot be stated precisely, return to independent reasoning without a
    search call.
-2. Start with one `search_arxiv_theorems` query.
+2. Start with one `search_matlas_theorems` query against the official Matlas
+   corpus of published papers and books. The separate
+   `search_arxiv_theorems` tool is the historical Danus/LeanSearch arXiv
+   provider, not an alias or implicit fallback; record the selected provider.
 3. Phrase the query as a complete mathematical statement whenever possible,
    inspect the results, and stop as soon as the named gap is resolved or the
    active route is killed.
-4. If the theorem query is not useful, use at most one built-in web-search
-   query for the same named gap. Do not broaden it into a survey. The total
-   query budget for one gap is two.
+4. If the Matlas query is not useful, use at most one additional authorized
+   retrieval for the same named gap: either the distinct legacy arXiv tool or
+   one built-in web/arXiv search, never both. Do not broaden it into a survey.
+   The total query budget for one gap is two.
 5. Download a paper only when one identified result is likely to resolve the
    named gap. Keep the PDF and extracted text inside `downloads/`, read the
    relevant proof and definitions, and verify applicability before relying on
@@ -72,7 +76,7 @@ Return this compact record to the root for inclusion in the next
   "query_count": 1,
   "query": "...",
   "search_intent": "theorem|construction|example|counterexample|background",
-  "primary_tool": "search_arxiv_theorems",
+  "primary_tool": "search_matlas_theorems",
   "fallback_used": false,
   "results_summary": ["..."],
   "useful_references": [
@@ -80,6 +84,14 @@ Return this compact record to the root for inclusion in the next
       "title": "...",
       "complete_statement": "...",
       "url_or_id": "...",
+      "provider": "matlas_official_v0_1|danus_legacy_arxiv_theorem_v1|web",
+      "source_type": "paper|book|optional",
+      "candidate_id": "official Matlas provider candidate id, optional",
+      "doi": "official Matlas DOI, optional",
+      "entity_name": "official Matlas theorem/lemma/definition label, optional",
+      "authors": "optional",
+      "journal": "optional",
+      "year": "optional",
       "paper_id": "...",
       "arxiv_id": "...",
       "theorem_id": "...",
@@ -97,9 +109,18 @@ Return this compact record to the root for inclusion in the next
 }
 ```
 
+For an official Matlas lead, preserve `candidate_id` as the provider's
+candidate id; do not treat it as a bibliographic theorem number. Use a nonempty
+DOI as `paper_id`; if DOI is empty, retain title/authors/year and record that a
+stable paper id still requires web verification. Use `entity_name` as the
+local `theorem_id` mapping. For the legacy provider, retain its native
+`arxiv_id` and `theorem_id`. Until the primary source has been read, every
+result remains a lead rather than mathematical evidence.
+
 ## MCP Tools
 
-- `search_arxiv_theorems`
+- `search_matlas_theorems`
+- `search_arxiv_theorems` (distinct legacy arXiv provider; never implicit)
 - `memory_append`
 - `memory_search`
 

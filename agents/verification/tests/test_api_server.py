@@ -1,12 +1,17 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
+import signal
 import subprocess
 import sys
+import tempfile
 import threading
+import time
 import tomllib
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from pathlib import Path
 from typing import Any
@@ -29,6 +34,7 @@ from api.proof_context import aggregate_context_digest, parse_blueprint  # noqa:
 
 
 _REAL_REQUIRE_MCP_RUNTIME = server._require_mcp_runtime
+TARGETED_DEADLINE = "2099-01-01T00:00:00+00:00"
 
 
 @pytest.fixture(autouse=True)
@@ -57,6 +63,42 @@ def two_item_proof() -> str:
             item("theorem thm:main", "S", "By lem:a, S.", "lem:a"),
         ]
     )
+
+
+def targeted_ticket(
+    proof: str,
+    *,
+    label: str | None = None,
+    claim_sha256: str | None = None,
+) -> dict[str, Any]:
+    manifest = parse_blueprint(proof)
+    bound = manifest.items[0]
+    claim = {
+        "blueprint_item_label": bound.label if label is None else label,
+        "claim_sha256": bound.digest if claim_sha256 is None else claim_sha256,
+        "reason": "This is the one load-bearing bridge.",
+    }
+    seed = {
+        "review_id": "review_" + "1" * 32,
+        "snapshot_sha256": "2" * 64,
+        "route_id": "route-a",
+        "blueprint_sha256": hashlib.sha256(proof.encode()).hexdigest(),
+        "blueprint_item_id": bound.item_id,
+        "claim": claim,
+    }
+    return {
+        "schema_version": "rethlas_targeted_claim_ticket_v2",
+        "ticket_id": "claim_"
+        + hashlib.sha256(
+            json.dumps(
+                seed, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+            ).encode()
+        ).hexdigest()[:32],
+        **seed,
+        "verification_mode": "targeted_nonpublishing",
+        "publication_authority": False,
+        "whole_blueprint_verdict_authority": False,
+    }
 
 
 def model_output(
@@ -102,6 +144,117 @@ def needs_context_output(
         verification_status="needs_context",
         needs_expanded_proofs=requests,
     )
+
+
+def test_targeted_claim_checks_exact_item_and_returns_nonpublishing_receipt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    proof = two_item_proof()
+    ticket = targeted_ticket(proof)
+    monkeypatch.setattr(server, "RESULTS_ROOT", tmp_path / "results")
+    calls = 0
+
+    def fake_targeted(**kwargs: Any) -> tuple[dict[str, Any], dict[str, Any], list[Any]]:
+        nonlocal calls
+        calls += 1
+        context = server.build_item_context(
+            kwargs["manifest"],
+            kwargs["item_id"],
+            max_chars=server.VERIFY_CONTEXT_MAX_CHARS,
+        )
+        return (
+            model_output(
+                proof_digest=kwargs["manifest"].proof_digest,
+                context=context,
+            ),
+            context,
+            [],
+        )
+
+    monkeypatch.setattr(server, "run_adaptive_item_verification", fake_targeted)
+    receipt = server.verify_targeted_claim("S", proof, ticket, TARGETED_DEADLINE)
+
+    assert calls == 1
+    assert receipt["ticket_id"] == ticket["ticket_id"]
+    assert receipt["checked_item_ids"] == [ticket["blueprint_item_id"]]
+    assert receipt["verification_deadline_utc"] == TARGETED_DEADLINE
+    assert receipt["publication_authority"] is False
+    assert receipt["whole_blueprint_verdict_authority"] is False
+
+
+@pytest.mark.parametrize("corruption", ["unknown_label", "wrong_hash", "mutation"])
+def test_targeted_claim_rejects_unbound_claim_before_model(
+    corruption: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    proof = two_item_proof()
+    if corruption == "unknown_label":
+        ticket = targeted_ticket(proof, label="lem:hallucinated")
+        supplied_proof = proof
+    elif corruption == "wrong_hash":
+        ticket = targeted_ticket(proof, claim_sha256="f" * 64)
+        supplied_proof = proof
+    else:
+        ticket = targeted_ticket(proof)
+        supplied_proof = proof + "\nmutated"
+    monkeypatch.setattr(server, "RESULTS_ROOT", tmp_path / "results")
+    monkeypatch.setattr(
+        server,
+        "run_adaptive_item_verification",
+        lambda **kwargs: pytest.fail("targeted verifier model must not start"),
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        server.verify_targeted_claim(
+            "S", supplied_proof, ticket, TARGETED_DEADLINE
+        )
+
+    assert exc_info.value.status_code == 422
+    assert not (tmp_path / "results").exists()
+
+
+def test_expired_targeted_deadline_starts_no_model_or_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    proof = two_item_proof()
+    ticket = targeted_ticket(proof)
+    monkeypatch.setattr(server, "RESULTS_ROOT", tmp_path / "results")
+    monkeypatch.setattr(
+        server,
+        "run_adaptive_item_verification",
+        lambda **kwargs: pytest.fail("expired targeted request must not start a model"),
+    )
+    with pytest.raises(HTTPException) as exc_info:
+        server.verify_targeted_claim(
+            "S", proof, ticket, "2000-01-01T00:00:00+00:00"
+        )
+    assert exc_info.value.status_code == 504
+    assert not (tmp_path / "results").exists()
+
+
+def test_targeted_model_deadline_is_capped_by_host_t90(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    proof = two_item_proof()
+    ticket = targeted_ticket(proof)
+    monkeypatch.setattr(server, "RESULTS_ROOT", tmp_path / "results")
+    host_deadline = datetime.now(timezone.utc) + timedelta(seconds=3)
+    deadline_text = host_deadline.isoformat()
+    observed_remaining: list[float] = []
+
+    def crosses_deadline(**kwargs: Any):
+        observed_remaining.append(kwargs["deadline"] - time.monotonic())
+        raise HTTPException(status_code=504, detail="simulated verifier timeout")
+
+    monkeypatch.setattr(server, "run_adaptive_item_verification", crosses_deadline)
+    with pytest.raises(HTTPException) as exc_info:
+        server.verify_targeted_claim("S", proof, ticket, deadline_text)
+    assert exc_info.value.status_code == 504
+    assert len(observed_remaining) == 1
+    assert 0 < observed_remaining[0] <= 3
+    assert not list((tmp_path / "results").rglob("targeted_verification.json"))
 
 
 def test_blueprint_is_verified_item_by_item_without_ancestor_proofs(
@@ -627,7 +780,11 @@ def test_broken_mcp_runtime_import_creates_no_run_and_starts_no_codex(
 def test_endpoint_token_and_busy_slot_fail_closed(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    request = server.VerifyRequest(statement="S", proof="proof")
+    request = server.VerifyRequest(
+        statement="S",
+        proof="proof",
+        verification_deadline_utc=TARGETED_DEADLINE,
+    )
     monkeypatch.setattr(server, "VERIFY_API_TOKEN", "secret")
     with pytest.raises(HTTPException) as unauthorized:
         server.verify(request, authorization=None)
@@ -668,6 +825,21 @@ def test_request_body_limit_counts_streamed_bytes_before_json_parsing(
     )
     assert response.status_code == 413
     assert "too large" in response.json()["detail"]
+
+
+def test_whole_verification_endpoint_requires_absolute_deadline_before_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(server, "VERIFY_API_TOKEN", "")
+    monkeypatch.setattr(
+        server,
+        "verify_blueprint",
+        lambda *args, **kwargs: pytest.fail("missing deadline must make zero calls"),
+    )
+    response = TestClient(server.app).post(
+        "/verify", json={"statement": "S", "proof": "proof"}
+    )
+    assert response.status_code == 422
 
 
 def test_admission_slot_is_acquired_before_body_parsing(
@@ -755,6 +927,24 @@ def test_overall_deadline_stops_before_starting_next_model(
     assert "deadline" in str(exc_info.value.detail)
 
 
+def test_expired_whole_verification_deadline_starts_zero_models(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(server, "RESULTS_ROOT", tmp_path / "results")
+    monkeypatch.setattr(
+        server,
+        "run_codex_item_verification",
+        lambda **kwargs: pytest.fail("expired request must make zero model calls"),
+    )
+    with pytest.raises(HTTPException) as exc_info:
+        server.verify_blueprint(
+            "S", "proof", "2000-01-01T00:00:00+00:00"
+        )
+    assert exc_info.value.status_code == 504
+    assert not (tmp_path / "results").exists()
+
+
 @pytest.mark.parametrize("corrupt_digest", [False, True])
 def test_codex_item_output_is_bound_to_expected_context(
     corrupt_digest: bool,
@@ -801,7 +991,7 @@ def test_codex_item_output_is_bound_to_expected_context(
         output_path.write_text(json.dumps(payload), encoding="utf-8")
         return SimpleNamespace(returncode=0)
 
-    monkeypatch.setattr(server.subprocess, "run", fake_subprocess_run)
+    monkeypatch.setattr(server, "_run_codex_process_group", fake_subprocess_run)
     if corrupt_digest:
         with pytest.raises(HTTPException) as exc_info:
             server.run_codex_item_verification(
@@ -905,7 +1095,7 @@ def test_codex_item_output_rejects_unsafe_or_invalid_artifacts(
             raise AssertionError(f"unknown artifact {artifact}")
         return SimpleNamespace(returncode=0)
 
-    monkeypatch.setattr(server.subprocess, "run", fake_subprocess_run)
+    monkeypatch.setattr(server, "_run_codex_process_group", fake_subprocess_run)
     with pytest.raises(HTTPException) as exc_info:
         server.run_codex_item_verification(
             run_id="unsafe-output-run",
@@ -935,7 +1125,7 @@ def test_nonzero_codex_exit_is_rejected_even_with_valid_output(
         output_path.write_text(json.dumps(payload), encoding="utf-8")
         return SimpleNamespace(returncode=7)
 
-    monkeypatch.setattr(server.subprocess, "run", fake_subprocess_run)
+    monkeypatch.setattr(server, "_run_codex_process_group", fake_subprocess_run)
     with pytest.raises(HTTPException) as exc_info:
         server.run_codex_item_verification(
             run_id="failed-codex-run",
@@ -951,3 +1141,281 @@ def test_nonzero_codex_exit_is_rejected_even_with_valid_output(
     assert json.dumps(payload) not in log_text
     assert "codex_returncode: 7" in log_text
     assert "codex_status: failed" in log_text
+
+
+@pytest.mark.skipif(os.name != "posix", reason="process-group semantics are POSIX")
+def test_codex_timeout_kills_descendant_process_group(tmp_path: Path) -> None:
+    child_pid_path = tmp_path / "child.pid"
+    script = tmp_path / "spawn_descendant.py"
+    script.write_text(
+        "\n".join(
+            [
+                "import pathlib, signal, subprocess, sys, time",
+                "child_code = (",
+                "    'import os,pathlib,signal,sys,time; '",
+                "    'signal.signal(signal.SIGTERM, signal.SIG_IGN); '",
+                "    'pathlib.Path(sys.argv[1]).write_text(str(os.getpid())); '",
+                "    'time.sleep(30)'",
+                ")",
+                "subprocess.Popen([sys.executable, '-c', child_code, sys.argv[1]])",
+                "signal.signal(signal.SIGTERM, signal.SIG_IGN)",
+                "time.sleep(30)",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    with tempfile.TemporaryFile(mode="w+b") as output:
+        with pytest.raises(subprocess.TimeoutExpired):
+            server._run_codex_process_group(
+                [sys.executable, str(script), str(child_pid_path)],
+                cwd=tmp_path,
+                input="",
+                stdout=output,
+                stderr=subprocess.STDOUT,
+                text=True,
+                timeout=0.5,
+                check=False,
+                env=os.environ,
+                guard_path=tmp_path / "process_guard.json",
+                guard_run_id="timeout-test",
+            )
+    guard = json.loads((tmp_path / "process_guard.json").read_text(encoding="utf-8"))
+    assert guard["schema_version"] == "rethlas_verifier_process_guard_v1"
+    assert guard["run_id"] == "timeout-test"
+    assert guard["state"] == "timed_out"
+    child_pid = int(child_pid_path.read_text(encoding="utf-8"))
+    poll_deadline = time.monotonic() + 2.0
+    while time.monotonic() < poll_deadline:
+        status = subprocess.run(
+            ["ps", "-o", "stat=", "-p", str(child_pid)],
+            capture_output=True,
+            text=True,
+            check=False,
+        ).stdout.strip()
+        if not status or status.startswith("Z"):
+            break
+        time.sleep(0.05)
+    else:
+        pytest.fail("verifier descendant survived the process-group timeout")
+
+
+@pytest.mark.skipif(os.name != "posix", reason="process-group semantics are POSIX")
+def test_verifier_supervisor_kills_model_when_service_is_sigkilled(
+    tmp_path: Path,
+) -> None:
+    model_pid_path = tmp_path / "model.pid"
+    wrapper_pid_path = tmp_path / "wrapper.pid"
+    model_script = tmp_path / "model.py"
+    model_script.write_text(
+        "\n".join(
+            [
+                "import os, pathlib, signal, sys, time",
+                "signal.signal(signal.SIGTERM, signal.SIG_IGN)",
+                "pathlib.Path(sys.argv[1]).write_text(str(os.getpid()))",
+                "time.sleep(30)",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    launcher_script = tmp_path / "service_launcher.py"
+    launcher_script.write_text(
+        "\n".join(
+            [
+                "import os, pathlib, subprocess, sys, time",
+                "output = open(sys.argv[5], 'wb')",
+                "wrapper = subprocess.Popen([",
+                "    sys.executable, '-I', '-B', sys.argv[1],",
+                "    str(os.getpid()), str(time.time() + 20),",
+                "    str(pathlib.Path(sys.argv[4]).with_suffix('.child.json')), '--',",
+                "    sys.executable, sys.argv[2], sys.argv[3],",
+                "], stdin=subprocess.PIPE, stdout=output, stderr=subprocess.STDOUT, start_new_session=True)",
+                "pathlib.Path(sys.argv[4]).write_text(str(wrapper.pid))",
+                "wrapper.communicate(input=b'', timeout=25)",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    supervisor = Path(server.__file__).with_name("process_supervisor.py")
+    output_path = tmp_path / "output.log"
+    launcher = subprocess.Popen(
+        [
+            sys.executable,
+            str(launcher_script),
+            str(supervisor),
+            str(model_script),
+            str(model_pid_path),
+            str(wrapper_pid_path),
+            str(output_path),
+        ],
+        start_new_session=True,
+    )
+    wait_deadline = time.monotonic() + 3.0
+    while time.monotonic() < wait_deadline and not model_pid_path.exists():
+        time.sleep(0.05)
+    assert model_pid_path.exists(), "supervised model never started"
+    model_pid = int(model_pid_path.read_text(encoding="utf-8"))
+    wrapper_pid = int(wrapper_pid_path.read_text(encoding="utf-8"))
+
+    os.kill(launcher.pid, signal.SIGKILL)
+    launcher.wait(timeout=2.0)
+    poll_deadline = time.monotonic() + 3.0
+    while time.monotonic() < poll_deadline:
+        statuses = []
+        for pid in (model_pid, wrapper_pid):
+            statuses.append(
+                subprocess.run(
+                    ["ps", "-o", "stat=", "-p", str(pid)],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                ).stdout.strip()
+            )
+        if all(not status or status.startswith("Z") for status in statuses):
+            break
+        time.sleep(0.05)
+    else:
+        for pid in (model_pid, wrapper_pid):
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        pytest.fail("verifier supervisor left paid model work after service SIGKILL")
+
+
+@pytest.mark.skipif(os.name != "posix", reason="process-group semantics are POSIX")
+def test_service_reaps_model_group_when_supervisor_itself_is_sigkilled(
+    tmp_path: Path,
+) -> None:
+    model_pid_path = tmp_path / "model.pid"
+    model_script = tmp_path / "model.py"
+    model_script.write_text(
+        "\n".join(
+            [
+                "import os, pathlib, signal, sys, time",
+                "signal.signal(signal.SIGTERM, signal.SIG_IGN)",
+                "pathlib.Path(sys.argv[1]).write_text(str(os.getpid()))",
+                "time.sleep(30)",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    guard_path = tmp_path / "process_guard.json"
+    outcome: dict[str, Any] = {}
+
+    def run_service_call() -> None:
+        with tempfile.TemporaryFile(mode="w+b") as output:
+            try:
+                outcome["result"] = server._run_codex_process_group(
+                    [sys.executable, str(model_script), str(model_pid_path)],
+                    cwd=tmp_path,
+                    input="",
+                    stdout=output,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    timeout=20,
+                    check=False,
+                    env=os.environ,
+                    guard_path=guard_path,
+                    guard_run_id="wrapper-sigkill-test",
+                )
+            except BaseException as exc:  # recorded for the parent assertion
+                outcome["error"] = exc
+
+    worker = threading.Thread(target=run_service_call, daemon=True)
+    worker.start()
+    wait_deadline = time.monotonic() + 4.0
+    while time.monotonic() < wait_deadline and (
+        not guard_path.exists() or not model_pid_path.exists()
+    ):
+        time.sleep(0.02)
+    assert guard_path.exists() and model_pid_path.exists()
+    main_guard = json.loads(guard_path.read_text(encoding="utf-8"))
+    model_pid = int(model_pid_path.read_text(encoding="utf-8"))
+    os.kill(int(main_guard["wrapper_pid"]), signal.SIGKILL)
+    worker.join(timeout=4.0)
+    assert not worker.is_alive(), "service did not observe killed supervisor"
+    assert isinstance(outcome.get("error"), server.VerifierExecutionUnknown)
+    terminal_guard = json.loads(guard_path.read_text(encoding="utf-8"))
+    assert terminal_guard["state"] == "execution_unknown"
+    poll_deadline = time.monotonic() + 3.0
+    while time.monotonic() < poll_deadline:
+        status = subprocess.run(
+            ["ps", "-o", "stat=", "-p", str(model_pid)],
+            capture_output=True,
+            text=True,
+            check=False,
+        ).stdout.strip()
+        if not status or status.startswith("Z"):
+            break
+        time.sleep(0.05)
+    else:
+        os.kill(model_pid, signal.SIGKILL)
+        pytest.fail("killed supervisor left its paid model process alive")
+
+
+@pytest.mark.skipif(os.name != "posix", reason="fork/exec gate is POSIX")
+def test_supervisor_path_swap_after_load_cannot_execute_replacement(
+    tmp_path: Path,
+) -> None:
+    trusted = tmp_path / "trusted_supervisor.py"
+    ready_marker = tmp_path / "supervisor-loaded.marker"
+    trusted_source = (
+        Path(server.__file__)
+        .with_name("process_supervisor.py")
+        .read_text(encoding="utf-8")
+    )
+    entrypoint = 'if __name__ == "__main__":\n    raise SystemExit(main())\n'
+    assert trusted_source.count(entrypoint) == 1
+    trusted.write_text(
+        trusted_source.replace(
+            entrypoint,
+            f"Path({str(ready_marker)!r}).write_text('ready')\n\n{entrypoint}",
+            1,
+        ),
+        encoding="utf-8",
+    )
+    model_marker = tmp_path / "model.marker"
+    malicious_marker = tmp_path / "malicious.marker"
+    model = tmp_path / "model.py"
+    model.write_text(
+        "import pathlib,sys; pathlib.Path(sys.argv[1]).write_text('model')",
+        encoding="utf-8",
+    )
+    child_guard = tmp_path / "child_guard.json"
+    wrapper = subprocess.Popen(
+        [
+            sys.executable,
+            "-I",
+            "-B",
+            str(trusted),
+            str(os.getpid()),
+            str(time.time() + 10),
+            str(child_guard),
+            "--",
+            sys.executable,
+            str(model),
+            str(model_marker),
+        ],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        start_new_session=True,
+    )
+    for _ in range(500):
+        if ready_marker.exists():
+            break
+        assert wrapper.poll() is None
+        time.sleep(0.01)
+    assert ready_marker.read_text(encoding="utf-8") == "ready"
+    original = tmp_path / "original_supervisor.py"
+    trusted.rename(original)
+    trusted.write_text(
+        "import pathlib; pathlib.Path(" + repr(str(malicious_marker)) + ").write_text('bad')",
+        encoding="utf-8",
+    )
+    stdout, stderr = wrapper.communicate(input=b"", timeout=5)
+    assert wrapper.returncode == 0, (stdout, stderr)
+    assert model_marker.read_text(encoding="utf-8") == "model"
+    assert not malicious_marker.exists()
+    guard = json.loads(child_guard.read_text(encoding="utf-8"))
+    assert guard["state"] == "completed"

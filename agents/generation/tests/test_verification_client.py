@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import threading
 import sys
+from copy import deepcopy
 from pathlib import Path
 from typing import Any, Callable
 
@@ -15,6 +17,7 @@ if str(REPO_ROOT) not in sys.path:
 from agents.generation.mcp import verification_client as client  # noqa: E402
 from agents.generation.mcp import server as generation_server  # noqa: E402
 
+TARGETED_DEADLINE = "2099-01-01T00:00:00+00:00"
 
 class FakeResponse:
     def __init__(self, payload: object) -> None:
@@ -85,6 +88,89 @@ def valid_payload(
     return payload
 
 
+def targeted_payload(proof: str) -> tuple[dict[str, Any], dict[str, Any]]:
+    manifest = client.parse_blueprint(proof)
+    item = manifest.items[0]
+    claim = {
+        "blueprint_item_label": item.label,
+        "claim_sha256": item.digest,
+        "reason": "The critic selected this exact bridge.",
+    }
+    ticket_seed = {
+        "review_id": "review_" + "1" * 32,
+        "snapshot_sha256": "2" * 64,
+        "route_id": "route-a",
+        "blueprint_sha256": client.proof_digest(proof),
+        "blueprint_item_id": item.item_id,
+        "claim": claim,
+    }
+    ticket = {
+        "schema_version": "rethlas_targeted_claim_ticket_v2",
+        "ticket_id": "claim_"
+        + hashlib.sha256(
+            json.dumps(
+                ticket_seed,
+                allow_nan=False,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode()
+        ).hexdigest()[:32],
+        **ticket_seed,
+        "verification_mode": "targeted_nonpublishing",
+        "publication_authority": False,
+        "whole_blueprint_verdict_authority": False,
+    }
+    context = client.build_item_context(
+        manifest, item.item_id, max_chars=client.VERIFY_CONTEXT_MAX_CHARS
+    )
+    receipt_seed = {
+        "schema_version": client.TARGETED_RECEIPT_SCHEMA,
+        "ticket_id": ticket["ticket_id"],
+        "review_id": ticket["review_id"],
+        "snapshot_sha256": ticket["snapshot_sha256"],
+        "route_id": ticket["route_id"],
+        "blueprint_sha256": ticket["blueprint_sha256"],
+        "blueprint_item_id": item.item_id,
+        "blueprint_item_label": item.label,
+        "claim_sha256": item.digest,
+        "verification_deadline_utc": TARGETED_DEADLINE,
+        "verification_status": "final",
+        "verdict": "correct",
+        "verification_report": {
+            "summary": "checked",
+            "critical_errors": [],
+            "gaps": [],
+        },
+        "repair_hints": "",
+        "checked_item_ids": [item.item_id],
+        "context_attestation": {
+            "item_id": item.item_id,
+            "disposition": "verified",
+            "final_round": 0,
+            "expanded_proof_ids": [],
+            "max_chars": client.VERIFY_CONTEXT_MAX_CHARS,
+            "context_digest": context["digest"],
+            "verdict": "correct",
+        },
+        "publication_authority": False,
+        "whole_blueprint_verdict_authority": False,
+    }
+    receipt = {
+        **receipt_seed,
+        "receipt_sha256": hashlib.sha256(
+            json.dumps(
+                receipt_seed,
+                allow_nan=False,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode()
+        ).hexdigest(),
+    }
+    return ticket, receipt
+
+
 def install_post(
     monkeypatch: pytest.MonkeyPatch,
     factory: Callable[[str, dict[str, Any]], object],
@@ -100,6 +186,69 @@ def install_post(
         return FakeResponse(factory(endpoint, json))
 
     monkeypatch.setattr(client.requests, "post", fake_post)
+
+
+def test_targeted_client_accepts_only_digest_bound_nonpublishing_receipt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    proof = "# lemma lem:a\n\n## statement\nA\n\n## proof\nProof A.\n"
+    ticket, receipt = targeted_payload(proof)
+    install_post(monkeypatch, lambda endpoint, request: deepcopy(receipt))
+
+    result = client.verify_targeted_claim_service(
+        statement="S",
+        proof=proof,
+        ticket=ticket,
+        verification_deadline_utc=TARGETED_DEADLINE,
+        endpoint="https://verifier/verify-targeted-claim",
+    )
+    assert result == receipt
+
+    forged = deepcopy(receipt)
+    forged["publication_authority"] = True
+    install_post(monkeypatch, lambda endpoint, request: forged)
+    with pytest.raises(ValueError, match="publication authority|content address"):
+        client.verify_targeted_claim_service(
+            statement="S",
+            proof=proof,
+            ticket=ticket,
+            verification_deadline_utc=TARGETED_DEADLINE,
+            endpoint="https://verifier/verify-targeted-claim",
+        )
+
+
+def test_targeted_client_maps_supervisor_terminal_loss_to_no_response_unknown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    proof = "# theorem thm:a\n\n## statement\nA.\n\n## proof\nProof.\n"
+    ticket, _receipt = targeted_payload(proof)
+
+    class UnknownResponse(FakeResponse):
+        status_code = 502
+
+        def __init__(self) -> None:
+            super().__init__(
+                {
+                    "detail": {
+                        "code": "verifier_execution_unknown",
+                        "item_id": ticket["blueprint_item_id"],
+                    }
+                }
+            )
+
+        def raise_for_status(self) -> None:
+            pytest.fail("recognized execution_unknown must not become generic HTTP error")
+
+    monkeypatch.setattr(client.requests, "post", lambda *args, **kwargs: UnknownResponse())
+    with pytest.raises(client.VerificationExecutionUnknown) as exc_info:
+        client.verify_targeted_claim_service(
+            statement="S",
+            proof=proof,
+            ticket=ticket,
+            verification_deadline_utc=TARGETED_DEADLINE,
+            endpoint="https://verifier/verify-targeted-claim",
+        )
+    assert getattr(exc_info.value, "response", None) is None
 
 
 def test_correct_response_promotes_unchanged_draft_atomically(
@@ -185,6 +334,25 @@ def test_https_and_explicit_loopback_http_endpoints_are_accepted(
     )
 
     assert result["published"] is True
+
+
+def test_expired_whole_verification_deadline_makes_zero_service_calls(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        client.requests,
+        "post",
+        lambda *args, **kwargs: pytest.fail("expired deadline must make zero calls"),
+    )
+    with pytest.raises(ValueError, match="already expired"):
+        client.verify_blueprint_file(
+            statement="S",
+            draft_path=tmp_path / "blueprint.md",
+            verified_path=tmp_path / "blueprint_verified.md",
+            endpoint="https://verifier/verify",
+            verification_deadline_utc="2000-01-01T00:00:00+00:00",
+        )
 
 
 @pytest.mark.parametrize(
@@ -653,9 +821,23 @@ def test_mcp_production_wrapper_uses_problem_id_and_publishes(
     monkeypatch.setattr(generation_server, "RECEIPTS_ROOT", receipts_root)
     monkeypatch.delenv("RETHLAS_EXPECTED_PROBLEM_ID", raising=False)
     monkeypatch.delenv("RETHLAS_EXPECTED_STATEMENT_SHA256", raising=False)
+    hard_stop = "2099-01-01T00:00:00+00:00"
+    monkeypatch.setattr(
+        generation_server,
+        "_reasoning_phase_preflight",
+        lambda tool_name: {
+            "tool_permitted": True,
+            "hard_stop_at_utc": hard_stop,
+        },
+    )
+
+    def verifier(endpoint: str, request: dict[str, Any]) -> dict[str, Any]:
+        assert request["verification_deadline_utc"] == hard_stop
+        return valid_payload(request["proof"])
+
     install_post(
         monkeypatch,
-        lambda endpoint, request: valid_payload(request["proof"]),
+        verifier,
     )
 
     result = generation_server.verify_blueprint_service(

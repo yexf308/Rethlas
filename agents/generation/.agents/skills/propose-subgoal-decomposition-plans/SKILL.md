@@ -67,7 +67,7 @@ Do not append a second event that merely restates the same plan set.
 - `memory_append`
 - `memory_append_batch`
 - `branch_update`
-- `search_arxiv_theorems`
+- `search_matlas_theorems`
 
 ## Failure Logging
 

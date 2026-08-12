@@ -76,7 +76,7 @@ mirror execution order.
 - `memory_append`
 - `memory_append_batch`
 - `branch_update`
-- `search_arxiv_theorems`
+- `search_matlas_theorems`
 
 ## Failure Logging
 

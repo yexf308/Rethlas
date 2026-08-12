@@ -203,6 +203,28 @@ def test_complete_receipt_imports_as_distinct_bounded_advisor_source(
     assert len(join.pending_messages("run-1")) == 1
 
 
+def test_advisor_import_cannot_write_while_source_recovery_is_exclusive(
+    tmp_path: Path,
+) -> None:
+    bridge = _ledger(tmp_path)
+    request_id = _completed(bridge)
+    join = _hotjoin(tmp_path)
+    before_events = len(join.events("run-1"))
+    source_guard = hotjoin._acquire_existing_source_lifecycle_lock(join.path, "run-1")
+    try:
+        with pytest.raises(advisor.AdvisorError, match="exclusively pinned"):
+            bridge.import_report(
+                request_id,
+                hotjoin_db=join.path,
+                mode="steer",
+                answer=ANSWER,
+            )
+        assert len(join.events("run-1")) == before_events
+        assert join.pending_messages("run-1") == []
+    finally:
+        source_guard.release()
+
+
 def test_local_followup_is_new_exact_request_in_same_verified_conversation(
     tmp_path: Path,
 ) -> None:
@@ -1987,7 +2009,7 @@ def test_unknown_abandon_reason_redacts_chatgpt_url_in_terminal_receipt(
     )
 
 
-def test_v2_hotjoin_database_migrates_source_provenance_columns(
+def test_v2_hotjoin_database_migrates_to_current_schema_with_source_provenance(
     tmp_path: Path,
 ) -> None:
     parent = tmp_path / "old-hotjoin"
@@ -2020,12 +2042,9 @@ def test_v2_hotjoin_database_migrates_source_provenance_columns(
     database.chmod(0o600)
     hotjoin.ConversationLedger(database)
     with sqlite3.connect(database) as connection:
-        assert (
-            connection.execute(
-                "SELECT value FROM metadata WHERE key = 'schema_version'"
-            ).fetchone()[0]
-            == "5"
-        )
+        assert connection.execute(
+            "SELECT value FROM metadata WHERE key = 'schema_version'"
+        ).fetchone()[0] == str(hotjoin.SCHEMA_VERSION)
         message_columns = {
             row[1] for row in connection.execute("PRAGMA table_info(messages)")
         }
