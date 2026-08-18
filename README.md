@@ -1,6 +1,6 @@
 # Rethlas
 
-Rethlas is a natural-language reasoning system for mathematics built around two Codex agents:
+Rethlas is a natural-language reasoning system for mathematics built around two core Codex roles:
 
 - The generation agent reads a math problem from a markdown file and writes an informal proof blueprint.
 - The verification agent checks that proof blueprint, produces a structured verdict, and serves as the generation agent's verifier.
@@ -16,6 +16,51 @@ The intended deployment order is:
 1. Start the verification agent as a local HTTP service.
 2. Run the generation agent through Codex.
 3. Let the generation agent call the verification service during its proof-and-repair loop.
+
+## What's New in August 2026
+
+### Safe three-route parallel generation
+
+Rethlas again explores three mathematical directions concurrently, with new
+safety boundaries around the original fanout model. On a hard problem, the root
+first designs exactly three materially different, scope-disjoint routes and
+commits one content-addressed pre-fanout checkpoint. It then starts one
+context-free solver for each route in a single fanout:
+
+```text
+root route design
+  -> pre-fanout checkpoint
+  -> route solver 1 | route solver 2 | route solver 3
+  -> root merge and candidate selection
+  -> independent verifier
+```
+
+The root is the only shared-memory writer and does not run a fourth proof route.
+Children cannot recursively spawn, switch assigned routes, write shared memory,
+verify, publish, yield, or initiate advisor work. A complete candidate from any
+route preempts the remaining waits and enters the verifier fast lane. Guardian
+allows three live proof children and fail-stops a fourth. If the root already
+has a complete candidate during route design, it skips the fanout and verifies
+the candidate directly.
+
+### Durable runtime and verification
+
+- Rethlas now uses the official MCP SDK directly and supports both its 1.x and
+  2.x server-class locations.
+- Phase checkpoints use an exact `CallToolResult` envelope and content-addressed
+  replay across separate primary and recovery MCP processes.
+- Optional hot-join mode provides an absolute 30/60/90-minute route cycle,
+  independent scheduled reviews, context handoffs, and Guardian process-tree
+  cleanup.
+- Verification uses fresh isolated sessions, adaptive lazy proof context, strict
+  schema validation, and atomic publication of `blueprint_verified.md` plus an
+  external receipt.
+- Owner-wait states and `generation_yield` are hot-join-only. Legacy runs persist
+  truthful failures and return unverified without fabricating an owner gate.
+
+The current release was validated with a real three-solver fanout, a complete
+generation-to-verification publication smoke, and the full repository suite:
+1,121 tests and 53 subtests passed, with one expected skip.
 
 ## Repository Layout
 
