@@ -185,7 +185,7 @@ APPROVED_GUARDIAN_LAUNCHER_SHA256 = (
     "abf7b49c8989d746fe796a59b516357224615d56e28bccb7026180be03883b1c"
 )
 APPROVED_GUARDIAN_RUNNER_SHA256 = (
-    "d5d4d9b34d79c6d2bce7fb45035477078818c5f8fc25c97fa240c792288aecc3"
+    "a8dfc8ba17a9ccd03c987595652d560df2d48bbc58f375d850dff037cd3e0255"
 )
 APPROVED_GUARDIAN_SHA256 = (
     "475ccd703e6a3c601f3ee5000bdcc6f6fe5a2659e033b561ba31d09653334b9b"
@@ -383,7 +383,7 @@ REVIEW_CADENCE_POLICY = {
     "review_is_independent": True,
     "review_is_not_fact_check": True,
     "hard_stop_interrupt_is_expected": True,
-    "max_concurrent_proof_lanes": 2,
+    "max_concurrent_proof_lanes": 3,
     "proof_lane_enforcement": "continuous_owner_host_scan",
     "owner_cost_gate_enabled": False,
     "guardian_worker_modes": ["runner_control"],
@@ -591,7 +591,7 @@ REVIEW_BOUNDARY_SOURCE_KINDS = (
 )
 REVIEW_BOUNDARY_THREAD_PAGE_LIMIT = 100
 MAX_REVIEW_BOUNDARY_DESCENDANTS = 64
-MAX_CONCURRENT_PROOF_LANES = 2
+MAX_CONCURRENT_PROOF_LANES = 3
 THREAD_START_RECOVERY_PAGE_LIMIT = 100
 MAX_THREAD_START_RECOVERY_THREADS = 512
 
@@ -17360,7 +17360,7 @@ class ConversationLedger:
         descendants: Sequence[Mapping[str, Any]],
         lease: LeaseToken,
     ) -> int:
-        """Fail-stop an active released turn as soon as a third proof lane lives."""
+        """Fail-stop an active released turn as soon as a fourth proof lane lives."""
 
         if len(descendants) > MAX_REVIEW_BOUNDARY_DESCENDANTS:
             raise ProtocolError("continuous descendant scan exceeded its bound")

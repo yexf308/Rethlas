@@ -13,7 +13,7 @@ import pytest
 GENERATION_ROOT = Path(__file__).resolve().parents[1]
 AGENTS = GENERATION_ROOT / "AGENTS.md"
 POLICY_RE = re.compile(
-    r"<!-- rethlas-reasoning-first-policy\s*(\{.*?\})\s*-->", re.DOTALL
+    r"<!-- rethlas-safe-three-route-policy\s*(\{.*?\})\s*-->", re.DOTALL
 )
 
 
@@ -49,7 +49,7 @@ def _action_allowed(
     named_knowledge_gap: bool = False,
     query_count: int = 0,
 ) -> bool:
-    if phase == "protected_root_deep_work":
+    if phase == "protected_route_design":
         return action in {
             "read_problem",
             "read_local_reference",
@@ -72,45 +72,56 @@ def _action_allowed(
     return True
 
 
-def test_reasoning_first_policy_is_machine_readable_and_bounded() -> None:
+def test_safe_three_route_policy_is_machine_readable_and_bounded() -> None:
     policy, text = _policy()
     assert policy == {
-        "policy_id": "rethlas_reasoning_first_v1",
+        "policy_id": "rethlas_safe_three_route_v1",
         "default_initial_deep_work_minutes": 30,
         "minimum_initial_deep_work_minutes": 10,
         "maximum_initial_deep_work_minutes": 90,
         "deep_work_minimum_is_soft": True,
         "initial_external_retrieval_calls": 0,
-        "initial_collaboration_spawns": 0,
+        "collaboration_spawns_before_route_checkpoint": 0,
+        "fanout_plan_count": 3,
+        "fanout_subagent_count": 3,
+        "max_live_subagents": 3,
+        "fanout_fork_turns": "none",
+        "fanout_in_one_batch": True,
+        "subagents_may_spawn": False,
+        "subagents_write_shared_memory": False,
+        "root_is_canonical_memory_writer": True,
         "initial_memory_init_calls": 0,
         "initial_memory_search_calls_for_continuation": 1,
         "persistence_mode": "write_behind_phase_checkpoint",
         "checkpoint_tool": "memory_append_batch",
         "max_checkpoint_records": 32,
-        "max_root_only_batches_before_first_critic": 1,
+        "max_root_only_batches_before_first_fanout": 1,
         "legal_yield_tool": "generation_yield",
+        "legal_yield_requires_hotjoin": True,
+        "legacy_non_success_disposition": "return_unverified_without_owner_wait",
         "retrieval_requires_explicit_knowledge_gap": True,
         "max_targeted_retrieval_queries_per_gap": 2,
-        "initial_adversarial_critic_count": 1,
-        "max_parallel_subagents_before_first_critic_report": 1,
         "candidate_fast_lane_forbids_new_search": True,
         "candidate_fast_lane_forbids_new_branches": True,
         "candidate_fast_lane_forbids_new_subagents": True,
-        "advisor_after_root_and_critic_failure_synthesis": True,
+        "candidate_preempts_fanout_or_wait": True,
+        "advisor_after_three_route_failure_synthesis": True,
         "telemetry_must_not_invent_reasoning_tokens": True,
         "enforcement_scope": (
             "instruction_runner_prompt_and_contract_tests_not_sampling_interceptor"
         ),
     }
-    assert "soft reasoning target" in text
-    assert "single pre-critic checkpoint" in text
+    assert "soft deep-work target" in text
+    assert "single pre-fanout checkpoint" in text
     assert "root may publish at most one" in text
-    assert "root-only skills contribute scratch" in text
+    assert "Root-only skills contribute scratch" in text
+    assert "exactly three context-free route solvers" in text
+    assert "must not become a fourth proof direction" in text
     assert "Search volume" in text
     assert "candidate fast lane" in text
 
 
-def test_protected_phase_and_candidate_fast_lane_reject_fragmenting_actions() -> None:
+def test_route_design_and_candidate_fast_lane_reject_fragmenting_actions() -> None:
     policy, _text = _policy()
     for action in (
         "memory_init",
@@ -121,7 +132,7 @@ def test_protected_phase_and_candidate_fast_lane_reject_fragmenting_actions() ->
         "spawn_subagent",
     ):
         assert not _action_allowed(
-            policy, phase="protected_root_deep_work", action=action
+            policy, phase="protected_route_design", action=action
         )
     for action in (
         "external_retrieval",
@@ -777,7 +788,7 @@ process.stdout.write(JSON.stringify({
     assert outcome == {"mutation_count": 62, "failed": []}
 
 
-def test_high_frequency_skills_use_write_behind_and_old_conflicts_are_absent() -> None:
+def test_high_frequency_skills_use_write_behind_and_unsafe_fanout_is_absent() -> None:
     skill_names = (
         "obtain-immediate-conclusions",
         "construct-counterexamples",
@@ -808,21 +819,21 @@ def test_high_frequency_skills_use_write_behind_and_old_conflicts_are_absent() -
         "Every intermediate artifact must be written to memory",
         "Always call `search_arxiv_theorems` for nontrivial subgoals",
         "Use web search early to gather background",
-        "Spawn one sub-agent per decomposition plan",
         "may itself spawn sub-agents recursively",
-        "Wait for all confirmed sub-agents",
+        "write progress into shared memory",
+        "one adversarial critic",
     )
     combined = agents + "\n" + recursive
     for stale_clause in forbidden:
         assert stale_clause not in combined
 
 
-def test_skill_interface_prompts_do_not_reintroduce_old_fanout_or_churn() -> None:
+def test_skill_interface_prompts_bind_safe_three_route_fanout() -> None:
     interface_expectations = {
-        "recursive-proving": "one context-free adversarial critic",
-        "propose-subgoal-decomposition-plans": "one primary decomposition plan",
+        "recursive-proving": "exactly three context-free route solvers",
+        "propose-subgoal-decomposition-plans": "exactly three materially different",
         "search-math-results": "one named external knowledge gap",
-        "direct-proving": "one selected plan",
+        "direct-proving": "one assigned route",
         "query-memory": "one bounded slice",
     }
     for skill_name, expected in interface_expectations.items():
@@ -835,9 +846,16 @@ def test_skill_interface_prompts_do_not_reintroduce_old_fanout_or_churn() -> Non
             / "openai.yaml"
         ).read_text(encoding="utf-8")
         assert expected in metadata
-        assert "one sub-agent per decomposition plan" not in metadata
-        assert "propose several subgoal" not in metadata
-        assert "multiple subgoal plans" not in metadata
+        assert "recursively spawn" not in metadata
+    recursive_metadata = (
+        GENERATION_ROOT
+        / ".agents"
+        / "skills"
+        / "recursive-proving"
+        / "agents"
+        / "openai.yaml"
+    ).read_text(encoding="utf-8")
+    assert "no child recursion or shared-memory writes" in recursive_metadata
 
 
 def test_non_success_yields_cannot_masquerade_as_solution() -> None:

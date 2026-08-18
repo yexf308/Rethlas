@@ -1,6 +1,6 @@
 ---
 name: direct-proving
-description: Carry one selected decomposition plan through in a coherent root reasoning phase, then persist one consolidated outcome. Use after the protected initial attack identifies a primary plan or one fallback, and before adding an adversarial critic or wider parallel work.
+description: Carry one assigned decomposition route through coherently. Use inside a three-route solver child, or at the root only for a specific post-fanout repair; never serialize all three routes before fanout.
 ---
 
 # Direct Proving
@@ -19,8 +19,8 @@ Read:
 
 ## Procedure
 
-1. Take the selected primary plan, or its one recorded fallback, in one coherent
-   reasoning phase. Do not interleave another plan, retrieval, memory writes, or
+1. Take exactly one assigned plan in one coherent reasoning phase. Do not
+   switch to either sibling route, interleave another plan, or start
    collaboration unless a named external knowledge gap is reached.
 2. For each subgoal, actively use the searched results, toy examples, and counterexamples that are most relevant to that subgoal.
 3. When a similar theorem has been found, try to adapt its proof idea, construction, or reduction to the current subgoal instead of treating it as a black-box citation.
@@ -35,17 +35,18 @@ Read:
 9. If a subgoal is blocked, test the claim and its negation locally before
    changing skills. Invoke `$construct-counterexamples` only when this produces
    a concrete falsifiability question, not merely because a step is hard.
-10. If all subgoals are solved directly, mark the plan as solved and assemble the proof draft.
-   Enter the candidate fast lane immediately: do not search, spawn, propose a
-   new plan, or wait for unrelated work before writing and verifying the draft.
+10. If all subgoals are solved directly, mark the plan as solved. A route child
+   returns the complete candidate to the root without writing memory,
+   verifying, or publishing. The root then enters the candidate fast lane,
+   stops the other routes, assembles the draft, and invokes the verifier.
 11. If the plan does not fully go through, then identify the key stuck points as concretely as possible.
 12. Focus on locating the decisive failure modes of the plan after this first full attempt, not on polishing a full proof.
 
 ## Output Contract
 
-Return one consolidated plan record for the root's next
-`memory_append_batch`. Keep per-subgoal results inside that record instead of
-issuing one MCP call per subgoal:
+Return one consolidated plan report. A route child returns it only to the root;
+the root includes it in the next `memory_append_batch`. Keep per-subgoal results
+inside that report instead of issuing one MCP call per subgoal:
 
 ```json
 {
@@ -66,14 +67,14 @@ issuing one MCP call per subgoal:
 }
 ```
 
-Include the corresponding decomposition-plan state (`screened` or `solved`) in
-the same phase checkpoint. Do not write a transient `screening` state solely to
-mirror execution order.
+Only the root includes the corresponding decomposition-plan state (`screened`
+or `solved`) in a phase checkpoint. A child never writes shared memory. Do not
+write a transient `screening` state solely to mirror execution order.
 
 ## MCP Tools
 
-- `memory_search`
-- `memory_append_batch`
+- `memory_search` (root only)
+- `memory_append_batch` (root only)
 - `search_matlas_theorems`
 
 ## Failure Logging

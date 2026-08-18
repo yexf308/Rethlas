@@ -1027,7 +1027,7 @@ REVIEW = {
     "review_is_not_fact_check": True,
     "hard_stop_interrupt_is_expected": True,
     "guardian_enforcement_ready": True,
-    "max_concurrent_proof_lanes": 2,
+    "max_concurrent_proof_lanes": 3,
 }
 CONTEXT = {
     "policy_id": "rethlas_context_guard_v1",
@@ -4952,7 +4952,7 @@ def test_runner_accepts_mock_atomic_publication_receipt(tmp_path: Path) -> None:
     assert "Solved problem_id=example" in completed.stdout
 
 
-def test_runner_prompts_enforce_reasoning_first_phase_sequence(tmp_path: Path) -> None:
+def test_runner_prompts_enforce_safe_three_route_phase_sequence(tmp_path: Path) -> None:
     runner, fake_bin = _make_runner_tree(tmp_path)
     calls_file = tmp_path / "codex-calls.jsonl"
     environment = _mock_environment(
@@ -4981,17 +4981,21 @@ def test_runner_prompts_enforce_reasoning_first_phase_sequence(tmp_path: Path) -
     exec_calls = [call for call in calls if "exec" in call]
     assert len(exec_calls) == 3
     prompts = [call[-1] for call in exec_calls]
-    assert all("reasoning_contract=rethlas_reasoning_first_v1" in p for p in prompts)
-    assert "protected root deep-work phase" in prompts[0]
-    assert "at least 90 minutes" in prompts[0]
+    assert all("reasoning_contract=rethlas_safe_three_route_v1" in p for p in prompts)
+    assert "protected root route-design phase" in prompts[0]
+    assert "90 minutes as a soft target" in prompts[0]
     assert "do not initialize or write memory" in prompts[0]
-    assert "primary plan plus at most one materially different fallback" in prompts[0]
-    assert "single pre-critic write-behind checkpoint" in prompts[0]
+    assert "exactly three materially different, scope-disjoint routes" in prompts[0]
+    assert "one pre-fanout checkpoint" in prompts[0]
+    assert "spawn exactly three context-free route solvers" in prompts[0]
+    assert "must not pursue a fourth proof route" in prompts[0]
     assert "at most one bounded memory_search" in prompts[1]
     assert "Do not use arXiv theorem search or web search" in prompts[1]
     assert "capabilities, not obligations" in prompts[2]
     assert "one named external knowledge gap" in prompts[2]
     assert all("candidate fast lane" in prompt for prompt in prompts)
+    assert all("cadence-disabled legacy transport" in prompt for prompt in prompts)
+    assert all("do not call generation_yield" in prompt for prompt in prompts)
 
     web_modes = []
     for call in exec_calls:

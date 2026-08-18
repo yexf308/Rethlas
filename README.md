@@ -204,10 +204,11 @@ Operational failures found in paid or mock generation runs are recorded in
 their token impact, security classification, remediation, and regression
 evidence.
 
-This script uses the machine-readable `rethlas_reasoning_first_v1` contract:
+This script uses the machine-readable `rethlas_safe_three_route_v1` contract:
 
-- iteration 0 is search-disabled and begins with a protected root deep-work
-  phase (30 minutes by default as a soft target)
+- iteration 0 is search-disabled and begins with a protected root route-design
+  phase; its deep-work duration is a soft target that never delays a ready
+  fanout
 - transient scratch stays in the active reasoning context; durable conclusions,
   counterexamples, branch decisions, and failed routes are flushed with one
   bounded `memory_append_batch` checkpoint at a phase boundary; in released
@@ -215,18 +216,22 @@ This script uses the machine-readable `rethlas_reasoning_first_v1` contract:
   their exact hashes through the cadence database's publication fence;
   legacy JSONL single-record writes are offline-only and fail closed in a
   released run rather than reporting success outside that registry;
-  sequential root-only skills share one pre-critic checkpoint rather than each
+  sequential root-only skills share one pre-fanout checkpoint rather than each
   forcing a model resumption
+- absent a complete candidate, that checkpoint binds exactly three materially
+  different, scope-disjoint plans; the root then starts three context-free
+  solvers in one fanout
 - retrieval is allowed only for a named external knowledge gap, with at most
   two targeted queries for that gap
-- the root remains the primary solver; the first recursive addition is one
-  context-free adversarial critic rather than one agent per speculative plan
+- children cannot recursively spawn or write shared memory; the root remains
+  the canonical merger and must not pursue a fourth proof route
 - a complete candidate enters a fast lane that freezes new search, branches,
   advisor checkpoints, and sub-agent work until assembly and verification
-- an evidence-bound `generation_yield` is the only unfinished state that stops
-  the loop; its per-run control record lives outside the model-writable
-  generation workspace, so a cost/advisor wait cannot silently start another
-  paid turn
+- in hot-join mode, an evidence-bound `generation_yield` is the only unfinished
+  owner-wait state that stops the loop; its per-run control record lives outside
+  the model-writable generation workspace, so a cost/advisor wait cannot
+  silently start another paid turn. Cadence-disabled legacy runs have no owner
+  wait and return unverified after persisting a truthful non-success
 
 For a legacy non-hot-join run, the deep-work duration is an instruction-level
 target, not a claim that the runner can measure private model reasoning time.
@@ -362,9 +367,10 @@ concrete obligations. Its registry acceptance time, not a model-supplied file
 timestamp, must precede the boundary. The first commitment is due before T+30m; after an
 official review and fresh-epoch handoff, the continued or host-switched route
 must be committed again before the next review. At most one separately
-evidenced fallback may be precommitted. Before the boundary, at most two
-host-admitted proof children may explore predeclared scope-disjoint mechanisms;
-their active/fallback roles are predeclared at spawn, and the root may update
+evidenced fallback may be precommitted. Before the boundary, exactly three
+host-admitted proof children may explore the three predeclared scope-disjoint
+mechanisms. One route is the provisional active review commitment; the other
+two are exploration roles, not simultaneous active routes. The root may update
 the commitment once by host CAS before the due instant using already returned
 evidence. At the boundary the host locks the last pre-due commitment,
 interrupts root and children, obtains terminal receipts, and only then builds
@@ -706,13 +712,13 @@ at 16 root orchestration resumptions, 3,000,000 observed orchestration input
 tokens, or four consecutive no-progress timeouts. Long waits still wake early
 when a sub-agent message or completion arrives.
 
-The companion `rethlas_recursive_pair_v1` contract changes the mathematical
-fanout itself. The root solver first receives one adversarial critic using a
-bounded context-free handoff. Sub-agents cannot recursively spawn or stream
-progress into shared memory; the root batch-persists their bounded final
-reports. Wider expansion requires concrete mutually exclusive obligations and
-an explicit cost justification, with at most two live sub-agents. Any complete
-candidate preempts wait-all and moves directly to the verifier.
+The companion `rethlas_three_route_fanout_v1` contract fixes the mathematical
+fanout at exactly three materially different plans and three context-free route
+solvers. Sub-agents cannot recursively spawn or stream progress into shared
+memory; the root batch-persists their bounded final reports and does not run a
+fourth route. Any complete candidate preempts wait-all and moves directly to
+the verifier. A later round requires all three prior reports plus one durable
+shared failure synthesis; individual slots are never refilled piecemeal.
 
 This control is deliberately scoped. Codex collaboration tools are not routed
 through the hot-join adapter, and app-server token notifications do not identify

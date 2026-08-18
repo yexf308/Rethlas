@@ -1,11 +1,12 @@
 ---
 name: recursive-proving
-description: Add one adversarial critic after a coherent root proof attempt and direct screening have produced a concrete failure synthesis. Use when the primary solver needs a bounded independent attack on its strongest plan before deciding whether any wider parallel work is justified.
+description: Launch exactly three context-free route solvers after the protected root phase has produced three materially different, scope-disjoint plans and one durable pre-fanout checkpoint. Use to recover Rethlas's three-direction parallel search without recursive child fanout or shared-memory races.
 ---
 
 # Recursive Proving
 
-Use this skill when direct proving has failed on the current decomposition plans.
+Use this skill after the protected root phase has checkpointed one exact set of
+three viable, independent routes and no complete candidate exists.
 
 <!-- rethlas-recursive-wait-policy
 {
@@ -31,7 +32,7 @@ Use this skill when direct proving has failed on the current decomposition plans
 {
   "policy_id": "rethlas_advisor_checkpoint_v1",
   "allowed_triggers": [
-    "root_solver_and_first_critic_shared_failure_synthesis",
+    "three_route_round_shared_failure_synthesis",
     "all_current_branches_terminal_blocked_or_dead_end",
     "all_remaining_routes_evidence_backed_near_exhaustion"
   ],
@@ -56,20 +57,22 @@ Use this skill when direct proving has failed on the current decomposition plans
 }
 -->
 
-<!-- rethlas-recursive-pair-policy
+<!-- rethlas-three-route-fanout-policy
 {
-  "policy_id": "rethlas_recursive_pair_v1",
-  "root_role": "primary_solver",
-  "initial_subagent_roles": ["adversarial_critic"],
-  "initial_subagent_count": 1,
-  "max_live_subagents": 2,
+  "policy_id": "rethlas_three_route_fanout_v1",
+  "root_role": "orchestrator_and_canonical_memory_writer",
+  "exact_plan_count": 3,
+  "initial_subagent_roles": ["route_solver_1", "route_solver_2", "route_solver_3"],
+  "initial_subagent_count": 3,
+  "max_live_subagents": 3,
   "fork_turns": "none",
+  "spawn_in_one_fanout": true,
   "subagents_may_spawn": false,
   "subagents_write_shared_memory": false,
   "max_report_utf8_bytes": 8192,
   "candidate_preempts_wait_all": true,
-  "expansion_requires_mutually_exclusive_obligations": true,
-  "expansion_requires_root_cost_justification": true,
+  "root_may_run_fourth_proof_route": false,
+  "next_round_requires_terminal_synthesis": true,
   "root_is_canonical_memory_writer": true,
   "enforcement_scope": "instruction_and_contract_tests_not_runtime_interceptor"
 }
@@ -93,48 +96,48 @@ or model-cost telemetry.
 
 Read:
 
-- the current set of decomposition plans
-- the direct-proving reports and key stuck points for each plan
-- the known stuck points from other plans
+- the exact three-plan pre-fanout checkpoint and record ids
+- the mechanism, scope, discriminating test, and subgoals for every plan
+- any known stuck points that all three children must avoid
 - relevant `failed_paths`, `branch_states`, and search results
 
 ## Procedure
 
-1. Confirm that the root has completed its protected deep-work phase, screened
-   the primary plan and at most one fallback with `$direct-proving`, and
-   persisted one concrete shared failure synthesis. If a complete candidate
-   already exists, do not invoke this skill; enter the candidate fast lane.
-2. Spawn exactly one adversarial critic. Use a context-free fork
-   (`fork_turns="none"`) when the host supports it, and pass a bounded prompt
-   containing the authoritative problem path/id, the strongest plan, the
-   relevant memory record ids, and the exact obstruction. Do not copy the full
-   root transcript and do not insert a status query around the spawn.
-3. Tell the critic to attack the plan's decisive dependencies, search for a
-   counterexample, and identify the smallest viable repair. It must not restart
-   a broad literature survey, spawn another agent, or write progress into
-   shared memory. It returns one report of at most 8,192 UTF-8 bytes; the root
-   is the canonical memory writer.
-4. Wait for the critic with the completion-driven protocol below. If the root
-   independently obtains a complete candidate, stop waiting immediately and
-   enter the candidate fast lane. If interruption is supported, interrupt the
-   critic; otherwise issue no more collaboration calls for it and ignore late
-   nonessential progress.
-5. On the critic's final report, the root performs one synthesis and persists
-   the critic result plus the resulting branch decision in one
-   `memory_append_batch` checkpoint.
-6. If the critic validates or repairs a complete proof, assemble the draft and
-   verify it immediately. If it identifies no new mechanism, invoke
-   `$identify-key-failures` and consider the evidence-triggered advisor
-   checkpoint before spending on wider recursion.
-7. Expand only when the critic identifies mutually exclusive, concrete proof
-   obligations and the root records why parallelism is worth the added context
-   and orchestration cost. At most two sub-agents may be live. Spawn the
-   selected obligations in one fanout, again with context-free forks, no child
-   spawning, no shared-memory progress writes, and bounded final reports.
-8. A complete candidate from any selected obligation preempts wait-all. Stop
-   unrelated waits/spawns/search, assemble the proof, and enter verification.
-   If every selected obligation returns a decisive failure, hand the compact
-   reports to `$identify-key-failures`.
+1. Confirm that the protected root route-design phase produced exactly three
+   materially different, scope-disjoint plans, one discriminating test per
+   plan, and one successful pre-fanout `memory_append_batch` receipt. If a
+   complete candidate already exists, do not invoke this skill; enter the
+   candidate fast lane.
+2. Spawn exactly one solver for each of the three plan ids in one fanout. Use
+   context-free forks (`fork_turns="none"`), bind each returned canonical agent
+   id to exactly one plan id, and do not insert a status query between spawns.
+   The root is an orchestrator and may not pursue a fourth proof route while
+   these solvers are live.
+3. If the fanout is only partially admitted, do not silently continue with one
+   or two routes and do not replace a failed spawn with a fourth plan. Reconcile
+   only an ambiguous tool result. Otherwise interrupt the confirmed children
+   when supported, persist the operationally incomplete fanout, and return to
+   the root without claiming a three-route round occurred.
+4. Give every solver a bounded prompt containing the authoritative problem
+   path/id, its assigned plan and subgoals, the other two plan summaries, the
+   pre-fanout record ids, and its exact scope. Do not copy the root transcript.
+   A solver may refine its own plan but may not switch to another assigned
+   route, spawn an agent, write shared memory, verify or publish a blueprint, or
+   start a broad literature survey without one named route-changing gap.
+5. Require one terminal report of at most 8,192 UTF-8 bytes with the plan id,
+   status (`candidate|partial|blocked`), concrete proof steps or counterexample,
+   remaining obligations, and decisive stuck points. The root is the only
+   memory writer and publication caller.
+6. Wait with the completion-driven protocol below. A complete candidate from
+   any confirmed solver preempts wait-all. Interrupt the other two when
+   supported, assemble the candidate at the root, and enter verification.
+7. If all three solvers terminate without a candidate, synthesize their reports
+   and persist the three results plus one branch decision in a single
+   `memory_append_batch`. Then invoke `$identify-key-failures`.
+8. A later round is legal only after the prior three reports and shared failure
+   synthesis are durable and `$propose-subgoal-decomposition-plans` has produced
+   a new exact set of three mechanisms. Never refill one finished slot piecemeal
+   or exceed three live proof children.
 
 ## Completion-driven wait protocol
 
@@ -169,7 +172,7 @@ to rediscover it.
    policy, stop the recursive round after four consecutive no-progress
    timeouts, persist that liveness failure, and continue or end locally without
    another poll. This is a route/liveness decision: return the bounded evidence
-   to the root or the already scheduled critic. It is never
+   to the root. It is never
    `waiting_cost_gate`, never a self-issued review verdict, never a new `T0`,
    and never permission to work through a review or hard-stop boundary. Never
    invent missing reports or convert a cost/liveness gate into a mathematical
@@ -183,9 +186,14 @@ to rediscover it.
 
 ## Event-driven strategic advisor checkpoint
 
+This owner-wait path is available only when the trusted runner prompt announces
+a hot-join owner-yield surface. In a cadence-disabled legacy run, persist the
+three-route failure synthesis and return unverified; do not write
+`waiting_owner_advisor_decision` or call `generation_yield`.
+
 The root (not a sub-agent) may recommend one owner-decided Pro consultation
-after either (a) the protected root attempt and first adversarial critic have
-produced a shared, evidence-backed failure synthesis with no complete
+after either (a) one exact three-route round has produced three terminal solver
+reports and a shared, evidence-backed failure synthesis with no complete
 candidate, (b) every confirmed branch has reached a terminal blocked/dead-end
 result, or (c) all remaining routes are demonstrably near exhaustion. Every
 trigger requires no live sub-agent. The third trigger additionally requires
@@ -193,9 +201,10 @@ no already scheduled next action, every remaining route has a concrete
 failure/obstruction record, and `$identify-key-failures` has synthesized the
 shared obstruction. A subjective sentence that the search is "stuck", a cost
 gate, timeout, long runtime, or token count never satisfies any trigger.
-For the root-plus-critic trigger, the root attempt, critic report, and failure
-synthesis must each have durable record ids. This is a strategic mathematical
-checkpoint, not a retry policy or a mandatory ceremony.
+For the three-route trigger, the route-set checkpoint, all three bound solver
+reports, and the root's failure synthesis must each have durable record ids.
+This is a strategic mathematical checkpoint, not a retry policy or a mandatory
+ceremony.
 
 Persist exactly one bounded `events` record using the
 `rethlas_advisor_checkpoint_v1` limits above. Include only evidence-backed
@@ -225,7 +234,7 @@ write without this bound yield receipt does not stop the runner.
   "event_type": "advisor_checkpoint",
   "policy_id": "rethlas_advisor_checkpoint_v1",
   "checkpoint_id": "acp_<24 lowercase sha256 hex>",
-  "trigger": "root_solver_and_first_critic_shared_failure_synthesis|all_current_branches_terminal_blocked_or_dead_end|all_remaining_routes_evidence_backed_near_exhaustion",
+  "trigger": "three_route_round_shared_failure_synthesis|all_current_branches_terminal_blocked_or_dead_end|all_remaining_routes_evidence_backed_near_exhaustion",
   "verified_fact_or_proof_ids": [],
   "failed_path_record_ids": [],
   "central_bottleneck": "...",
@@ -269,10 +278,12 @@ Append an `events` record for the recursive round:
 ```json
 {
   "event_type": "recursive_proving_round",
-  "pair_policy_id": "rethlas_recursive_pair_v1",
-  "plan_ids": ["..."],
+  "fanout_policy_id": "rethlas_three_route_fanout_v1",
+  "plan_ids": ["plan_1", "plan_2", "plan_3"],
   "subagents": [
-    {"id": "...", "role": "adversarial_critic|selected_obligation"}
+    {"id": "...", "role": "route_solver", "plan_id": "plan_1"},
+    {"id": "...", "role": "route_solver", "plan_id": "plan_2"},
+    {"id": "...", "role": "route_solver", "plan_id": "plan_3"}
   ],
   "shared_stuck_points": {
     "plan_id": ["..."]
@@ -281,7 +292,7 @@ Append an `events` record for the recursive round:
   "successful_plan_ids": ["..."],
   "failed_plan_ids": ["..."],
   "candidate_preempted_wait_all": false,
-  "expansion_cost_justification": null,
+  "fanout_complete": true,
   "orchestration_cost": {
     "policy_id": "rethlas_recursive_wait_v1",
     "cost_gate_policy": "owner_gated|disabled_by_owner",
@@ -304,16 +315,18 @@ After four consecutive no-progress timeouts, use `status="liveness_stopped"`,
 persist the bounded reports and missing agent ids, issue no generation yield,
 and return control to the root or scheduled route review under the unchanged
 cycle clock.
-Only under `owner_gated`, if a cost threshold fires, use
+Only under `owner_gated` in a trusted hot-join run, if a cost threshold fires, use
 `status="waiting_cost_gate"`, keep unfinished plan IDs out of both outcome
 lists, and persist the same `orchestration_cost` object. Bind the batch
 receipt's event and branch-state record ids by input order, then call
 `generation_yield(problem_id, state="waiting_cost_gate", reason=...,
 evidence_record_ids=[recursive_event_id, branch_state_id])` as the final tool
-action. Do not issue another collaboration or reasoning call afterward. Under
-`disabled_by_owner`, record the threshold in `observed_thresholds` but never
-write `waiting_cost_gate` and never call that yield; the trusted MCP/host
-preflight rejects such a call before any control record is written.
+action. Do not issue another collaboration or reasoning call afterward. In a
+cadence-disabled legacy run, record the threshold and return unverified without
+an owner-wait state or yield call. Under `disabled_by_owner`, record the
+threshold in `observed_thresholds` but never write `waiting_cost_gate` and never
+call that yield; the trusted MCP/host preflight rejects such a call before any
+control record is written.
 
 ## Tools
 
@@ -337,8 +350,8 @@ preflight rejects such a call before any control record is written.
 
 ## Failure Logging
 
-If the root and critic fail to repair the strongest plan, append one compact
-summary to `failed_paths` and invoke `$identify-key-failures`. The root may then
-consider the evidence-triggered advisor checkpoint before wider expansion. For
-a near-exhaustion checkpoint, first prove the additional no-live,
-no-scheduled-action, and per-route obstruction-record conditions.
+If all three routes terminate without a candidate, append one compact summary
+to `failed_paths` and invoke `$identify-key-failures`. The root may then propose
+one new exact three-route generation or consider the evidence-triggered advisor
+checkpoint. For a near-exhaustion checkpoint, first prove the additional
+no-live, no-scheduled-action, and per-route obstruction-record conditions.

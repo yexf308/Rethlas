@@ -2769,7 +2769,7 @@ def test_t30_terminal_boundary_reaps_paginated_late_descendants_before_host_driv
     }
 
 
-def test_review_boundary_persists_fail_stop_for_third_live_proof_lane(
+def test_review_boundary_persists_fail_stop_for_fourth_live_proof_lane(
     ledger: hotjoin.ConversationLedger,
 ) -> None:
     now = time.time()
@@ -2803,7 +2803,7 @@ def test_review_boundary_persists_fail_stop_for_third_live_proof_lane(
             "observed_status": "active",
             "active_turn_id": f"turn-proof-{index}",
         }
-        for index in range(3)
+        for index in range(4)
     ]
     with pytest.raises(hotjoin.HotJoinError, match="proof-lane policy limit"):
         ledger.prepare_review_boundary_descendants(
@@ -2816,7 +2816,7 @@ def test_review_boundary_persists_fail_stop_for_third_live_proof_lane(
     assert state["paid_turn_allowed"] is False
     assert state["review_cadence"]["state"] == "operational_blocked"
     assert state["review_cadence"]["close_disposition"] == ("proof_lane_limit_exceeded")
-    assert hotjoin.REVIEW_CADENCE_POLICY["max_concurrent_proof_lanes"] == 2
+    assert hotjoin.REVIEW_CADENCE_POLICY["max_concurrent_proof_lanes"] == 3
 
 
 @pytest.mark.parametrize(
@@ -18044,7 +18044,7 @@ def test_release_policy_rejects_valid_owner_cost_gate_without_mutation(
         ).fetchone()[0] == 0
 
 
-def test_released_tick_continuously_blocks_third_live_proof_lane(
+def test_released_tick_allows_three_and_blocks_fourth_live_proof_lane(
     ledger: hotjoin.ConversationLedger,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -18057,26 +18057,28 @@ def test_released_tick_continuously_blocks_third_live_proof_lane(
     owner_token = _bind_continuation_capability(ledger)
     ledger.activate_reasoning_epoch_capability("run-1", owner_token=owner_token)
     rpc = _RpcStub()
-    rpc.add(
-        "thread/list",
-        {
-            "data": [
-                _listed_subagent(
-                    f"thread-proof-{index}", "thread-1", status="active"
-                )
-                for index in range(3)
-            ],
-            "nextCursor": None,
-        },
-    )
-    for index in range(3):
+    for count in (3, 4):
         rpc.add(
-            "thread/read",
-            _history(
-                _turn(f"turn-proof-{index}", "inProgress"),
-                thread_id=f"thread-proof-{index}",
-            ),
+            "thread/list",
+            {
+                "data": [
+                    _listed_subagent(
+                        f"thread-proof-{index}", "thread-1", status="active"
+                    )
+                    for index in range(count)
+                ],
+                "nextCursor": None,
+            },
         )
+    for count in (3, 4):
+        for index in range(count):
+            rpc.add(
+                "thread/read",
+                _history(
+                    _turn(f"turn-proof-{index}", "inProgress"),
+                    thread_id=f"thread-proof-{index}",
+                ),
+            )
     adapter = hotjoin.GeneratorHotJoin(
         ledger,
         "run-1",
@@ -18090,6 +18092,7 @@ def test_released_tick_continuously_blocks_third_live_proof_lane(
     monkeypatch.setitem(
         hotjoin.REVIEW_CADENCE_POLICY, "guardian_enforcement_ready", True
     )
+    adapter._process_cadence_tick()
     with pytest.raises(hotjoin.HotJoinError, match="proof-lane policy limit"):
         adapter._process_cadence_tick()
     projection = ledger.cadence_control_state("run-1")
@@ -18110,6 +18113,11 @@ def test_released_tick_continuously_blocks_third_live_proof_lane(
     )
     assert [method for method, _params in rpc.calls] == [
         "thread/list",
+        "thread/read",
+        "thread/read",
+        "thread/read",
+        "thread/list",
+        "thread/read",
         "thread/read",
         "thread/read",
         "thread/read",
@@ -18654,7 +18662,7 @@ You may use local read-only shell/Python for the `q=7` arithmetic. Do not use th
     private_adapter.write_text(private_source, encoding="utf-8")
     private_adapter_sha256 = hashlib.sha256(private_adapter.read_bytes()).hexdigest()
     assert private_adapter_sha256 == (
-        "68bccf16a796dca0064e0d0c987bc018122b8545c2f341b0c00cfccd6a912a1c"
+        "a84519e687e5a6e28b8d20ad06571051360b736cbc13197eacd7a73285f3952c"
     )
 
     monkeypatch.setattr(hotjoin, "__file__", str(private_adapter))

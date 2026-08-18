@@ -73,8 +73,9 @@ Advisor use is an evidence-triggered, event-driven intervention. The root may
 include one bounded `rethlas_advisor_checkpoint_v1` recommendation in `events`
 and one `branch_states` transition to `waiting_owner_advisor_decision` in the
 same `memory_append_batch` only after either all
-current proof branches are terminally blocked/dead-ended, the root solver and
-its first adversarial critic have produced a shared concrete failure synthesis,
+current proof branches are terminally blocked/dead-ended, one complete
+three-route solver round has produced three terminal reports plus a shared
+concrete failure synthesis,
 or all remaining routes are evidence-backed near exhaustion. The latter additionally requires
 no live sub-agent, no already scheduled next action, and a concrete
 failure/obstruction record for every remaining route. Every trigger requires a
@@ -149,56 +150,69 @@ web/arXiv search tools when retrieval is enabled. Read local references only
 through the problem-specific paths described above.
 
 
-## Reasoning-first control policy
+## Safe three-route control policy
 
-<!-- rethlas-reasoning-first-policy
+<!-- rethlas-safe-three-route-policy
 {
-  "policy_id": "rethlas_reasoning_first_v1",
+  "policy_id": "rethlas_safe_three_route_v1",
   "default_initial_deep_work_minutes": 30,
   "minimum_initial_deep_work_minutes": 10,
   "maximum_initial_deep_work_minutes": 90,
   "deep_work_minimum_is_soft": true,
   "initial_external_retrieval_calls": 0,
-  "initial_collaboration_spawns": 0,
+  "collaboration_spawns_before_route_checkpoint": 0,
+  "fanout_plan_count": 3,
+  "fanout_subagent_count": 3,
+  "max_live_subagents": 3,
+  "fanout_fork_turns": "none",
+  "fanout_in_one_batch": true,
+  "subagents_may_spawn": false,
+  "subagents_write_shared_memory": false,
+  "root_is_canonical_memory_writer": true,
   "initial_memory_init_calls": 0,
   "initial_memory_search_calls_for_continuation": 1,
   "persistence_mode": "write_behind_phase_checkpoint",
   "checkpoint_tool": "memory_append_batch",
   "max_checkpoint_records": 32,
-  "max_root_only_batches_before_first_critic": 1,
+  "max_root_only_batches_before_first_fanout": 1,
   "legal_yield_tool": "generation_yield",
+  "legal_yield_requires_hotjoin": true,
+  "legacy_non_success_disposition": "return_unverified_without_owner_wait",
   "retrieval_requires_explicit_knowledge_gap": true,
   "max_targeted_retrieval_queries_per_gap": 2,
-  "initial_adversarial_critic_count": 1,
-  "max_parallel_subagents_before_first_critic_report": 1,
   "candidate_fast_lane_forbids_new_search": true,
   "candidate_fast_lane_forbids_new_branches": true,
   "candidate_fast_lane_forbids_new_subagents": true,
-  "advisor_after_root_and_critic_failure_synthesis": true,
+  "candidate_preempts_fanout_or_wait": true,
+  "advisor_after_three_route_failure_synthesis": true,
   "telemetry_must_not_invent_reasoning_tokens": true,
   "enforcement_scope": "instruction_runner_prompt_and_contract_tests_not_sampling_interceptor"
 }
 -->
 
-Start every fresh root run with one protected deep-work phase. Read the problem,
-local references, and at most one bounded memory search when continuing an
-existing run, then keep one coherent mathematical line in working context.
-During this phase, do not initialize or write memory, use external retrieval,
-spawn a sub-agent, or update branch state. Necessary
-local symbolic, numeric, or exact computation is allowed. The runner supplies
-the requested deep-work duration; it is a soft reasoning target because the
-host does not expose a sampling interceptor or trusted reasoning clock.
+Start every fresh root run with one protected route-design phase. Read the
+problem, local references, and at most one bounded memory search when
+continuing an existing run. During this phase, do not initialize or write
+memory, use external retrieval, spawn a sub-agent, or update branch state.
+Necessary local symbolic, numeric, or exact computation is allowed. The runner
+supplies a soft deep-work target because the host does not expose a sampling
+interceptor or trusted reasoning clock. Do not delay a ready three-route fanout
+merely to consume that duration.
 
-End the protected root phase only when there is either a complete candidate
-argument or the primary plan plus at most one materially different fallback
-have been screened into a shared, evidence-backed obstruction. Sequential
-root-only skills contribute scratch to that one phase; they do not each flush
-their own batch. Before the first critic, the root may publish at most one
-`memory_append_batch`, except that a complete candidate, terminal legal yield,
-or demonstrated context-loss risk may force an earlier boundary. Persist the
-frontier-changing output together in that bounded checkpoint. Do not turn every
-algebraic rewrite, skill return, speculative sentence, tool result, or abandoned
-micro-idea into a memory record.
+End the protected phase only when there is either a complete candidate argument
+or exactly three materially different, scope-disjoint proof routes have been
+screened for duplication, obvious contradiction, and basic viability. The root
+does not exhaust those routes sequentially. Root-only skills contribute scratch
+to this one phase; they do not each flush their own batch. Before the first
+fanout, the root may publish at most one `memory_append_batch`, except that a
+complete candidate, terminal legal yield, or demonstrated context-loss risk may
+force an earlier boundary. The normal pre-fanout checkpoint contains the exact
+three plan ids and mechanisms, their disjoint scopes and discriminating tests,
+and one provisional active route commitment for scheduled review. Once that
+receipt returns, and only if no complete candidate exists, spawn exactly three
+context-free route solvers in one fanout. Do not continue root-only proving as
+a fourth route. Do not turn every algebraic rewrite, skill return, speculative
+sentence, tool result, or abandoned micro-idea into a memory record.
 
 Before every scheduled review boundary, the latest pre-due checkpoint for that
 review window must leave one and only one active route commitment in
@@ -215,10 +229,12 @@ nonempty, duplicate-free list of at most 16 concrete strings (each at most
 same exact keys. At most one distinct fallback may use `status="fallback"` and
 adds a nonempty, duplicate-free `evidence_record_ids` list of at most 16 active
 mathematical records. The latest pre-boundary states must leave exactly one
-active route. Before that designation, at most two host-admitted proof children
-may explore predeclared scope-disjoint mechanisms; the root must predeclare
-both mechanisms' roles at spawn and may update the active/fallback commitment
-once by host CAS before the due instant using already returned evidence. At the
+active route. During a three-route round, exactly three host-admitted proof
+children may explore the three predeclared scope-disjoint mechanisms. The root
+must bind every child to one plan id at spawn, keep one provisional active
+review commitment, and record the other two as exploration roles rather than
+simultaneous active routes. It may update the active/fallback commitment once
+by host CAS before the due instant using already returned evidence. At the
 boundary the host locks the final pre-due commitment, interrupts the root and
 children, obtains their terminal receipts, and only then constructs the critic
 snapshot. Any post-due attempt to designate or switch the reviewed route is
@@ -237,10 +253,14 @@ queries for that gap before returning to independent reasoning. Search volume,
 elapsed time, token count, or a desire for general background is not itself a
 knowledge gap.
 
-The root is the primary solver. If its coherent attempt is blocked, add one
-adversarial critic, not one solver per speculative route. Expand beyond that
-only after the critic identifies mutually exclusive, high-value branches and
-the root records why parallelism is worth its context and orchestration cost.
+The root is the route designer, orchestrator, and canonical memory writer. It
+must not become a fourth proof direction while the three children work. Each
+child receives one route through a context-free fork, cannot spawn descendants,
+cannot write shared memory, and returns one bounded terminal report. If any
+child supplies a complete candidate, stop waiting on the other routes and enter
+the candidate fast lane. If all three routes fail, persist their reports and one
+shared failure synthesis before proposing another exact three-route generation
+or recommending an evidence-triggered owner checkpoint.
 
 When a complete candidate proof exists, enter the candidate fast lane: freeze
 new retrieval, decomposition plans, and sub-agent spawning; assemble the
@@ -424,9 +444,12 @@ action. Absolute review and hard-stop deadlines survive that move.
 
 ## Required Memory Policy
 
-Persist frontier-changing reasoning artifacts in `memory/{problem_id}/` using
-MCP tools (`memory_init`, `memory_append_batch`, `memory_search`). Transient
-scratch stays in the active reasoning context and is not a durable artifact.
+The root is the only memory writer. It persists frontier-changing reasoning
+artifacts in `memory/{problem_id}/` using MCP tools (`memory_init`,
+`memory_append_batch`, `memory_search`). A route-solver child never invokes a
+memory, verification, publication, yield, or advisor MCP tool; it returns one
+bounded terminal report to the root. Transient scratch stays in the active
+reasoning context and is not a durable artifact.
 In a released run, `memory_append` and `branch_update` are unavailable: they
 write legacy JSONL outside the host publication registry and therefore fail
 closed. They remain offline/local compatibility tools only.
@@ -459,9 +482,9 @@ urgent single durable state transition in a released run, include it in
 the next bounded batch; never fall back to `memory_append` or `branch_update`.
 Never split one phase into many writes merely to mirror the order in which
 thoughts occurred.
-During the initial root-only attack, invoking another reasoning skill does not
+During the initial root-only route-design phase, invoking another reasoning skill does not
 create a new phase boundary. Hold its compact result in working context and
-merge it into the single pre-critic checkpoint. This reduces repeated model
+merge it into the single pre-fanout checkpoint. This reduces repeated model
 resumptions and context reprocessing while preserving the full frontier state.
 
 Use the exact shape `memory_append_batch(problem_id, items=[{"channel":
@@ -761,13 +784,14 @@ Then choose only the next necessary skill:
   structural or falsifiability question.
 - `$search-math-results`: one named external knowledge gap that could change
   the route; stop after its two-query budget.
-- `$propose-subgoal-decomposition-plans`: select one primary plan and at most
-  one materially different fallback after a real obstruction.
-- `$direct-proving`: carry the selected plan through coherently.
-- `$recursive-proving`: add the first adversarial critic after the root failure
-  synthesis; follow its bounded pair/expansion contract.
-- `$identify-key-failures`: compress root/critic failures before any new
-  mechanism, expansion, or advisor recommendation.
+- `$propose-subgoal-decomposition-plans`: produce exactly three materially
+  different, scope-disjoint routes for one safe fanout.
+- `$direct-proving`: carry one assigned child route or one post-fanout root
+  repair through coherently.
+- `$recursive-proving`: spawn exactly three context-free route solvers in one
+  fanout and follow the bounded three-route contract.
+- `$identify-key-failures`: compress the three terminal route reports before
+  any new three-route generation or advisor recommendation.
 - `$verify-proof`: only after a full candidate for the whole theorem exists.
 
 `$recursive-proving` is also governed by `rethlas_recursive_wait_v1`: the first
@@ -776,8 +800,10 @@ completion wait is 600,000 ms with early wake, no-change waits back off to
 `SKILL.md`. Repeated 60-second polling is forbidden. When a cost gate fires,
 persist a matching recursive-round event and branch state as two items in one
 `memory_append_batch`, bind their returned record ids by input order, then call
-`generation_yield` with both ids as the final tool action. Make no further
-collaboration call. It never
+`generation_yield` with both ids as the final tool action only when the trusted
+host has announced a hot-join owner-yield surface. In a cadence-disabled legacy
+run, persist the failure and return unverified without writing an owner-wait
+state or calling `generation_yield`. Make no further collaboration call. It never
 authorizes an invented human turn or advisor request; only the repository owner decides
 whether and when to intervene.
 
@@ -812,21 +838,23 @@ the verifier API and is never publishable. The tool atomically writes
 ### Stopping rules
 
 The only successful terminal state is a blueprint that passes verification and
-is published as `blueprint_verified.md`. Two truthful non-success yield states
-are also legal: `waiting_cost_gate` and
+is published as `blueprint_verified.md`. In a trusted hot-join run, two truthful
+non-success yield states are also legal: `waiting_cost_gate` and
 `waiting_owner_advisor_decision`. In either state, persist the exact reason,
 state that the theorem remains unsolved, batch the active event and branch-state
 transition together, call `generation_yield` with those exact batch-returned
 evidence ids, and return locally without polling or inventing progress. The
-runner accepts this bounded control record as an
-unfinished yield and will not start another paid turn until the owner explicitly
-invokes the runner again.
+runner accepts this bounded control record as an unfinished yield and will not
+start another paid turn until the owner explicitly invokes the runner again.
+In a cadence-disabled legacy run, no owner-yield surface exists: persist the
+mathematical failure and return unverified without writing either waiting state
+or calling `generation_yield`.
 
 ## Hard Invariants
 
-1. Batch-persist every frontier-changing conclusion, counterexample, proof
-   step, branch decision, and decisive failed path; never persist duplicate
-   scratch.
+1. The root batch-persists every frontier-changing conclusion, counterexample,
+   proof step, branch decision, and decisive failed path; children return
+   bounded reports and never persist duplicate or shared scratch.
 2. Preserve queryable failures before changing plans. Add a plan only for a new
    mechanism or discriminating test.
 3. Any verifier `wrong`, critical finding, or gap is failure. Verification must
@@ -837,9 +865,10 @@ invokes the runner again.
    paper-local definitions, verify applicability, and diagnose extra
    hypotheses rather than using a black box.
 6. Never read outside the current working directory.
-7. Explore difficult strategies sequentially after failure synthesis, not by
-   default fanout. An open problem is not permission to claim success or to
-   churn plans without new evidence.
+7. Explore exactly three precheckpointed, materially distinct routes in one
+   safe fanout. Never add a fourth live route, recursively fan out children, or
+   start another three-route generation without a terminal synthesis. An open
+   problem is not permission to claim success or churn routes without evidence.
 8. The final target `## statement` must reproduce the complete input statement.
 
 Relevant released-run tools are `memory_init`, `memory_append_batch`,

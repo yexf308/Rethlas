@@ -1,7 +1,7 @@
 interface:
   display_name: "Propose Decomposition Plans"
-  short_description: "Choose one primary plan and one fallback"
-  default_prompt: "Use $propose-subgoal-decomposition-plans to choose one primary decomposition plan and at most one materially different fallback."
+  short_description: "Design three independent routes"
+  default_prompt: "Use $propose-subgoal-decomposition-plans to produce exactly three materially different, scope-disjoint proof routes for one safe fanout."
 
 policy:
   allow_implicit_invocation: true

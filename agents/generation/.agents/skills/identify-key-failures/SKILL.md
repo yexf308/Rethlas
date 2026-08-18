@@ -1,6 +1,6 @@
 ---
 name: identify-key-failures
-description: Compress a blocked root attempt and adversarial-critic report into one reusable failure synthesis. Use before any wider recursive expansion, a new plan generation, or an evidence-triggered Pro recommendation.
+description: Compress three terminal route-solver reports into one reusable failure synthesis. Use before a new three-route generation or an evidence-triggered Pro recommendation.
 ---
 
 # Identify Key Failures
@@ -19,9 +19,9 @@ Read:
 
 ## Procedure
 
-1. Gather the protected root-attempt record, primary/fallback plan outcomes, and
-   the first adversarial-critic report. Include later selected obligations only
-   when they actually ran.
+1. Gather the protected route-set record and exactly three bound route-solver
+   reports from the completed fanout. Reject an incomplete or duplicate plan
+   association rather than inventing the missing direction.
 2. List the key stuck points for each plan.
 3. Identify common points across those failures:
    - recurring obstructions or counterexamples
@@ -30,9 +30,9 @@ Read:
 4. Summarize what the failures suggest for the next generation of decomposition plans.
 5. Return one synthesized `failed_paths` item for the root's next
    `memory_append_batch` checkpoint.
-6. Decide among three next states: one genuinely new plan mechanism, an
-   evidence-triggered owner Pro checkpoint, or a truthful non-success yield.
-   Do not automatically generate another plan set.
+6. Decide among three next states: one genuinely new exact three-route
+   generation, an evidence-triggered owner Pro checkpoint, or a truthful
+   non-success yield. Do not refill one route slot in isolation.
 
 ## Output Contract
 

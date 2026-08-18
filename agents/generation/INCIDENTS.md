@@ -592,3 +592,48 @@ an incident.
   blueprint and external receipt, and the top-level runner recognized them
   with exit code `0`. The final repository suite passed 1,121 tests and 53
   subtests, with one expected skip.
+
+## 2026-08-18: critic-first hardening had removed original three-route fanout
+
+- **Classification:** proof-search policy regression relative to original
+  Rethlas semantics; replaced with a bounded safe three-route contract.
+- **Trigger:** repository-history review showed that commit `bf8e6f1` replaced
+  the old one-agent-per-decomposition-plan fanout with one protected root route
+  followed by one adversarial critic. Tests explicitly forbade the original
+  parallel-plan clauses, so the change was semantic rather than an incidental
+  runtime limit.
+- **Observed effect:** the first real post-upgrade multi-agent smoke ran only a
+  root plus one critic. It proved native collaboration worked, but did not test
+  the original three-direction behavior. A separate legacy smoke also exposed
+  that `generation_yield` was still attempted without a hot-join review-adapter
+  binding, producing an invalid owner-wait transition after otherwise valid
+  mathematical failure persistence.
+- **Remediation:** `rethlas_safe_three_route_v1` now requires exactly three
+  materially different, scope-disjoint plans and one context-free solver per
+  plan in a single fanout. Children cannot recursively spawn, switch assigned
+  routes, write shared memory, verify, publish, yield, or open an advisor path.
+  The root is the canonical merger and cannot run a fourth proof route. Any
+  complete candidate preempts the remaining waits; a later fanout requires all
+  three prior reports plus a durable shared failure synthesis. Guardian permits
+  three live proof children and fail-stops the fourth. Owner-wait states remain
+  hot-join-only; cadence-disabled legacy runs return unverified without calling
+  `generation_yield`.
+- **Real-run evidence:** one Codex CLI 0.148.0-alpha.9 smoke on the Chowla
+  cosine-set problem admitted all three solvers in one fanout. The durable
+  round bound unique child ids to the cyclic-deperiodization,
+  multivariate-positive, and one-sided-discrepancy plans, recorded
+  `fanout_complete=true`, six orchestration resumptions, zero timeouts, zero
+  status queries, and no follow-up fanout. All three reports were merged in one
+  checkpoint; no proof or verified blueprint was claimed. The turn used
+  129,559 tokens.
+- **Runtime finding:** the framework Python 3.13.7 venv reproducibly caused
+  multi-process SQLite `disk I/O error` or `database disk image is malformed`
+  failures in the guarded review path. Rebuilding both local venvs with copied
+  Anaconda Python 3.13.9 binaries made the real review-drive tests pass. The
+  failed hot-join smoke attempts started zero model turns; the successful
+  three-solver smoke used legacy transport.
+- **Regression evidence:** policy tests bind the exact three plans, three
+  context-free roles, no child recursion/shared writes, candidate preemption,
+  and hot-join-only yields. Host tests admit three live proof lanes and
+  operationally block four. The final repository suite passed 1,121 tests and
+  53 subtests, with one expected skip.

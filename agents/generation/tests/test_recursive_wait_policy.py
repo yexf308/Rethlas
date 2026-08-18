@@ -18,8 +18,8 @@ POLICY_RE = re.compile(
 ADVISOR_POLICY_RE = re.compile(
     r"<!-- rethlas-advisor-checkpoint-policy\s*(\{.*?\})\s*-->", re.DOTALL
 )
-PAIR_POLICY_RE = re.compile(
-    r"<!-- rethlas-recursive-pair-policy\s*(\{.*?\})\s*-->", re.DOTALL
+FANOUT_POLICY_RE = re.compile(
+    r"<!-- rethlas-three-route-fanout-policy\s*(\{.*?\})\s*-->", re.DOTALL
 )
 
 
@@ -37,9 +37,9 @@ def _advisor_policy() -> tuple[dict[str, object], str]:
     return json.loads(match.group(1)), text
 
 
-def _pair_policy() -> tuple[dict[str, object], str]:
+def _fanout_policy() -> tuple[dict[str, object], str]:
     text = SKILL.read_text(encoding="utf-8")
-    match = PAIR_POLICY_RE.search(text)
+    match = FANOUT_POLICY_RE.search(text)
     assert match is not None
     return json.loads(match.group(1)), text
 
@@ -197,6 +197,8 @@ def test_recursive_wait_contract_forbids_no_change_status_poll_and_auto_human() 
     assert "generation_yield" in text
     assert "built-in collaboration calls bypass repository code" in flattened
     assert "not a runtime interceptor" in text
+    assert "cadence-disabled legacy run" in text
+    assert "return unverified without" in text
 
 
 def test_late_advisor_checkpoint_is_bounded_event_driven_and_owner_only() -> None:
@@ -206,7 +208,7 @@ def test_late_advisor_checkpoint_is_bounded_event_driven_and_owner_only() -> Non
     assert policy == {
         "policy_id": "rethlas_advisor_checkpoint_v1",
         "allowed_triggers": [
-            "root_solver_and_first_critic_shared_failure_synthesis",
+            "three_route_round_shared_failure_synthesis",
             "all_current_branches_terminal_blocked_or_dead_end",
             "all_remaining_routes_evidence_backed_near_exhaustion",
         ],
@@ -253,6 +255,8 @@ def test_late_advisor_checkpoint_is_bounded_event_driven_and_owner_only() -> Non
     assert "new request id" in skill
     assert "same ChatGPT conversation" in skill
     assert "start a paid turn" in skill
+    assert "hot-join owner-yield surface" in skill
+    assert "do not write\n`waiting_owner_advisor_decision`" in skill
 
 
 def _checkpoint_policy_replay(
@@ -266,8 +270,8 @@ def _checkpoint_policy_replay(
     obstruction_record_routes: tuple[str, ...] = (),
     subjective_stuck_only: bool = False,
     timeout_or_cost_only: bool = False,
-    root_attempt_recorded: bool = False,
-    critic_report_recorded: bool = False,
+    route_set_recorded: bool = False,
+    three_solver_reports_recorded: bool = False,
     failure_synthesis_recorded: bool = False,
 ) -> bool:
     if trigger not in policy["allowed_triggers"]:
@@ -276,11 +280,11 @@ def _checkpoint_policy_replay(
         return False
     if trigger == "all_current_branches_terminal_blocked_or_dead_end":
         return not remaining_routes and live_subagents == 0
-    if trigger == "root_solver_and_first_critic_shared_failure_synthesis":
+    if trigger == "three_route_round_shared_failure_synthesis":
         return (
             live_subagents == 0
-            and root_attempt_recorded
-            and critic_report_recorded
+            and route_set_recorded
+            and three_solver_reports_recorded
             and failure_synthesis_recorded
         )
     return (
@@ -321,21 +325,21 @@ def test_late_advisor_checkpoint_near_exhaustion_policy_replay() -> None:
         assert not _checkpoint_policy_replay(policy, **arguments)  # type: ignore[arg-type]
 
 
-def test_advisor_checkpoint_can_preempt_wider_recursion_only_after_root_critic_evidence() -> (
+def test_advisor_checkpoint_requires_complete_three_route_failure_evidence() -> (
     None
 ):
     policy, skill = _advisor_policy()
     complete: dict[str, object] = {
-        "trigger": "root_solver_and_first_critic_shared_failure_synthesis",
+        "trigger": "three_route_round_shared_failure_synthesis",
         "shared_failure_synthesis": True,
-        "root_attempt_recorded": True,
-        "critic_report_recorded": True,
+        "route_set_recorded": True,
+        "three_solver_reports_recorded": True,
         "failure_synthesis_recorded": True,
     }
     assert _checkpoint_policy_replay(policy, **complete)  # type: ignore[arg-type]
     for missing in (
-        "root_attempt_recorded",
-        "critic_report_recorded",
+        "route_set_recorded",
+        "three_solver_reports_recorded",
         "failure_synthesis_recorded",
     ):
         case = dict(complete)
@@ -346,33 +350,40 @@ def test_advisor_checkpoint_can_preempt_wider_recursion_only_after_root_critic_e
     assert not _checkpoint_policy_replay(  # type: ignore[arg-type]
         policy, **with_live_agent
     )
-    assert "before spending on wider recursion" in skill
+    assert "one exact three-route round" in skill
 
 
-def test_recursive_pair_policy_limits_initial_fanout_and_preempts_wait_all() -> None:
-    policy, skill = _pair_policy()
+def test_three_route_policy_fixes_safe_fanout_and_preempts_wait_all() -> None:
+    policy, skill = _fanout_policy()
     assert policy == {
-        "policy_id": "rethlas_recursive_pair_v1",
-        "root_role": "primary_solver",
-        "initial_subagent_roles": ["adversarial_critic"],
-        "initial_subagent_count": 1,
-        "max_live_subagents": 2,
+        "policy_id": "rethlas_three_route_fanout_v1",
+        "root_role": "orchestrator_and_canonical_memory_writer",
+        "exact_plan_count": 3,
+        "initial_subagent_roles": [
+            "route_solver_1",
+            "route_solver_2",
+            "route_solver_3",
+        ],
+        "initial_subagent_count": 3,
+        "max_live_subagents": 3,
         "fork_turns": "none",
+        "spawn_in_one_fanout": True,
         "subagents_may_spawn": False,
         "subagents_write_shared_memory": False,
         "max_report_utf8_bytes": 8192,
         "candidate_preempts_wait_all": True,
-        "expansion_requires_mutually_exclusive_obligations": True,
-        "expansion_requires_root_cost_justification": True,
+        "root_may_run_fourth_proof_route": False,
+        "next_round_requires_terminal_synthesis": True,
         "root_is_canonical_memory_writer": True,
         "enforcement_scope": ("instruction_and_contract_tests_not_runtime_interceptor"),
     }
-    assert "Spawn exactly one adversarial critic" in skill
-    assert 'fork_turns="none"' in skill
-    assert "must not restart\n   a broad literature survey" in skill
-    assert "spawn another agent" in skill
-    assert "write progress into\n   shared memory" in skill
-    assert "At most two sub-agents may be live" in skill
+    assert "Spawn exactly one solver for each of the three plan ids" in skill
+    assert "context-free forks (`fork_turns=\"none\"`)" in skill
+    assert "may not pursue a fourth proof route" in skill
+    assert "may not switch to another assigned" in skill
+    assert "spawn an agent" in skill
+    assert "write shared memory" in skill
+    assert "exceed three live proof children" in skill
     assert "preempts wait-all" in skill
     assert "memory_append_batch" in skill
 

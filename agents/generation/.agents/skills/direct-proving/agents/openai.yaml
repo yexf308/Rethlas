@@ -1,7 +1,7 @@
 interface:
   display_name: "Direct Proving"
-  short_description: "Carry one selected plan through coherently"
-  default_prompt: "Use $direct-proving to carry one selected plan through in a coherent root reasoning phase and return one consolidated outcome."
+  short_description: "Carry one assigned route coherently"
+  default_prompt: "Use $direct-proving to carry one assigned route through coherently and return one bounded consolidated report to the root."
 
 policy:
   allow_implicit_invocation: true

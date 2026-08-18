@@ -1,12 +1,12 @@
 ---
 name: propose-subgoal-decomposition-plans
-description: Select one primary decomposition plan and at most one materially different fallback from the current evidence. Use after a coherent root attempt or failure synthesis reveals a real obstruction; do not use merely to create breadth at the start of a problem.
+description: Produce exactly three materially different, scope-disjoint proof routes for one safe parallel fanout. Use after the protected root route-design phase has enough information to avoid duplicate or obviously dead directions.
 ---
 
 # Propose Subgoal Decomposition Plans
 
-Use this skill when the agent has enough context to choose a strong next plan
-without fragmenting the proof search.
+Use this skill when the root has enough context to define three independent
+directions without fragmenting one mechanism into cosmetic variants.
 
 ## Input Contract
 
@@ -20,15 +20,19 @@ Read:
 ## Procedure
 
 1. Gather the current information that materially constrains the problem: useful examples, failed claims, known obstructions, and relevant search results.
-2. Propose one primary plan and, only when it uses a genuinely different
-   mechanism, one fallback. Do not create more than two current plans.
+2. Propose exactly three plans. They must use materially different mechanisms,
+   have scope-disjoint first obligations, and include a discriminating test
+   that can kill or advance that route.
 3. For each plan, state:
    - the main idea of the plan
    - the ordered subgoals
    - why this plan is plausible given the current information
    - which earlier failures or counterexamples it tries to avoid
-4. Hand the primary plan to `$direct-proving`. Screen the fallback only after a
-   decisive primary-plan obstruction; do not interleave both.
+4. Screen the three plans only for duplication, obvious contradiction, and
+   basic viability. Do not exhaust them sequentially at the root.
+5. Return the whole set for one pre-fanout checkpoint, then hand it to
+   `$recursive-proving` so all three context-free solvers start in one fanout.
+   If a complete candidate already exists, skip the fanout and verify it.
 
 ## Output Contract
 
@@ -42,7 +46,10 @@ root's next `memory_append_batch` checkpoint:
   "plans": [
     {
       "plan_id": "...",
-      "role": "primary|fallback",
+      "role": "route_solver_1|route_solver_2|route_solver_3",
+      "mechanism": "...",
+      "scope": "...",
+      "discriminating_test": "...",
       "plan_summary": "...",
       "subgoals": ["..."],
       "motivation": ["..."]
@@ -54,7 +61,7 @@ root's next `memory_append_batch` checkpoint:
     "key_failures": ["..."],
     "search_results": ["..."]
   },
-  "status": "selected|failed|solved",
+  "status": "ready_for_fanout|failed|solved",
   "branch_id": "optional"
 }
 ```
@@ -69,7 +76,8 @@ Do not append a second event that merely restates the same plan set.
 
 ## Failure Logging
 
-If the agent cannot yet propose a meaningful primary plan, return an event
+If the agent cannot yet propose exactly three meaningful independent plans,
+do not spawn a partial fanout. Return an event
 payload for the next phase checkpoint with:
 
 - `event_type="decomposition_plans_not_ready"`

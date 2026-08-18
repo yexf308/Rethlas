@@ -612,6 +612,14 @@ def test_codex_command_uses_read_only_ephemeral_sandbox() -> None:
     assert "approval_policy=\"never\"" in command
 
 
+def _verifier_python() -> Path:
+    configured = os.environ.get("RETHLAS_TEST_VERIFY_PYTHON")
+    local_verifier = VERIFICATION_ROOT / ".venv" / "bin" / "python"
+    if configured:
+        return Path(configured).resolve(strict=True)
+    return local_verifier if local_verifier.is_file() else Path(sys.executable)
+
+
 def _isolated_verifier_model_settings(
     overrides: dict[str, str] | None = None,
 ) -> dict[str, str]:
@@ -622,7 +630,7 @@ def _isolated_verifier_model_settings(
     environment.update(overrides or {})
     completed = subprocess.run(
         [
-            sys.executable,
+            str(_verifier_python()),
             "-c",
             (
                 "import json; from api import server; "
@@ -750,7 +758,7 @@ def test_api_requirements_include_authoritative_mcp_runtime_requirements() -> No
 def test_mcp_runtime_preflight_ignores_local_package_shadow() -> None:
     completed = subprocess.run(
         [
-            sys.executable,
+            str(_verifier_python()),
             "-I",
             "-B",
             "-c",
@@ -1201,7 +1209,7 @@ def test_codex_timeout_kills_descendant_process_group(tmp_path: Path) -> None:
                 stdout=output,
                 stderr=subprocess.STDOUT,
                 text=True,
-                timeout=0.5,
+                timeout=2.0,
                 check=False,
                 env=os.environ,
                 guard_path=tmp_path / "process_guard.json",
