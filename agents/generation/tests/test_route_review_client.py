@@ -6,6 +6,8 @@ import json
 import os
 import subprocess
 import sys
+import time
+from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
 from pathlib import Path
 from typing import Any
@@ -1035,8 +1037,9 @@ def test_attested_adapter_invocation_keeps_snapshot_out_of_argv(
     def fake_run(argv: list[str], **kwargs: Any) -> subprocess.CompletedProcess[bytes]:
         captured["argv"] = argv
         captured["executed_bytes"] = Path(argv[3]).read_bytes()
-        captured["input"] = kwargs["input"]
+        captured["input"] = kwargs["input_bytes"]
         captured["env"] = kwargs["env"]
+        captured["directory"] = kwargs["directory"]
         response = {
             "schema_version": review_client.ADAPTER_RESPONSE_SCHEMA,
             "operation": "review_status",
@@ -1052,7 +1055,7 @@ def test_attested_adapter_invocation_keeps_snapshot_out_of_argv(
             argv, 0, stdout=json.dumps(response).encode(), stderr=b""
         )
 
-    monkeypatch.setattr(review_client.subprocess, "run", fake_run)
+    monkeypatch.setattr(review_client, "_run_adapter_posix_spawn", fake_run)
     response = review_client._invoke_adapter(
         "review-status",
         {
@@ -1070,6 +1073,7 @@ def test_attested_adapter_invocation_keeps_snapshot_out_of_argv(
     assert b"SECRET_MATH_CANARY" in captured["input"]
     assert captured["env"][review_client.CONTROL_TOKEN_ENV] == "f" * 64
     assert "PYTHONPATH" not in captured["env"]
+    assert Path(captured["argv"][3]).parent == captured["directory"]
 
 
 def test_adapter_path_swap_restore_executes_only_pinned_bytes(
@@ -1124,7 +1128,7 @@ def test_adapter_path_swap_restore_executes_only_pinned_bytes(
         )
 
     monkeypatch.setattr(review_client, "_write_pinned_adapter", swap_then_pin)
-    monkeypatch.setattr(review_client.subprocess, "run", fake_run)
+    monkeypatch.setattr(review_client, "_run_adapter_posix_spawn", fake_run)
     review_client._invoke_adapter(
         "review-status",
         review_client._command(
@@ -1140,6 +1144,233 @@ def test_adapter_path_swap_restore_executes_only_pinned_bytes(
     assert observed["executed"] == original_bytes
     assert b"MALICIOUS" not in observed["executed"]
     assert adapter.read_bytes() == original_bytes
+
+
+@pytest.mark.skipif(not hasattr(os, "posix_spawn"), reason="posix_spawn unavailable")
+def test_attested_adapter_invocation_uses_direct_posix_spawn_from_mcp_worker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    adapter = tmp_path / "hotjoin_adapter.py"
+    adapter.write_text(
+        "import sys\nsys.stdin.buffer.read()\nsys.stdout.write('{}')\n",
+        encoding="utf-8",
+    )
+    adapter.chmod(0o600)
+    monkeypatch.setenv(review_client.ADAPTER_ENV_PATH, os.fspath(adapter))
+    monkeypatch.setenv(
+        review_client.ADAPTER_ENV_SHA256,
+        hashlib.sha256(adapter.read_bytes()).hexdigest(),
+    )
+    monkeypatch.setenv(review_client.CONTROL_TOKEN_ENV, "f" * 64)
+    monkeypatch.setenv(
+        review_client.ADAPTER_ENV_DB,
+        os.fspath((tmp_path / "messages.sqlite3").resolve()),
+    )
+    calls = 0
+    original = os.posix_spawn
+
+    def observed(*args: Any, **kwargs: Any) -> int:
+        nonlocal calls
+        calls += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(review_client.os, "posix_spawn", observed)
+    with ThreadPoolExecutor(max_workers=1, thread_name_prefix="AnyIO-worker") as pool:
+        response = pool.submit(
+            review_client._invoke_adapter,
+            "review-status",
+            review_client._command("review_status", {"operation": "probe"}),
+            timeout_seconds=5,
+        ).result(timeout=10)
+    assert response == {}
+    assert calls == 1
+
+
+@pytest.mark.skipif(not hasattr(os, "posix_spawn"), reason="posix_spawn unavailable")
+def test_attested_adapter_trampoline_closes_late_inheritable_descriptors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    adapter = tmp_path / "hotjoin_adapter.py"
+    adapter.write_text(
+        "import json, os, sys\n"
+        "sys.stdin.buffer.read()\n"
+        "opened = []\n"
+        "for descriptor in range(3, 256):\n"
+        "    try:\n"
+        "        os.fstat(descriptor)\n"
+        "    except OSError:\n"
+        "        continue\n"
+        "    opened.append(descriptor)\n"
+        "sys.stdout.write(json.dumps({'open_descriptors': opened}))\n",
+        encoding="utf-8",
+    )
+    adapter.chmod(0o600)
+    monkeypatch.setenv(review_client.ADAPTER_ENV_PATH, os.fspath(adapter))
+    monkeypatch.setenv(
+        review_client.ADAPTER_ENV_SHA256,
+        hashlib.sha256(adapter.read_bytes()).hexdigest(),
+    )
+    monkeypatch.setenv(review_client.CONTROL_TOKEN_ENV, "f" * 64)
+    monkeypatch.setenv(
+        review_client.ADAPTER_ENV_DB,
+        os.fspath((tmp_path / "messages.sqlite3").resolve()),
+    )
+    original = os.posix_spawn
+    injected_descriptors: list[int] = []
+
+    def observed(*args: Any, **kwargs: Any) -> int:
+        descriptor = os.open(os.devnull, os.O_RDONLY)
+        os.set_inheritable(descriptor, True)
+        injected_descriptors.append(descriptor)
+        try:
+            return original(*args, **kwargs)
+        finally:
+            os.close(descriptor)
+
+    monkeypatch.setattr(review_client.os, "posix_spawn", observed)
+    response = review_client._invoke_adapter(
+        "review-status",
+        review_client._command("review_status", {"operation": "probe"}),
+        timeout_seconds=5,
+    )
+    assert injected_descriptors
+    assert response == {"open_descriptors": []}
+
+
+@pytest.mark.skipif(not hasattr(os, "posix_spawn"), reason="posix_spawn unavailable")
+def test_attested_adapter_stdio_is_bound_to_unlinked_descriptors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    adapter = tmp_path / "hotjoin_adapter.py"
+    adapter.write_text(
+        "import json, sys\n"
+        "payload = json.load(sys.stdin)\n"
+        "sys.stdout.write(json.dumps({'observed': payload['command']}))\n",
+        encoding="utf-8",
+    )
+    adapter.chmod(0o600)
+    monkeypatch.setenv(review_client.ADAPTER_ENV_PATH, os.fspath(adapter))
+    monkeypatch.setenv(
+        review_client.ADAPTER_ENV_SHA256,
+        hashlib.sha256(adapter.read_bytes()).hexdigest(),
+    )
+    monkeypatch.setenv(review_client.CONTROL_TOKEN_ENV, "f" * 64)
+    monkeypatch.setenv(
+        review_client.ADAPTER_ENV_DB,
+        os.fspath((tmp_path / "messages.sqlite3").resolve()),
+    )
+    original = os.posix_spawn
+
+    def observed(*args: Any, **kwargs: Any) -> int:
+        trampoline_argv = args[1]
+        spawn_directory = Path(trampoline_argv[6])
+        for name, content in (
+            ("request.json", b'{"command":"forged"}'),
+            ("stdout.bin", b'{"observed":"forged"}'),
+            ("stderr.bin", b"forged diagnostic"),
+        ):
+            target = spawn_directory / name
+            target.write_bytes(content)
+            target.chmod(0o600)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(review_client.os, "posix_spawn", observed)
+    response = review_client._invoke_adapter(
+        "review-status",
+        review_client._command("review_status", {"operation": "probe"}),
+        timeout_seconds=5,
+    )
+    assert response == {"observed": "review_status"}
+
+
+@pytest.mark.skipif(not hasattr(os, "posix_spawn"), reason="posix_spawn unavailable")
+def test_attested_adapter_posix_spawn_timeout_kills_and_reaps_exact_child(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    adapter = tmp_path / "hotjoin_adapter.py"
+    adapter.write_text(
+        "import sys, time\nsys.stdin.buffer.read()\ntime.sleep(30)\n",
+        encoding="utf-8",
+    )
+    adapter.chmod(0o600)
+    monkeypatch.setenv(review_client.ADAPTER_ENV_PATH, os.fspath(adapter))
+    monkeypatch.setenv(
+        review_client.ADAPTER_ENV_SHA256,
+        hashlib.sha256(adapter.read_bytes()).hexdigest(),
+    )
+    monkeypatch.setenv(review_client.CONTROL_TOKEN_ENV, "f" * 64)
+    monkeypatch.setenv(
+        review_client.ADAPTER_ENV_DB,
+        os.fspath((tmp_path / "messages.sqlite3").resolve()),
+    )
+    original = os.posix_spawn
+    spawned: list[int] = []
+
+    def observed(*args: Any, **kwargs: Any) -> int:
+        pid = original(*args, **kwargs)
+        spawned.append(pid)
+        return pid
+
+    monkeypatch.setattr(review_client.os, "posix_spawn", observed)
+    started_at = time.monotonic()
+    with pytest.raises(review_client.ReviewAdapterError, match="command timed out"):
+        review_client._invoke_adapter(
+            "review-status",
+            review_client._command("review_status", {"operation": "probe"}),
+            timeout_seconds=1,
+        )
+    assert time.monotonic() - started_at < 3
+    assert len(spawned) == 1
+    with pytest.raises(ChildProcessError):
+        os.waitpid(spawned[0], os.WNOHANG)
+
+
+@pytest.mark.skipif(not hasattr(os, "posix_spawn"), reason="posix_spawn unavailable")
+def test_attested_adapter_output_bound_kills_and_reaps_exact_child(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    adapter = tmp_path / "hotjoin_adapter.py"
+    adapter.write_text(
+        "import sys, time\n"
+        "sys.stdin.buffer.read()\n"
+        f"sys.stdout.buffer.write(b'x' * {review_client.MAX_ADAPTER_RESPONSE_BYTES + 1})\n"
+        "sys.stdout.buffer.flush()\n"
+        "time.sleep(30)\n",
+        encoding="utf-8",
+    )
+    adapter.chmod(0o600)
+    monkeypatch.setenv(review_client.ADAPTER_ENV_PATH, os.fspath(adapter))
+    monkeypatch.setenv(
+        review_client.ADAPTER_ENV_SHA256,
+        hashlib.sha256(adapter.read_bytes()).hexdigest(),
+    )
+    monkeypatch.setenv(review_client.CONTROL_TOKEN_ENV, "f" * 64)
+    monkeypatch.setenv(
+        review_client.ADAPTER_ENV_DB,
+        os.fspath((tmp_path / "messages.sqlite3").resolve()),
+    )
+    original = os.posix_spawn
+    spawned: list[int] = []
+
+    def observed(*args: Any, **kwargs: Any) -> int:
+        pid = original(*args, **kwargs)
+        spawned.append(pid)
+        return pid
+
+    monkeypatch.setattr(review_client.os, "posix_spawn", observed)
+    started_at = time.monotonic()
+    with pytest.raises(
+        review_client.ReviewAdapterError, match="exceeded its output byte bound"
+    ):
+        review_client._invoke_adapter(
+            "review-status",
+            review_client._command("review_status", {"operation": "probe"}),
+            timeout_seconds=5,
+        )
+    assert time.monotonic() - started_at < 3
+    assert len(spawned) == 1
+    with pytest.raises(ChildProcessError):
+        os.waitpid(spawned[0], os.WNOHANG)
 
 
 def _install_targeted_attempt_harness(

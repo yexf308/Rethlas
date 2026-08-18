@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shutil
@@ -12,6 +13,7 @@ from typing import Any, Mapping
 import pytest
 
 from agents import hotjoin_adapter as hotjoin
+from agents.generation.tests import test_hotjoin_adapter as hotjoin_test
 
 
 _CODEX_OVERRIDE_ENV = "RETHLAS_TEST_CODEX_BIN"
@@ -527,3 +529,218 @@ def test_installed_codex_three_server_checkpoint_split_is_zero_model(
         time.sleep(0.01)
     assert not any(_pid_is_live(pid) for pid in {app_server_pid, *mcp_pids})
     assert time.monotonic() - started_at < 9.5
+
+
+def test_installed_codex_production_checkpoint_preflight_is_zero_model(
+    tmp_path: Path,
+) -> None:
+    """Exercise the real released checkpoint stack without starting a turn."""
+
+    codex, explicit = _installed_codex()
+    if explicit and not codex.is_file():
+        pytest.fail(f"explicit Codex binary does not exist: {codex}")
+    generation_root = tmp_path / "generation"
+    generation_root.mkdir()
+    ledger = hotjoin.ConversationLedger(tmp_path / "state" / "messages.sqlite3")
+    ledger.create_run("run-1", "problem/example")
+    _adapter, cycle = hotjoin_test._materialize_guardian_clock_turn(
+        ledger,
+        wall_epoch=time.time(),
+        monotonic_epoch=time.monotonic(),
+    )
+    ledger.ensure_initial_thread_epoch(
+        "run-1",
+        thread_id="thread-1",
+        turn_id="turn-1",
+        lease=_adapter._lease(),
+    )
+    owner_token = hotjoin_test._bind_continuation_capability(ledger)
+    reasoning = ledger.activate_reasoning_epoch_capability(
+        "run-1", owner_token=owner_token
+    )
+    reasoning_token = str(reasoning["token"])
+    observed_boot = hotjoin._system_guardian_process_inspector().boot_identity()
+    with ledger._connect() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        connection.execute(
+            "UPDATE cadence_cycles SET boot_identity = ? WHERE cycle_id = ?",
+            (observed_boot, cycle["cycle_id"]),
+        )
+        connection.commit()
+    adapter_path = Path(hotjoin.__file__).resolve(strict=True)
+    source_mcp = Path(__file__).resolve(strict=True).parents[1] / "mcp"
+    source_review = Path(__file__).resolve(strict=True).parents[2] / "review"
+    snapshot_root = tmp_path / "trusted-runtime"
+    snapshot_mcp = snapshot_root / "mcp"
+    snapshot_review = snapshot_root / "review"
+    shutil.copytree(
+        source_mcp, snapshot_mcp, ignore=shutil.ignore_patterns("__pycache__")
+    )
+    shutil.copytree(
+        source_review, snapshot_review, ignore=shutil.ignore_patterns("__pycache__")
+    )
+    for path in snapshot_root.rglob("*"):
+        path.chmod(0o500 if path.is_dir() else 0o400)
+    snapshot_root.chmod(0o500)
+    server_path = snapshot_mcp / "server.py"
+    runner_text = (Path(__file__).with_name("run_example.sh")).read_text(
+        encoding="utf-8"
+    )
+    loader_start = "TRUSTED_MCP_SECURE_LOADER=\"$(cat <<'PY'\n"
+    loader_body = runner_text.split(loader_start, 1)[1].split("\nPY\n)\"", 1)[0]
+    committed_modules = (
+        ("review.contracts", snapshot_review / "contracts.py"),
+        ("review.critic", snapshot_review / "critic.py"),
+        ("mcp.proof_context", snapshot_mcp / "proof_context.py"),
+        ("mcp.advisor_client", snapshot_mcp / "advisor_client.py"),
+        ("mcp.review_client", snapshot_mcp / "review_client.py"),
+        ("mcp.verification_client", snapshot_mcp / "verification_client.py"),
+        ("mcp.server", server_path),
+    )
+    secure_loader_args = ["-I", "-B", "-c", loader_body]
+    for module_name, module_path in committed_modules:
+        secure_loader_args.extend(
+            [
+                module_name,
+                str(module_path),
+                hashlib.sha256(module_path.read_bytes()).hexdigest(),
+            ]
+        )
+    secure_loader_args.append("--")
+    configured_runtime = os.environ.get("RETHLAS_TEST_MCP_PYTHON")
+    runtime_python = Path(configured_runtime or sys.executable).resolve(strict=True)
+    runtime_probe = subprocess.run(
+        [
+            str(runtime_python),
+            "-I",
+            "-B",
+            "-c",
+            (
+                "try:\n"
+                " from mcp.server.fastmcp import FastMCP\n"
+                "except ImportError:\n"
+                " from mcp.server.mcpserver import MCPServer as FastMCP\n"
+                "assert callable(FastMCP)\n"
+            ),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=10,
+    )
+    if runtime_probe.returncode != 0:
+        if configured_runtime:
+            pytest.fail(
+                "RETHLAS_TEST_MCP_PYTHON lacks a compatible official MCP SDK: "
+                + runtime_probe.stderr
+            )
+        pytest.skip("compatible official MCP SDK test runtime is unavailable")
+    shared_environment = {
+        "PYTHONDONTWRITEBYTECODE": "1",
+        "RETHLAS_EXPECTED_HOTJOIN_RUN_ID": "run-1",
+        "RETHLAS_EXPECTED_PROBLEM_ID": "problem/example",
+        "RETHLAS_GENERATION_ROOT": str(generation_root),
+        "RETHLAS_REVIEW_ADAPTER_PATH": str(adapter_path),
+        "RETHLAS_REVIEW_ADAPTER_SHA256": hashlib.sha256(
+            adapter_path.read_bytes()
+        ).hexdigest(),
+        "RETHLAS_REVIEW_DB": str(ledger.path),
+    }
+    base = {
+        "args": secure_loader_args,
+        "command": str(runtime_python),
+        "cwd": str(tmp_path),
+        "default_tools_approval_mode": "approve",
+        "env": shared_environment,
+        "required": True,
+        "tool_timeout_sec": 3600,
+    }
+    servers = hotjoin._derive_reasoning_mcp_server_map(base)
+    for server in servers.values():
+        server["env"]["RETHLAS_REVIEW_CONTROL_TOKEN"] = reasoning_token
+    servers["reasoning_checkpoint_primary"]["tool_timeout_sec"] = 10
+    servers["reasoning_checkpoint_recovery"]["tool_timeout_sec"] = 10
+
+    client = _RecordingAppServerClient(
+        [str(codex), "app-server", "--listen", "stdio://", "--strict-config"],
+        process_env=_isolated_process_env(tmp_path),
+        rpc_timeout_seconds=30,
+        close_grace_seconds=5,
+    )
+    with client:
+        try:
+            thread = client.call(
+                "thread/start",
+                {
+                    "allowProviderModelFallback": False,
+                    "approvalPolicy": "never",
+                    "config": {"mcp_servers": servers, "web_search": "disabled"},
+                    "cwd": str(tmp_path),
+                    "ephemeral": True,
+                    "model": "gpt-5.6-sol",
+                    "sandbox": "workspace-write",
+                },
+                timeout_seconds=120,
+            )
+        except BaseException as exc:
+            pytest.fail(
+                "production MCP thread/start failed: "
+                + str(exc)
+                + "; app-server stderr tail="
+                + repr(client._stderr_tail)
+            )
+        assert isinstance(thread, dict)
+        thread_id = thread["thread"]["id"]
+        arguments = {
+            "problem_id": "problem/example",
+            "items": [
+                {
+                    "channel": "proof_steps",
+                    "record": {"claim": "production zero-model preflight"},
+                }
+            ],
+        }
+        started_at = time.monotonic()
+        response = client.call(
+            "mcpServer/tool/call",
+            {
+                "arguments": arguments,
+                "server": "reasoning_checkpoint_primary",
+                "threadId": thread_id,
+                "tool": "memory_append_batch",
+            },
+            timeout_seconds=20,
+        )
+        elapsed = time.monotonic() - started_at
+        receipt = _tool_json(response)
+        assert set(response) == {"content", "isError", "structuredContent"}
+        assert response["isError"] is False
+        assert response.get("structuredContent") == receipt
+        assert receipt["schema_version"] == "rethlas_memory_batch_receipt_v3"
+        assert receipt["publication_receipt"]["state"] == "accepted"
+        assert elapsed < 10
+        replay_response = client.call(
+            "mcpServer/tool/call",
+            {
+                "arguments": arguments,
+                "server": "reasoning_checkpoint_recovery",
+                "threadId": thread_id,
+                "tool": "memory_append_batch",
+            },
+            timeout_seconds=20,
+        )
+        replay = _tool_json(replay_response)
+        assert set(replay_response) == {"content", "isError", "structuredContent"}
+        assert replay_response["isError"] is False
+        assert replay_response.get("structuredContent") == replay
+        assert replay == receipt
+        with ledger._connect() as connection:
+            assert connection.execute(
+                "SELECT COUNT(*) FROM memory_batch_publications WHERE state='accepted'"
+            ).fetchone()[0] == 1
+        assert client.methods == [
+            "initialize",
+            "thread/start",
+            "mcpServer/tool/call",
+            "mcpServer/tool/call",
+        ]

@@ -689,7 +689,7 @@ def test_codex_command_injects_one_complete_mcp_object_and_preserves_venv_path(
     assert parsed["command"] != str(Path(venv_python).resolve())
 
 
-@pytest.mark.parametrize("missing_module", ["fastmcp", "requests", "jsonschema"])
+@pytest.mark.parametrize("missing_module", ["mcp", "requests", "jsonschema"])
 def test_missing_mcp_runtime_dependency_creates_no_run_and_starts_no_codex(
     missing_module: str,
     tmp_path: Path,
@@ -713,7 +713,11 @@ def test_missing_mcp_runtime_dependency_creates_no_run_and_starts_no_codex(
     monkeypatch.setattr(
         server.importlib,
         "import_module",
-        lambda name: SimpleNamespace(),
+        lambda name: (
+            SimpleNamespace(FastMCP=object)
+            if name == "mcp.server.fastmcp"
+            else SimpleNamespace()
+        ),
     )
     monkeypatch.setattr(server.subprocess, "run", forbidden_subprocess)
 
@@ -743,6 +747,28 @@ def test_api_requirements_include_authoritative_mcp_runtime_requirements() -> No
         )
 
 
+def test_mcp_runtime_preflight_ignores_local_package_shadow() -> None:
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-I",
+            "-B",
+            "-c",
+            f"import sys; sys.path.insert(0, {str(VERIFICATION_ROOT)!r}); "
+            "from api.server import _require_mcp_runtime; "
+            "_require_mcp_runtime(); print('ok')",
+        ],
+        cwd=VERIFICATION_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=20,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout.strip() == "ok"
+
+
 def test_broken_mcp_runtime_import_creates_no_run_and_starts_no_codex(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -753,6 +779,8 @@ def test_broken_mcp_runtime_import_creates_no_run_and_starts_no_codex(
     def import_module(name: str) -> Any:
         if name == "requests":
             raise ImportError("simulated broken dependency")
+        if name == "mcp.server.fastmcp":
+            return SimpleNamespace(FastMCP=object)
         return SimpleNamespace()
 
     def forbidden_subprocess(*args: Any, **kwargs: Any) -> None:

@@ -119,7 +119,7 @@ fi
 export PYTHONDONTWRITEBYTECODE=1
 
 REQUIRED_GENERATION_MODULES=(
-  fastmcp
+  mcp
   requests
   numpy
   scipy
@@ -435,6 +435,26 @@ for module_name in module_names:
         audit_loaded_module_tree(module_name)
     except BaseException as exc:
         errors.append(f"{module_name}: unsafe imported path: {type(exc).__name__}: {exc}")
+
+if "mcp" in module_names and not any(
+    error.startswith("mcp:") for error in errors
+):
+    try:
+        try:
+            sdk_server = importlib.import_module("mcp.server.fastmcp")
+            server_class = getattr(sdk_server, "FastMCP")
+        except (ImportError, AttributeError):
+            sdk_server = importlib.import_module("mcp.server.mcpserver")
+            server_class = getattr(sdk_server, "MCPServer")
+        if not callable(server_class):
+            raise TypeError("resolved MCP server class is not callable")
+        audit_sys_path("official MCP server compatibility import")
+        audit_loaded_module_tree("mcp")
+    except BaseException as exc:
+        errors.append(
+            "mcp: compatible FastMCP/MCPServer import raised "
+            f"{type(exc).__name__}: {exc}"
+        )
 
 if errors:
     fail("; ".join(errors))

@@ -19,17 +19,25 @@ from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional
 
 import requests
 
-# Import FastMCP before exposing the trusted snapshot parent on ``sys.path``.
-# The local generation package is also named ``mcp`` on disk, while FastMCP
-# depends on the separately installed MCP SDK's top-level ``mcp`` package.
-# Loading the SDK first prevents direct execution from shadowing ``mcp.types``
-# with the trusted generation sources.
+# Resolve the official MCP SDK before exposing the trusted snapshot parent on
+# ``sys.path``.  MCP 2.x moved ``FastMCP`` and renamed it to ``MCPServer``;
+# the constructor, ``tool`` decorator, and ``run`` surface used here stayed
+# compatible.  Capability detection also avoids importing the third-party
+# ``fastmcp`` package, whose private MCP-SDK coupling has broken released
+# Rethlas runtimes.
+try:  # MCP SDK 1.x
+    from mcp.server.fastmcp import FastMCP
+except ImportError:  # MCP SDK 2.x
+    try:
+        from mcp.server.mcpserver import MCPServer as FastMCP
+    except ImportError:  # pragma: no cover - dependency is required in prod
+        FastMCP = None  # type: ignore[assignment]
+
 try:
-    from fastmcp import FastMCP
-except ModuleNotFoundError as exc:  # pragma: no cover - dependency is required in prod
-    if exc.name != "fastmcp":
-        raise
-    FastMCP = None  # type: ignore[assignment]
+    from mcp.types import CallToolResult, TextContent
+except ImportError:  # pragma: no cover - dependency is required in prod
+    CallToolResult = None  # type: ignore[assignment,misc]
+    TextContent = None  # type: ignore[assignment,misc]
 
 if __package__ in {None, ""}:
     # ``python -I /attested/snapshot/mcp/server.py`` intentionally removes the
@@ -6355,6 +6363,25 @@ def generation_control_receipt(
     }
 
 
+def _exact_checkpoint_tool_result(receipt: Dict[str, Any]) -> Any:
+    """Return one cross-SDK-stable CallToolResult for durable checkpoints."""
+
+    if CallToolResult is None or TextContent is None:
+        raise RuntimeError("the official MCP SDK result types are unavailable")
+    encoded = json.dumps(
+        receipt,
+        allow_nan=False,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return CallToolResult(
+        content=[TextContent(type="text", text=encoded)],
+        structuredContent=receipt,
+        isError=False,
+    )
+
+
 def build_mcp_app() -> Optional[Any]:
     if FastMCP is None:
         return None
@@ -6450,14 +6477,16 @@ def build_mcp_app() -> Optional[Any]:
     def _tool_memory_append_batch(
         problem_id: str,
         items: List[Dict[str, Any]],
-    ) -> Dict[str, Any]:
+    ) -> Any:
         """Persist a bounded phase checkpoint in one compact tool call."""
-        return memory_append_batch(
-            problem_id=problem_id,
-            items=items,
-            _trusted_publication_preflight=lambda: _reasoning_phase_preflight(
-                "memory_append_batch"
-            ),
+        return _exact_checkpoint_tool_result(
+            memory_append_batch(
+                problem_id=problem_id,
+                items=items,
+                _trusted_publication_preflight=lambda: _reasoning_phase_preflight(
+                    "memory_append_batch"
+                ),
+            )
         )
 
     @_guarded_tool("memory_search")
@@ -6681,7 +6710,8 @@ def main() -> None:
         return
     if APP is None:
         raise SystemExit(
-            "fastmcp is not installed. Install requirements from mcp/requirements.txt first."
+            "the official MCP SDK is missing or incompatible. Install "
+            "requirements from mcp/requirements.txt first."
         )
     APP.run()
 

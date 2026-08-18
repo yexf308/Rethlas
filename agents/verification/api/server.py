@@ -46,7 +46,7 @@ CODEX_MODEL = os.getenv("CODEX_MODEL", "gpt-5.6-sol")
 CODEX_REASONING_EFFORT = os.getenv("CODEX_REASONING_EFFORT", "xhigh")
 VERIFICATION_FILENAME = "verification.json"
 _TOKEN_USAGE_RE = re.compile(r"tokens\s+used\s*\n?\s*([0-9][0-9,]*)", re.IGNORECASE)
-_MCP_RUNTIME_MODULES = ("fastmcp", "requests", "jsonschema")
+_MCP_RUNTIME_MODULES = ("mcp", "requests", "jsonschema")
 _TARGETED_TICKET_SCHEMA = "rethlas_targeted_claim_ticket_v2"
 _TARGETED_RECEIPT_SCHEMA = "rethlas_targeted_claim_verification_receipt_v1"
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -391,14 +391,63 @@ def _require_mcp_runtime() -> None:
     """Import-check the complete injected MCP runtime before any paid work."""
 
     unavailable: List[str] = []
+    imported: set[str] = set()
     for module_name in _MCP_RUNTIME_MODULES:
+        if module_name == "mcp":
+            continue
         try:
             if importlib.util.find_spec(module_name) is None:
                 unavailable.append(f"{module_name} (not installed)")
                 continue
             importlib.import_module(module_name)
+            imported.add(module_name)
         except Exception as exc:  # noqa: BLE001 - any import failure is fatal
             unavailable.append(f"{module_name} ({type(exc).__name__})")
+
+    # The verifier's source directory also contains a local package named
+    # ``mcp``.  When uvicorn is launched from that directory, an ordinary
+    # top-level import resolves the local injected-server sources instead of
+    # the official SDK installed in the service interpreter.  The actual
+    # isolated MCP command does not have that shadowing path, so preflight the
+    # same SDK resolution by temporarily removing only the exact local package
+    # parent from the import search path.
+    original_sys_path = list(sys.path)
+    local_mcp_root = (REPO_ROOT / "mcp").resolve()
+    filtered_sys_path: List[str] = []
+    for entry in original_sys_path:
+        candidate_root = Path(entry or os.getcwd()).resolve()
+        if (candidate_root / "mcp").resolve() == local_mcp_root:
+            continue
+        filtered_sys_path.append(entry)
+    loaded_mcp = sys.modules.get("mcp")
+    loaded_mcp_file = getattr(loaded_mcp, "__file__", None)
+    if loaded_mcp_file is not None:
+        try:
+            loaded_mcp_path = Path(loaded_mcp_file).resolve()
+        except (OSError, RuntimeError, TypeError):
+            loaded_mcp_path = local_mcp_root
+        if loaded_mcp_path.is_relative_to(local_mcp_root):
+            unavailable.append("mcp (local verifier package shadowed official SDK)")
+    if not unavailable:
+        try:
+            sys.path[:] = filtered_sys_path
+            if importlib.util.find_spec("mcp") is None:
+                unavailable.append("mcp (not installed)")
+            else:
+                importlib.import_module("mcp")
+                try:
+                    sdk_server = importlib.import_module("mcp.server.fastmcp")
+                    server_class = getattr(sdk_server, "FastMCP")
+                except (ImportError, AttributeError):
+                    sdk_server = importlib.import_module("mcp.server.mcpserver")
+                    server_class = getattr(sdk_server, "MCPServer")
+                if not callable(server_class):
+                    raise TypeError("resolved MCP server class is not callable")
+                imported.add("mcp")
+        except Exception as exc:  # noqa: BLE001 - any import failure is fatal
+            unavailable.append(f"mcp server class ({type(exc).__name__})")
+        finally:
+            sys.path[:] = original_sys_path
     if unavailable:
         raise HTTPException(
             status_code=500,

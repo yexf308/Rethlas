@@ -18506,14 +18506,14 @@ def test_private_opaque_real_codex_binary_stream_attestation_is_zero_model() -> 
     if not codex.is_file():
         pytest.skip("desktop Codex binary is not installed")
     expected_sha256 = (
-        "04ddea2f332bd524bf6cc02f8efcf45f0"
-        "afa0c7d9b97d77aaef7bb84adf3d4c5"
+        "6170ff5578170ee9b74ad92bfcff96e6"
+        "186f41d02b60815a7c2b01ad424c754f"
     )
 
     attestation = hotjoin._attest_readonly_executable(codex, expected_sha256)
 
     assert attestation["sha256"] == expected_sha256
-    assert attestation["size"] == 218_437_552
+    assert attestation["size"] == 219_666_000
     assert attestation["path"] == str(codex)
 
 
@@ -18525,8 +18525,8 @@ def test_private_opaque_manifest_allows_only_frozen_paid_probe_command(
     if not codex.is_file():
         pytest.skip("desktop Codex binary is not installed")
     codex_sha256 = (
-        "04ddea2f332bd524bf6cc02f8efcf45f0"
-        "afa0c7d9b97d77aaef7bb84adf3d4c5"
+        "6170ff5578170ee9b74ad92bfcff96e6"
+        "186f41d02b60815a7c2b01ad424c754f"
     )
     prompt = """This is a paid Guardian transport staging probe, not a request to solve or claim progress on the full open Chowla problem.
 
@@ -18654,7 +18654,7 @@ You may use local read-only shell/Python for the `q=7` arithmetic. Do not use th
     private_adapter.write_text(private_source, encoding="utf-8")
     private_adapter_sha256 = hashlib.sha256(private_adapter.read_bytes()).hexdigest()
     assert private_adapter_sha256 == (
-        "cfccfc3e9bf7add0b728c949eeed62d6b55985f74ecb5cdfb639a173bd80b869"
+        "68bccf16a796dca0064e0d0c987bc018122b8545c2f341b0c00cfccd6a912a1c"
     )
 
     monkeypatch.setattr(hotjoin, "__file__", str(private_adapter))

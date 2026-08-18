@@ -1765,7 +1765,11 @@ class MemoryContextTests(unittest.TestCase):
                     ],
                 )
 
-        self.assertEqual(replay, first)
+        self.assertFalse(replay.isError)
+        self.assertEqual(replay.structuredContent, first)
+        self.assertEqual(len(replay.content), 1)
+        self.assertEqual(replay.content[0].type, "text")
+        self.assertEqual(json.loads(replay.content[0].text), first)
 
     def test_control_publication_receipts_use_commit_witness_and_replay_exactly(
         self,

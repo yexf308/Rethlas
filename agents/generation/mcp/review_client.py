@@ -9,14 +9,17 @@ environment; mathematical content never appears in argv.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import math
 import os
 import re
+import signal
 import stat
 import subprocess
 import sys
 import tempfile
+import time
 from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -315,6 +318,251 @@ def _adapter_env() -> dict[str, str]:
     return env
 
 
+_ADAPTER_SPAWN_TRAMPOLINE = """\
+import os
+import sys
+
+working_directory = sys.argv[1]
+target_argv = sys.argv[2:]
+if (
+    not os.path.isabs(working_directory)
+    or len(target_argv) != 5
+    or not os.path.isabs(target_argv[0])
+    or target_argv[1:3] != ["-I", "-B"]
+    or not os.path.isabs(target_argv[3])
+    or os.path.dirname(target_argv[3]) != working_directory
+):
+    raise SystemExit("invalid pinned adapter trampoline arguments")
+descriptor_root = next(
+    (path for path in ("/dev/fd", "/proc/self/fd") if os.path.isdir(path)),
+    None,
+)
+if descriptor_root is None:
+    raise SystemExit("adapter descriptor directory is unavailable")
+for name in os.listdir(descriptor_root):
+    if not name.isdigit() or int(name) <= 2:
+        continue
+    try:
+        os.close(int(name))
+    except OSError:
+        pass
+os.chdir(working_directory)
+os.execve(target_argv[0], target_argv, dict(os.environ))
+"""
+
+def _open_unlinked_spawn_file(directory: Path, name: str) -> int:
+    path = directory / name
+    descriptor = os.open(
+        path,
+        os.O_RDWR
+        | os.O_CREAT
+        | os.O_EXCL
+        | getattr(os, "O_NOFOLLOW", 0),
+        0o600,
+    )
+    try:
+        os.fchmod(descriptor, 0o600)
+        opened = os.fstat(descriptor)
+        if (
+            descriptor <= 2
+            or not stat.S_ISREG(opened.st_mode)
+            or opened.st_nlink != 1
+            or (hasattr(os, "getuid") and opened.st_uid != os.getuid())
+            or stat.S_IMODE(opened.st_mode) != 0o600
+        ):
+            raise ReviewAdapterError("review adapter stdio file is not owner-only")
+        path.unlink()
+        if os.fstat(descriptor).st_nlink != 0:
+            raise ReviewAdapterError("review adapter stdio file remained linked")
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _write_spawn_input(descriptor: int, content: bytes) -> None:
+    view = memoryview(content)
+    while view:
+        written = os.write(descriptor, view)
+        if written <= 0:  # pragma: no cover - os.write writes or raises
+            raise ReviewAdapterError("review adapter request write was short")
+        view = view[written:]
+    if os.lseek(descriptor, 0, os.SEEK_SET) != 0:
+        raise ReviewAdapterError("review adapter request rewind failed")
+
+
+def _open_spawn_stdio(directory: Path, input_bytes: bytes) -> tuple[int, int, int]:
+    descriptors: list[int] = []
+    try:
+        for name in ("request.json", "stdout.bin", "stderr.bin"):
+            descriptors.append(_open_unlinked_spawn_file(directory, name))
+        _write_spawn_input(descriptors[0], input_bytes)
+        return descriptors[0], descriptors[1], descriptors[2]
+    except BaseException:
+        for descriptor in reversed(descriptors):
+            with contextlib.suppress(OSError):
+                os.close(descriptor)
+        raise
+
+
+def _read_spawn_output(descriptor: int, *, maximum_bytes: int) -> bytes:
+    before = os.fstat(descriptor)
+    identity = (
+        before.st_dev,
+        before.st_ino,
+        before.st_mode,
+        before.st_nlink,
+        before.st_uid,
+        before.st_size,
+        before.st_mtime_ns,
+        before.st_ctime_ns,
+    )
+    if (
+        not stat.S_ISREG(before.st_mode)
+        or before.st_nlink != 0
+        or (hasattr(os, "getuid") and before.st_uid != os.getuid())
+        or stat.S_IMODE(before.st_mode) != 0o600
+        or before.st_size > maximum_bytes
+    ):
+        raise ReviewAdapterError("review adapter output is invalid or oversized")
+    remaining = int(before.st_size)
+    offset = 0
+    chunks: list[bytes] = []
+    while remaining:
+        chunk = os.pread(descriptor, min(65_536, remaining), offset)
+        if not chunk:
+            raise ReviewAdapterError("review adapter output was truncated")
+        chunks.append(chunk)
+        offset += len(chunk)
+        remaining -= len(chunk)
+    after = os.fstat(descriptor)
+    if identity != (
+        after.st_dev,
+        after.st_ino,
+        after.st_mode,
+        after.st_nlink,
+        after.st_uid,
+        after.st_size,
+        after.st_mtime_ns,
+        after.st_ctime_ns,
+    ):
+        raise ReviewAdapterError("review adapter output changed during read")
+    return b"".join(chunks)
+
+
+def _spawn_output_is_bounded(stdout_descriptor: int, stderr_descriptor: int) -> bool:
+    return (
+        os.fstat(stdout_descriptor).st_size <= MAX_ADAPTER_RESPONSE_BYTES
+        and os.fstat(stderr_descriptor).st_size <= MAX_ADAPTER_STDERR_BYTES
+    )
+
+
+def _run_adapter_posix_spawn(
+    argv: list[str],
+    *,
+    input_bytes: bytes,
+    env: Mapping[str, str],
+    directory: Path,
+    timeout_seconds: int,
+) -> subprocess.CompletedProcess[bytes]:
+    """Run the pinned adapter without fork/exec from the FastMCP worker thread."""
+
+    if not hasattr(os, "posix_spawn"):
+        raise ReviewAdapterError("bounded adapter posix_spawn is unavailable")
+    if (
+        not directory.is_absolute()
+        or len(argv) != 5
+        or argv[0] != sys.executable
+        or not Path(argv[0]).is_absolute()
+        or argv[1:3] != ["-I", "-B"]
+        or not Path(argv[3]).is_absolute()
+        or Path(argv[3]).parent != directory
+    ):
+        raise ReviewAdapterError("pinned adapter spawn arguments are invalid")
+    if (
+        isinstance(timeout_seconds, bool)
+        or not isinstance(timeout_seconds, int)
+        or timeout_seconds <= 0
+    ):
+        raise ReviewAdapterError("pinned adapter timeout is invalid")
+    input_descriptor, stdout_descriptor, stderr_descriptor = _open_spawn_stdio(
+        directory, input_bytes
+    )
+    file_actions: list[tuple[Any, ...]] = [
+        (os.POSIX_SPAWN_DUP2, input_descriptor, 0),
+        (os.POSIX_SPAWN_DUP2, stdout_descriptor, 1),
+        (os.POSIX_SPAWN_DUP2, stderr_descriptor, 2),
+    ]
+    trampoline_argv = [
+        argv[0],
+        "-I",
+        "-B",
+        "-S",
+        "-c",
+        _ADAPTER_SPAWN_TRAMPOLINE,
+        os.fspath(directory),
+        *argv,
+    ]
+    try:
+        try:
+            pid = os.posix_spawn(
+                trampoline_argv[0],
+                trampoline_argv,
+                dict(env),
+                file_actions=file_actions,
+            )
+        except OSError as exc:
+            raise ReviewAdapterError(
+                "cannot posix_spawn pinned review adapter"
+            ) from exc
+        status: int | None = None
+        deadline = time.monotonic() + float(timeout_seconds)
+        try:
+            while True:
+                waited_pid, observed_status = os.waitpid(pid, os.WNOHANG)
+                if waited_pid == pid:
+                    status = observed_status
+                    break
+                if not _spawn_output_is_bounded(
+                    stdout_descriptor, stderr_descriptor
+                ):
+                    with contextlib.suppress(ProcessLookupError):
+                        os.kill(pid, signal.SIGKILL)
+                    _, status = os.waitpid(pid, 0)
+                    raise ReviewAdapterError(
+                        "review adapter exceeded its output byte bound"
+                    )
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    with contextlib.suppress(ProcessLookupError):
+                        os.kill(pid, signal.SIGKILL)
+                    _, status = os.waitpid(pid, 0)
+                    raise subprocess.TimeoutExpired(argv, timeout_seconds)
+                time.sleep(min(0.01, remaining))
+        except BaseException:
+            if status is None:
+                with contextlib.suppress(ProcessLookupError):
+                    os.kill(pid, signal.SIGKILL)
+                with contextlib.suppress(ChildProcessError):
+                    os.waitpid(pid, 0)
+            raise
+        assert status is not None
+        return subprocess.CompletedProcess(
+            argv,
+            os.waitstatus_to_exitcode(status),
+            stdout=_read_spawn_output(
+                stdout_descriptor, maximum_bytes=MAX_ADAPTER_RESPONSE_BYTES
+            ),
+            stderr=_read_spawn_output(
+                stderr_descriptor, maximum_bytes=MAX_ADAPTER_STDERR_BYTES
+            ),
+        )
+    finally:
+        for descriptor in (input_descriptor, stdout_descriptor, stderr_descriptor):
+            with contextlib.suppress(OSError):
+                os.close(descriptor)
+
+
 def _invoke_adapter(
     command: str,
     payload: Mapping[str, Any],
@@ -341,15 +589,12 @@ def _invoke_adapter(
         with tempfile.TemporaryDirectory(prefix="rethlas-review-adapter-") as raw_temp:
             pinned_root = Path(raw_temp)
             pinned_path = _write_pinned_adapter(pinned_root, pinned_bytes)
-            completed = subprocess.run(
+            completed = _run_adapter_posix_spawn(
                 [sys.executable, "-I", "-B", os.fspath(pinned_path), command],
-                input=raw,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
+                input_bytes=raw,
                 env=_adapter_env(),
-                cwd=os.fspath(pinned_root),
-                timeout=timeout_seconds,
-                check=False,
+                directory=pinned_root,
+                timeout_seconds=timeout_seconds,
             )
     except subprocess.TimeoutExpired as exc:
         raise ReviewAdapterError("review adapter command timed out") from exc

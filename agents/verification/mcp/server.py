@@ -14,10 +14,13 @@ try:
 except ImportError:  # pragma: no cover - dependency managed by requirements
     Draft202012Validator = None  # type: ignore[assignment]
 
-try:
-    from fastmcp import FastMCP
-except ImportError:  # pragma: no cover - dependency managed by requirements
-    FastMCP = None  # type: ignore[assignment]
+try:  # MCP SDK 1.x
+    from mcp.server.fastmcp import FastMCP
+except ImportError:  # MCP SDK 2.x
+    try:
+        from mcp.server.mcpserver import MCPServer as FastMCP
+    except ImportError:  # pragma: no cover - dependency managed by requirements
+        FastMCP = None  # type: ignore[assignment]
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -718,7 +721,8 @@ APP = build_mcp_app()
 def main() -> None:
     if APP is None:
         raise SystemExit(
-            "fastmcp is not installed. Install dependencies from mcp/requirements.txt first."
+            "the official MCP SDK is missing or incompatible. Install "
+            "dependencies from mcp/requirements.txt first."
         )
     APP.run()
 

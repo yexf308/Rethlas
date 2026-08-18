@@ -556,3 +556,39 @@ an incident.
   infrequently as every five minutes to reduce observation noise. That cadence
   has no control authority and does not replace, delay, or weaken the
   guardian's internal safety polling, durable deadlines, or terminal cleanup.
+
+## 2026-08-18: official MCP migration exposed two package-boundary mismatches
+
+- **Classification:** MCP SDK compatibility and verifier preflight defects;
+  fixed. No mathematical rejection occurred.
+- **Trigger:** a real one-iteration smoke used Codex CLI 0.148.0-alpha.9 and a
+  clean runtime with the official MCP SDK 2.0.0 on the included prime-order
+  group example.
+- **Observed effect:** generation produced a complete draft and durably wrote
+  its local phase checkpoint, but the exact checkpoint receipt validator
+  rejected the returned envelope. The verifier endpoint then returned HTTP 500
+  twice before allocating a run or starting a verifier Codex process. No
+  `blueprint_verified.md` was published during that turn, and the wrapper
+  correctly exited `1`. The generation turn reported 94,767 tokens; the two
+  failed verifier requests used zero verifier-model tokens.
+- **Root causes:** the official SDK inferred structured output for
+  `Dict[str, Any]` as `structuredContent={"result": receipt}`, while the
+  security contract requires the text body and structured content to equal the
+  exact receipt. Separately, starting uvicorn from `agents/verification` put
+  that directory's local `mcp/` package ahead of the installed official SDK
+  during API preflight.
+- **Remediation:** the checkpoint tool now returns an explicit standard
+  `CallToolResult` whose only app-server fields are `content`, `isError`, and
+  `structuredContent`, with the decoded text exactly equal to the structured
+  receipt. Verifier preflight removes only the exact local MCP package parent
+  from its temporary import search path, resolves the official SDK by
+  capability across its 1.x and 2.x server locations, and restores `sys.path`
+  before returning. A preloaded local shadow still fails closed.
+- **Regression evidence:** installed-Codex zero-model tests enforce the exact
+  checkpoint envelope and idempotent replay under both MCP 1.29 and 2.0. A
+  subprocess regression starts from the documented verifier working directory
+  and proves that the local package cannot shadow the SDK. The clean-runtime
+  smoke subsequently verified both proof items, atomically published the
+  blueprint and external receipt, and the top-level runner recognized them
+  with exit code `0`. The final repository suite passed 1,121 tests and 53
+  subtests, with one expected skip.

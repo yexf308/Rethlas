@@ -85,7 +85,7 @@ in the same object. It never relies on an isolated workspace's
 search/bounded memory but no verdict-validation or verdict-write tool.
 
 Before allocating a persistent run or starting Codex, the service performs an
-actual import check for the complete injected MCP runtime (`fastmcp`,
+actual import check for the complete injected MCP runtime (the official MCP SDK,
 `requests`, and `jsonschema`) in the bound service interpreter. A missing or
 broken dependency therefore starts zero paid subprocesses and leaves no run
 record. `api/requirements.txt` includes the single authoritative
@@ -162,6 +162,12 @@ required module. Its `sys.path`, module origins/search locations, and imported
 module trees are checked against the same writable boundaries. A missing
 module, broken binary/import, or workspace-backed editable package therefore
 fails with zero Codex invocations.
+
+Rethlas imports the official `mcp` SDK directly and supports both its 1.x and
+2.x server-class locations. The separate third-party `fastmcp` package is no
+longer required. When upgrading an existing environment, rerun the requirements
+installation so the official SDK is present; an old `fastmcp` installation may
+be removed after confirming no other local project uses it.
 
 Model shell commands still use `shell_environment_policy.inherit=none`. The
 runner explicitly sets a minimal `PATH` containing only the trusted Python

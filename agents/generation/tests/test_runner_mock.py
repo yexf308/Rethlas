@@ -21,7 +21,7 @@ from agents.hotjoin_adapter import GUARDIAN_CONTROL_SCHEMA_SHA256
 RUNNER = Path(__file__).with_name("run_example.sh")
 GENERATION_ROOT = RUNNER.parents[1]
 REQUIRED_MODULES = (
-    "fastmcp",
+    "mcp",
     "requests",
     "numpy",
     "scipy",
@@ -180,7 +180,14 @@ def _real_mcp_python() -> Path:
             "-I",
             "-B",
             "-c",
-            "from fastmcp import FastMCP; import mcp.types",
+            (
+                "try:\n"
+                " from mcp.server.fastmcp import FastMCP\n"
+                "except ImportError:\n"
+                " from mcp.server.mcpserver import MCPServer as FastMCP\n"
+                "import mcp.types\n"
+                "assert callable(FastMCP)\n"
+            ),
         ],
         text=True,
         capture_output=True,
@@ -190,10 +197,10 @@ def _real_mcp_python() -> Path:
     if probe.returncode != 0:
         if configured:
             pytest.fail(
-                "RETHLAS_TEST_MCP_PYTHON lacks the real FastMCP/MCP SDK: "
+                "RETHLAS_TEST_MCP_PYTHON lacks a compatible official MCP SDK: "
                 + probe.stderr
             )
-        pytest.skip("real FastMCP/MCP SDK unavailable; set RETHLAS_TEST_MCP_PYTHON")
+        pytest.skip("official MCP SDK unavailable; set RETHLAS_TEST_MCP_PYTHON")
     return executable
 
 
@@ -521,12 +528,15 @@ def _make_math_runtime(agents_dir: Path) -> Path:
         package = site_packages / module_name
         package.mkdir()
         module_source = ""
-        if module_name == "fastmcp":
+        if module_name == "mcp":
             # Most runner tests exercise transport/control behavior without a
             # real MCP session.  This structural stub lets the trusted server
             # register its decorators; the dedicated stdio tests above use the
-            # production FastMCP/MCP SDK and would catch namespace shadowing.
-            module_source = """class FastMCP:
+            # production official MCP SDK and would catch namespace shadowing.
+            server_package = package / "server"
+            server_package.mkdir()
+            (server_package / "__init__.py").write_text("", encoding="utf-8")
+            (server_package / "fastmcp.py").write_text("""class FastMCP:
     def __init__(self, name):
         self.name = name
 
@@ -537,7 +547,8 @@ def _make_math_runtime(agents_dir: Path) -> Path:
 
     def run(self):
         return None
-"""
+""", encoding="utf-8")
+            (package / "types.py").write_text("", encoding="utf-8")
         elif module_name == "requests":
             # The trusted verification client subclasses the public requests
             # base exception at import time; network calls remain outside this
