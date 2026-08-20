@@ -3791,7 +3791,7 @@ if boundary is not None:
 required_mode = {
     "continue_active_cycle": "active_cycle",
 }.get(disposition)
-if disposition in {"continuation_authorization_required", "continue_active_cycle"} and review.get(
+if disposition == "continuation_authorization_required" and review.get(
     "allowed_action"
 ) not in {
     "free_construction",
@@ -3799,6 +3799,11 @@ if disposition in {"continuation_authorization_required", "continue_active_cycle
     "one_bounded_cycle_on_fatal_doubt",
 }:
     fail("ordinary active-cycle continuation conflicts with the durable allowed action")
+if (
+    disposition == "continue_active_cycle"
+    and review.get("allowed_action") != "continue_active_cycle_authorized"
+):
+    fail("authorized active-cycle continuation lacks its durable allowed action")
 if (
     disposition == "continue_reviewed_cycle_fresh_epoch"
     and review.get("allowed_action") != "post_review_handoff_required"

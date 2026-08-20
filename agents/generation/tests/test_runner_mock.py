@@ -1740,6 +1740,11 @@ if command == "cadence-admit":
     operation = payload["operation"]
     if operation == "continue_active_cycle":
         assert state["disposition"] == "continuation_authorization_required"
+        state["prior_allowed_action"] = state.get(
+            "allowed_action",
+            os.environ.get("MOCK_CADENCE_ALLOWED_ACTION", "free_construction"),
+        )
+        state["allowed_action"] = "continue_active_cycle_authorized"
         state["disposition"] = "continue_active_cycle"
     elif operation == "continue_review_only":
         assert state["disposition"] == "review_turn_authorization_required"
@@ -2116,6 +2121,11 @@ if command == "review-status":
     raise SystemExit(0)
 
 starting_disposition = state["disposition"]
+if starting_disposition == "continue_active_cycle":
+    assert state["allowed_action"] == "continue_active_cycle_authorized"
+    state["allowed_action"] = state.pop(
+        "prior_allowed_action", "free_construction"
+    )
 if starting_disposition in {"initial_start_allowed", "continue_next_cycle"}:
     prior_cycle_id = state.get("cycle_id")
     state["cycle_serial"] = int(state.get("cycle_serial", 0)) + 1
@@ -2392,6 +2402,12 @@ if os.environ.get("MOCK_HOTJOIN_LEGAL_YIELD"):
     # generation_yield has committed its wait record and authenticated handoff,
     # but only owner cadence-close may turn that into a resumable owner_wait.
     next_disposition = "owner_yield_close_required"
+if next_disposition == "continue_active_cycle":
+    state["prior_allowed_action"] = state.get(
+        "allowed_action",
+        os.environ.get("MOCK_CADENCE_ALLOWED_ACTION", "free_construction"),
+    )
+    state["allowed_action"] = "continue_active_cycle_authorized"
 state.update({
     "disposition": next_disposition,
     "run_count": run_count,

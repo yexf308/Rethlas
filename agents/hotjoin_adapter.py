@@ -185,7 +185,7 @@ APPROVED_GUARDIAN_LAUNCHER_SHA256 = (
     "abf7b49c8989d746fe796a59b516357224615d56e28bccb7026180be03883b1c"
 )
 APPROVED_GUARDIAN_RUNNER_SHA256 = (
-    "a952cae95c6217f6855b075a0e650ce0b77fa0f42fdf7eee425119dbc4055725"
+    "2c7a90560239aa31bf4634091c13e32cb5df75571687f5b016daccb1c02e6788"
 )
 APPROVED_GUARDIAN_SHA256 = (
     "aa2f1c798fd8415bf850973f4ba0b100a8c142327e578a26bfd6416e09584266"
@@ -32711,7 +32711,13 @@ def _context_handoff_prepare_control(
     if authoritative_blueprint_sha256 is None:
         # There is no trusted review snapshot yet. Bind the first handoff to the
         # owner's statement-scoped assertion; the helper validates its digest.
-        authoritative_blueprint_sha256 = str(assertions.get("blueprint_sha256"))
+        asserted_blueprint_sha256 = assertions.get("blueprint_sha256")
+        if asserted_blueprint_sha256 is not None and (
+            not isinstance(asserted_blueprint_sha256, str)
+            or SHA256_RE.fullmatch(asserted_blueprint_sha256) is None
+        ):
+            raise HotJoinError("context handoff blueprint assertion is malformed")
+        authoritative_blueprint_sha256 = asserted_blueprint_sha256
     route_frozen = bool(
         latest_review is not None
         and _json_loads_strict(str(latest_review["decision_json"]))["route_frozen"]
