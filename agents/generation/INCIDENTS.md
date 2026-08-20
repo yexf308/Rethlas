@@ -772,8 +772,8 @@ an incident.
 
 ## 2026-08-20: production fresh-run owner yield failed before the first review
 
-- **Classification:** pre-review route-binding and post-Guardian authority
-  mismatch; fixed. The mathematical search remained honestly unsolved and no
+- **Classification:** production-shaped pre-review owner-yield integration
+  failures; fixed. The mathematical search remained honestly unsolved and no
   verifier receipt or answer was claimed.
 - **Trigger:** production run
   `arxivhard-am2606-048-production-max-20260820-01` used the T0 problem asking
@@ -792,9 +792,17 @@ an incident.
   `route:unspecified` until its first official review, while the valid
   pre-fanout checkpoint had already committed the concrete root route. The
   handoff control required strict equality and therefore made a pre-review
-  owner yield impossible. Separately, released `cadence-admit` always selected
-  a runner fence, even when the command arrived through the documented
-  one-shot owner FD after the Guardian had cleanly returned.
+  owner yield impossible. A missing draft correctly produced
+  `blueprint_sha256=null`, but the adapter coerced that assertion to the string
+  `"None"` before comparing it. Released `cadence-admit` always selected a
+  runner fence even when the command arrived through the documented one-shot
+  owner FD after Guardian return. Its outer projection validator then rejected
+  the real post-admission `continue_active_cycle_authorized` action because the
+  mock had continued to report `free_construction`. Finally, the trusted MCP
+  derived one pending advisor record, but the review-client to adapter proposal
+  omitted that host-derived field and the adapter hard-coded both pending ids
+  to null. This last mismatch created a validated host handoff while returning
+  an MCP error, so generation correctly refused to call `generation_yield`.
 - **Remediation:** a validated pre-review `owner_yield` or `context_guard`
   handoff may bind the single initial concrete route atomically when, and only
   when, the durable cycle still contains `route:unspecified` and has no prior
@@ -802,14 +810,35 @@ an incident.
   rejected. Released continuation admission now selects the fence from the
   actual one-shot FD domain: runner FD operations retain `GuardianRunnerFence`,
   while the outer owner wrapper uses the current `ReviewControlFence`. The
-  following paid root still requires a fresh Guardian admission, so this does
-  not grant paid work directly.
+  adapter preserves a genuinely nullable pre-review blueprint digest. The
+  validator recognizes only the exact authorized continuation action. The
+  trusted server now derives `pending`, passes it through the private review
+  client proposal, and the adapter binds it into the content-addressed handoff;
+  the model-facing tool still has no pending-state parameter. The following
+  paid root still requires a fresh Guardian admission, so none of these changes
+  grants paid work directly.
 - **Regression evidence:** tests reproduce a reasoning-epoch handoff against a
   production-like unspecified route, reject invalid content without binding,
   accept one binding, replay it once, reject route drift, exercise the real
-  owner-FD subprocess after Guardian return, and preserve the runner-only
-  fence path. The focused hot-join suite passes 423 tests; runner and review
-  suites pass 176 tests; Guardian and launcher suites pass 126 tests with one
-  expected skip. The complete generation test directory passes 973 tests with
-  one expected skip. A same-problem production rerun is still required before
-  the incident is considered end-to-end closed.
+  owner-FD subprocess after Guardian return, preserve the runner-only fence
+  path, use a null blueprint digest, expose the actual authorized action in the
+  runner mock, and carry one server-derived advisor id through the private
+  handoff protocol. The complete generation test directory passes 973 tests
+  with one expected skip; the isolated worktree needed the repository's
+  intentionally ignored quarantined-seed fixture before its final test could
+  pass.
+- **Follow-up production evidence:** runs `-02` and `-03` exposed the nullable
+  blueprint, authorized-action, and pending-state mismatches without starting a
+  second paid turn. Final run
+  `arxivhard-am2606-048-production-max-20260820-04` used the same statement,
+  model, effort, and unmodified production cadence. It completed one exact
+  three-route fanout, atomically bound `route_source_attestation`, validated
+  handoff
+  `handoff_7b5dcbcbeb77b700bd7208b60abd60e2cf4e06529b08c991abc060a4665528bf`
+  with the exact pending advisor record, prepared and closed one owner-yield
+  admission, completed Guardian with `forced=false`, and exited zero in
+  22m57s. Its 231-event chain verifies, with zero control failures, zero
+  continuation authorizations, zero verifier attempts, and final disposition
+  `owner_wait_advisor` with `paid_turn_allowed=false`. The benchmark answer was
+  not produced, so this closes the control incident but is not a mathematical
+  solve.
