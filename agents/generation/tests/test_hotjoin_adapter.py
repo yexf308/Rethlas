@@ -435,6 +435,7 @@ def _materialize_cadence_turn(
     *,
     started_at: float,
     turn_id: str = "turn-1",
+    active_route_id: str = "route-a",
 ) -> tuple[hotjoin.LeaseToken, dict[str, Any]]:
     lease = ledger.acquire_lease("run-1", "continuation-test")
     ledger.bind_thread("run-1", "thread-1", lease=lease)
@@ -464,7 +465,7 @@ def _materialize_cadence_turn(
         turn_id=turn_id,
         now_epoch=started_at,
         lease=lease,
-        active_route_id="route-a",
+        active_route_id=active_route_id,
     )
     return lease, cycle
 
@@ -4279,7 +4280,11 @@ def test_context_handoff_prepare_v2_is_host_derived_and_purpose_bound(
     ledger: hotjoin.ConversationLedger,
 ) -> None:
     now = time.time()
-    lease, cycle = _materialize_cadence_turn(ledger, started_at=now - 1_000.0)
+    lease, cycle = _materialize_cadence_turn(
+        ledger,
+        started_at=now - 1_000.0,
+        active_route_id="route:unspecified",
+    )
     ledger.ensure_initial_thread_epoch(
         "run-1", thread_id="thread-1", turn_id="turn-1", lease=lease
     )
@@ -4301,9 +4306,12 @@ def test_context_handoff_prepare_v2_is_host_derived_and_purpose_bound(
             "Prove the frontier bridge.".encode()
         ).hexdigest(),
     )
+    reasoning = ledger.activate_reasoning_epoch_capability(
+        "run-1", owner_token=token
+    )
     environment = {
         **os.environ,
-        hotjoin.REVIEW_CONTROL_TOKEN_ENV: token,
+        hotjoin.REVIEW_CONTROL_TOKEN_ENV: str(reasoning["token"]),
         hotjoin.REVIEW_DATABASE_ENV: str(ledger.path),
     }
     blueprint_sha256 = "b" * 64
@@ -4334,6 +4342,21 @@ def test_context_handoff_prepare_v2_is_host_derived_and_purpose_bound(
             "route_frozen": False,
         },
     }
+    invalid_payload = json.loads(json.dumps(payload))
+    invalid_payload["proposal"]["active_route"]["core_bridge"] = ""
+    invalid = _invoke_control_subprocess(
+        "context-handoff-prepare", invalid_payload, environment
+    )
+    assert invalid.returncode != 0
+    assert (
+        ledger.cadence_control_state("run-1")["review_cadence"]["active_route_id"]
+        == "route:unspecified"
+    )
+    assert not any(
+        event["kind"] == "cadence_initial_route_bound_by_handoff"
+        for event in ledger.events("run-1")
+    )
+
     process = _invoke_control_subprocess(
         "context-handoff-prepare", payload, environment
     )
@@ -4342,6 +4365,7 @@ def test_context_handoff_prepare_v2_is_host_derived_and_purpose_bound(
     assert response["state"] == "available"
     assert response["binding"] is None
     assert response["content"]["purpose"] == "owner_yield"
+    assert response["content"]["active_route"]["route_id"] == "route-a"
     assert response["content"]["from_thread_epoch"] == "1"
     assert response["content"]["cadence"]["cycle_started_at_utc"] == (
         datetime.fromtimestamp(
@@ -4356,6 +4380,46 @@ def test_context_handoff_prepare_v2_is_host_derived_and_purpose_bound(
         == hashlib.sha256(
             hotjoin._canonical_json(response["content"]).encode()
         ).hexdigest()
+    )
+    projection = ledger.cadence_control_state("run-1")
+    assert projection["review_cadence"]["active_route_id"] == "route-a"
+    bound = [
+        event
+        for event in ledger.events("run-1")
+        if event["kind"] == "cadence_initial_route_bound_by_handoff"
+    ]
+    assert len(bound) == 1
+    assert bound[0]["payload"] == {
+        "cycle_id": cycle["cycle_id"],
+        "purpose": "owner_yield",
+        "route_id": "route-a",
+    }
+
+    replay = _invoke_control_subprocess(
+        "context-handoff-prepare", payload, environment
+    )
+    assert replay.returncode == 0, replay.stderr
+    replay_response = json.loads(replay.stdout)
+    assert replay_response["handoff_id"] == response["handoff_id"]
+    assert replay_response["idempotent"] is True
+    assert len(
+        [
+            event
+            for event in ledger.events("run-1")
+            if event["kind"] == "cadence_initial_route_bound_by_handoff"
+        ]
+    ) == 1
+
+    drifted_payload = json.loads(json.dumps(payload))
+    drifted_payload["proposal"]["active_route"]["route_id"] = "route-b"
+    rejected = _invoke_control_subprocess(
+        "context-handoff-prepare", drifted_payload, environment
+    )
+    assert rejected.returncode != 0
+    assert "assertions differ from durable host state" in rejected.stderr
+    assert (
+        ledger.cadence_control_state("run-1")["review_cadence"]["active_route_id"]
+        == "route-a"
     )
 
 
@@ -15532,6 +15596,50 @@ def test_released_runner_continue_active_validates_receipt_without_owner_token(
     assert admitted["paid_turn_allowed"] is True
 
 
+def test_released_owner_continue_active_uses_owner_fence_after_guardian_returns(
+    ledger: hotjoin.ConversationLedger,
+) -> None:
+    now = time.time()
+    lease, _cycle = _materialize_cadence_turn(
+        ledger, started_at=now - 1_200.0
+    )
+    terminal = _turn("turn-1", "completed")
+    ledger.stage_turn_terminal(
+        "run-1", thread_id="thread-1", turn=terminal, lease=lease
+    )
+    ledger.finalize_turn(
+        "run-1",
+        turn_id="turn-1",
+        status="completed",
+        assistant_message="guardian returned before host continuation admission",
+        error=None,
+        terminal_audit=terminal,
+        lease=lease,
+    )
+    ledger.release_lease("run-1", lease)
+    owner_token = _bind_continuation_capability(ledger)
+    environment = {
+        **os.environ,
+        hotjoin.REVIEW_CONTROL_TOKEN_ENV: owner_token,
+        hotjoin.REVIEW_DATABASE_ENV: str(ledger.path),
+    }
+    process = _invoke_control_subprocess(
+        "cadence-admit",
+        {
+            "operation": "continue_active_cycle",
+            "run_id": "run-1",
+            "generation_control_receipt": _generation_control_receipt(),
+        },
+        environment,
+        allow_unreleased_paid_work=False,
+    )
+
+    assert process.returncode == 0, process.stderr
+    admitted = json.loads(process.stdout)
+    assert admitted["disposition"] == "continue_active_cycle"
+    assert admitted["paid_turn_allowed"] is True
+
+
 def test_guarded_review_consumes_exact_runner_fd_and_replay_is_impossible(
     ledger: hotjoin.ConversationLedger,
     monkeypatch: pytest.MonkeyPatch,
@@ -19330,7 +19438,7 @@ You may use local read-only shell/Python for the `q=7` arithmetic. Do not use th
     private_adapter.write_text(private_source, encoding="utf-8")
     private_adapter_sha256 = hashlib.sha256(private_adapter.read_bytes()).hexdigest()
     assert private_adapter_sha256 == (
-        "f0554cd680b162e2a82c83458f43792dc8fc8daf002649262d3bd3b3ab61bc04"
+        "7992ca17730a319fa4c3211f73d1e115f35be42cc3f5c58eae31c05219afe4f2"
     )
 
     monkeypatch.setattr(hotjoin, "__file__", str(private_adapter))

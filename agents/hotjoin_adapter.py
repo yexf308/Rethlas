@@ -18724,6 +18724,37 @@ class ConversationLedger:
                 context_exact or owner_exact or cycle_close_exact
             ):
                 raise HotJoinError("context handoff missed its exact epoch/turn window")
+            content_active_route = content.get("active_route")
+            content_route_id = (
+                content_active_route.get("route_id")
+                if isinstance(content_active_route, Mapping)
+                else None
+            )
+            if (
+                cycle is not None
+                and purpose in {"context_guard", "owner_yield"}
+                and content.get("last_review") is None
+                and cycle["active_route_id"] == "route:unspecified"
+                and isinstance(content_route_id, str)
+                and content_route_id != "route:unspecified"
+            ):
+                route_sequence, _, _ = self._append_event(
+                    connection,
+                    run_id=run_id,
+                    kind="cadence_initial_route_bound_by_handoff",
+                    actor="context_control",
+                    payload={
+                        "cycle_id": cycle["cycle_id"],
+                        "purpose": purpose,
+                        "route_id": content_route_id,
+                    },
+                )
+                connection.execute(
+                    "UPDATE cadence_cycles SET active_route_id = ?, "
+                    "updated_sequence = ? WHERE cycle_id = ? "
+                    "AND active_route_id = 'route:unspecified'",
+                    (content_route_id, route_sequence, cycle["cycle_id"]),
+                )
             existing = connection.execute(
                 "SELECT * FROM context_handoffs WHERE handoff_id = ?", (handoff_id,)
             ).fetchone()
@@ -28688,9 +28719,17 @@ def _cadence_admit_control(
     run_id = payload.get("run_id")
     if not isinstance(run_id, str):
         raise ValueError("cadence admission omitted run_id")
+    override_domain = (
+        _CONTROL_TOKEN_OVERRIDE[0] if _CONTROL_TOKEN_OVERRIDE is not None else None
+    )
+    # The guarded worker may admit a continuation before its Guardian exits,
+    # while the outer repository-owner wrapper performs the same mutation only
+    # after that clean terminal has been finalized. Preserve the runner fence
+    # for the former and use the current owner revision for the latter.
     if (
         operation == "continue_active_cycle"
         and _released_guardian_enforcement()
+        and override_domain != "owner"
     ):
         control_fence: ReviewControlFence | GuardianRunnerFence = (
             ledger.guardian_runner_fence(
@@ -32678,6 +32717,17 @@ def _context_handoff_prepare_control(
         and _json_loads_strict(str(latest_review["decision_json"]))["route_frozen"]
     )
     active_route = proposal.get("active_route")
+    proposed_route_id = (
+        active_route.get("route_id") if isinstance(active_route, dict) else None
+    )
+    initial_handoff_route_binding = (
+        purpose in {"context_guard", "owner_yield"}
+        and latest_review is None
+        and cycle["active_route_id"] == "route:unspecified"
+        and isinstance(proposed_route_id, str)
+        and bool(proposed_route_id)
+        and proposed_route_id != "route:unspecified"
+    )
     if (
         assertions.get("problem_id") != run["problem_id"]
         or assertions.get("statement_sha256") != capability["expected_statement_sha256"]
@@ -32687,7 +32737,10 @@ def _context_handoff_prepare_control(
         or assertions.get("route_frozen") is not route_frozen
         or not isinstance(active_route, dict)
         or set(active_route) != {"route_id", "core_bridge"}
-        or active_route.get("route_id") != cycle["active_route_id"]
+        or (
+            proposed_route_id != cycle["active_route_id"]
+            and not initial_handoff_route_binding
+        )
     ):
         raise HotJoinError("context handoff assertions differ from durable host state")
     content = {

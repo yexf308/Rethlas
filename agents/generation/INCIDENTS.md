@@ -769,3 +769,47 @@ an incident.
   was validated from epoch 1 to pending epoch 2. The smoke stopped immediately
   after that handoff, exited zero in 7m16s, and did not claim a proof or start a
   second paid segment.
+
+## 2026-08-20: production fresh-run owner yield failed before the first review
+
+- **Classification:** pre-review route-binding and post-Guardian authority
+  mismatch; fixed. The mathematical search remained honestly unsolved and no
+  verifier receipt or answer was claimed.
+- **Trigger:** production run
+  `arxivhard-am2606-048-production-max-20260820-01` used the T0 problem asking
+  for the exact number of labeled 19-element posets, `gpt-5.6-sol` at `max`,
+  and the unmodified 30/60/87/90-minute cadence. Exactly three logical routes
+  completed without a candidate. The root then requested an owner-advisor
+  yield before the first scheduled review.
+- **Observed effect:** all three `context-handoff-prepare` attempts failed with
+  `context handoff assertions differ from durable host state`. After the root
+  returned cleanly, the wrapper attempted `continue_active_cycle` and failed
+  with `owner control capability cannot authenticate runner authority`; the
+  run exited `70` at T+22m35s. Guardian finalized normally with
+  `forced=false`, no killed or stopped groups, and no remaining generation
+  process.
+- **Root causes:** a fresh production cycle keeps the host route placeholder
+  `route:unspecified` until its first official review, while the valid
+  pre-fanout checkpoint had already committed the concrete root route. The
+  handoff control required strict equality and therefore made a pre-review
+  owner yield impossible. Separately, released `cadence-admit` always selected
+  a runner fence, even when the command arrived through the documented
+  one-shot owner FD after the Guardian had cleanly returned.
+- **Remediation:** a validated pre-review `owner_yield` or `context_guard`
+  handoff may bind the single initial concrete route atomically when, and only
+  when, the durable cycle still contains `route:unspecified` and has no prior
+  official review. Replays are idempotent and a different later route remains
+  rejected. Released continuation admission now selects the fence from the
+  actual one-shot FD domain: runner FD operations retain `GuardianRunnerFence`,
+  while the outer owner wrapper uses the current `ReviewControlFence`. The
+  following paid root still requires a fresh Guardian admission, so this does
+  not grant paid work directly.
+- **Regression evidence:** tests reproduce a reasoning-epoch handoff against a
+  production-like unspecified route, reject invalid content without binding,
+  accept one binding, replay it once, reject route drift, exercise the real
+  owner-FD subprocess after Guardian return, and preserve the runner-only
+  fence path. The focused hot-join suite passes 423 tests; runner and review
+  suites pass 176 tests; Guardian and launcher suites pass 126 tests with one
+  expected skip. The complete generation test directory passes 973 tests with
+  one expected skip. A same-problem production rerun is still required before
+  the incident is considered end-to-end closed.
