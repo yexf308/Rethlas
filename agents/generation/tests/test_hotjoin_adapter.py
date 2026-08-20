@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import io
 import json
@@ -1881,7 +1882,6 @@ developer_arg = next(
 developer = json.loads(developer_arg.split("=", 1)[1])
 review_id = re.search(r"review_id=(review_[0-9a-f]{{32}})", developer).group(1)
 snapshot_sha = re.search(r"snapshot_sha256=([0-9a-f]{{64}})", developer).group(1)
-last_path = sys.argv[sys.argv.index("--output-last-message") + 1]
 report = {{
     "review_id": review_id,
     "snapshot_sha256": snapshot_sha,
@@ -1919,8 +1919,6 @@ report = {{
         if {load_bearing_claim!r} else None
     )
 }}
-with open(last_path, "w", encoding="utf-8") as handle:
-    json.dump(report, handle, sort_keys=True, separators=(",", ":"))
 capture = {{
     "argv": sys.argv[1:],
     "codex_home_files": sorted(os.listdir(os.environ["CODEX_HOME"])),
@@ -1940,6 +1938,124 @@ print(json.dumps({{"type": "turn.completed"}}))
 """
     path.write_text(source, encoding="utf-8")
     path.chmod(0o700)
+
+
+@pytest.mark.parametrize("descriptor", [1, 2])
+def test_reviewer_auth_preflight_accepts_login_status_on_either_stream(
+    tmp_path: Path, descriptor: int
+) -> None:
+    executable = tmp_path / "codex"
+    executable.write_text(
+        "#!/bin/sh\n"
+        "if [ \"$1\" = login ] && [ \"$2\" = status ]; then\n"
+        f"  printf 'Logged in using test fixture\\n' >&{descriptor}\n"
+        "  exit 0\n"
+        "fi\n"
+        "exit 3\n",
+        encoding="utf-8",
+    )
+    executable.chmod(0o700)
+    codex_home = tmp_path / "codex-home"
+    codex_home.mkdir(mode=0o700)
+
+    hotjoin._preflight_reviewer_authentication(
+        executable, codex_home=codex_home
+    )
+
+
+def test_reviewer_event_validation_allows_bounded_transport_diagnostic() -> None:
+    report = b'{"verdict":"green"}'
+    events = b"\n".join(
+        hotjoin._canonical_json(event).encode("utf-8")
+        for event in (
+            {
+                "type": "item.completed",
+                "item": {
+                    "id": "transport-1",
+                    "type": "error",
+                    "message": "WebSocket unavailable; falling back to HTTPS.",
+                },
+            },
+            {"type": "thread.started", "thread_id": "fresh-review-thread"},
+            {"type": "turn.started"},
+            {
+                "type": "item.completed",
+                "item": {
+                    "id": "report-1",
+                    "type": "agent_message",
+                    "text": report.decode("utf-8"),
+                },
+            },
+            {"type": "turn.completed"},
+        )
+    )
+
+    trace, observed_report = hotjoin._validate_tool_free_reviewer_events(events)
+
+    assert trace["tool_free"] is True
+    assert trace["event_count"] == 5
+    assert observed_report == report
+
+
+def test_reviewer_event_validation_rejects_duplicate_or_out_of_order_start() -> None:
+    raw = b"\n".join(
+        hotjoin._canonical_json(event).encode("utf-8")
+        for event in (
+            {"type": "thread.started", "thread_id": "one"},
+            {"type": "thread.started", "thread_id": "two"},
+            {"type": "turn.started"},
+            {"type": "turn.completed"},
+        )
+    )
+
+    with pytest.raises(hotjoin.HotJoinError, match="thread start order"):
+        hotjoin._validate_tool_free_reviewer_events(raw)
+
+
+def test_reviewer_pipe_prefix_is_unknown_until_all_writers_reach_eof(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    event_stream = b"\n".join(
+        hotjoin._canonical_json(event).encode("utf-8")
+        for event in (
+            {"type": "thread.started", "thread_id": "fresh"},
+            {"type": "turn.started"},
+            {
+                "type": "item.completed",
+                "item": {
+                    "id": "report",
+                    "type": "agent_message",
+                    "text": "{}",
+                },
+            },
+            {"type": "turn.completed"},
+        )
+    ) + b"\n"
+    source = (
+        "import os,time; payload="
+        + repr(event_stream)
+        + "; child=os.fork(); "
+        + "(time.sleep(2), os._exit(0)) if child == 0 "
+        + "else (os.write(1,payload), os._exit(0))"
+    )
+    process = subprocess.Popen(
+        [sys.executable, "-c", source],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        start_new_session=True,
+    )
+    monkeypatch.setattr(hotjoin, "REVIEW_PIPE_DRAIN_TIMEOUT_SECONDS", 0.05)
+    try:
+        result = hotjoin._communicate_reviewer_bounded(
+            process,
+            stdin_bytes=b"",
+            timeout_seconds=1.0,
+        )
+        assert result[-1] is True
+    finally:
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(process.pid, signal.SIGKILL)
 
 
 def _prepare_control_review_runtime(
@@ -6973,8 +7089,17 @@ def test_review_control_exact_subprocess_launch_is_fresh_authenticated_and_tool_
     assert request["snapshot"]["statement_text"] not in " ".join(capture["argv"])
     assert "--ephemeral" in capture["argv"]
     assert "--ignore-user-config" in capture["argv"]
+    assert "--output-last-message" not in capture["argv"]
     assert "features.shell_tool=false" in capture["argv"]
+    assert "features.shell_snapshot=false" in capture["argv"]
+    assert "features.shell_zsh_fork=false" in capture["argv"]
+    assert "features.unified_exec_zsh_fork=false" in capture["argv"]
     assert "features.multi_agent=false" in capture["argv"]
+    assert "features.multi_agent_v2=false" in capture["argv"]
+    assert "features.plugins=false" in capture["argv"]
+    assert "features.skill_search=false" in capture["argv"]
+    assert "features.view_image=false" in capture["argv"]
+    assert "tools.view_image=false" not in capture["argv"]
     assert 'history.persistence="none"' in capture["argv"]
     assert any(value.startswith("developer_instructions=") for value in capture["argv"])
     with ledger._connect() as connection:
@@ -6988,6 +7113,62 @@ def test_review_control_exact_subprocess_launch_is_fresh_authenticated_and_tool_
         launch_receipt["developer_instructions_sha256"] == capture["developer_sha256"]
     )
     assert ledger.verify_chain("run-1")["valid"] is True
+
+
+def test_reviewer_jit_admission_rejects_elapsed_wall_deadline(
+    ledger: hotjoin.ConversationLedger,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request, environment, _capture_path = _prepare_control_review_runtime(
+        ledger, tmp_path
+    )
+    prepared = _invoke_control_subprocess(
+        "review-prepare", {"request": request}, environment
+    )
+    assert prepared.returncode == 0, prepared.stderr
+    monkeypatch.setenv(
+        hotjoin.REVIEW_CONTROL_TOKEN_ENV,
+        environment[hotjoin.REVIEW_CONTROL_TOKEN_ENV],
+    )
+    review = hotjoin._review_row_by_id(ledger, request["review_id"])
+    capability = hotjoin._review_capability(
+        ledger,
+        "run-1",
+        environment[hotjoin.REVIEW_CONTROL_TOKEN_ENV],
+    )
+    running, should_launch = hotjoin._begin_review_execution(
+        ledger, review, capability["_control_fence"]
+    )
+    assert should_launch is True
+    with ledger._connect() as connection:
+        connection.execute(
+            "UPDATE cadence_actions SET deadline_at = ?, deadline_monotonic = ? "
+            "WHERE action_id = (SELECT action_id FROM route_reviews "
+            "WHERE review_id = ?)",
+            (time.time() - 1.0, time.monotonic() + 60.0, request["review_id"]),
+        )
+        connection.commit()
+
+    with pytest.raises(hotjoin.HotJoinError, match="elapsed during reviewer preflight"):
+        hotjoin._reviewer_dispatch_admission_remaining(
+            ledger, running, capability
+        )
+
+
+def test_review_deadline_remaining_uses_same_boot_monotonic_earliest() -> None:
+    remaining = hotjoin._review_deadline_remaining(
+        {
+            "deadline_at": 2_000.0,
+            "deadline_monotonic": 99.0,
+            "cycle_boot_identity": "boot-1",
+        },
+        wall_epoch=1_000.0,
+        monotonic_epoch=100.0,
+        boot_identity="boot-1",
+    )
+
+    assert remaining == -1.0
 
 
 def test_review_control_rejects_tool_event_even_with_valid_final_report(
@@ -13960,6 +14141,119 @@ def test_guardian_finalize_accepts_exact_post_worker_group_cleanup(
         )
 
 
+def test_guardian_finalize_and_clean_accept_pid_reuse_but_not_same_process_escape(
+    ledger: hotjoin.ConversationLedger,
+) -> None:
+    registered = _arm_initial_guardian(
+        ledger, wall_epoch=1_000.0, monotonic_epoch=2_000.0
+    )
+    ack = registered["registration_ack"]
+    uid = os.getuid()
+    reused_root = _GuardianIdentity(
+        pid=10_101,
+        uid=uid,
+        pgid=10_101,
+        start_marker="reused-root-pid",
+    )
+    reused_daemon = _GuardianIdentity(
+        pid=20_202,
+        uid=uid,
+        pgid=20_202,
+        start_marker="reused-daemon-pid",
+    )
+    reused_inspector = _GuardianInspector(
+        boot_identity="boot-test-1",
+        identities=[reused_root, reused_daemon],
+    )
+    report = {
+        "registration_id": ack["registration_id"],
+        "request_sha256": ack["request_sha256"],
+        "state": "completed",
+        "reason": "paid_group_empty",
+        "forced": False,
+        "direct_returncode": 0,
+        "stopped_pgids": [],
+        "killed_pgids": [],
+        "already_empty_pgids": [10_101],
+    }
+
+    terminal = ledger.finalize_guardian(
+        "run-1",
+        report=report,
+        report_sha256=hashlib.sha256(
+            hotjoin._canonical_json(report).encode("utf-8")
+        ).hexdigest(),
+        guardian_token="4" * 64,
+        inspector=reused_inspector,
+        wall_epoch=1_001.0,
+        monotonic_epoch=2_001.0,
+    )
+    assert terminal["state"] == "completed"
+    with ledger._connect() as connection:
+        row = connection.execute(
+            "SELECT cycle_id FROM guardian_registrations "
+            "WHERE registration_id = ?",
+            (ack["registration_id"],),
+        ).fetchone()
+        assert row is not None
+        cycle_id = str(row["cycle_id"])
+        assert ledger._guardian_terminal_clean_txn(
+            connection,
+            cycle_id=cycle_id,
+            inspector=reused_inspector,
+        )
+
+        escaped_original = _GuardianIdentity(
+            pid=10_101,
+            uid=uid,
+            pgid=73_703,
+            start_marker="root-birth-1",
+        )
+        escaped_inspector = _GuardianInspector(
+            boot_identity="boot-test-1",
+            identities=[escaped_original, reused_daemon],
+        )
+        assert not ledger._guardian_terminal_clean_txn(
+            connection,
+            cycle_id=cycle_id,
+            inspector=escaped_inspector,
+        )
+
+
+def test_guardian_bound_group_reuse_requires_exact_new_leader_or_old_empty() -> None:
+    uid = os.getuid()
+    moved_reuse = _GuardianIdentity(
+        pid=10_101,
+        uid=uid,
+        pgid=70_707,
+        start_marker="reused-pid-in-another-group",
+    )
+    old_residual = _GuardianIdentity(
+        pid=30_303,
+        uid=uid,
+        pgid=10_101,
+        start_marker="old-leaderless-member",
+    )
+    inspector = _GuardianInspector(
+        boot_identity="boot-test-1",
+        identities=[moved_reuse, old_residual],
+    )
+
+    assert not hotjoin._guardian_bound_group_retired(
+        pid=10_101,
+        pgid=10_101,
+        start_marker="original-root",
+        inspector=inspector,
+    )
+    inspector._identities.pop(old_residual.pid)  # noqa: SLF001
+    assert hotjoin._guardian_bound_group_retired(
+        pid=10_101,
+        pgid=10_101,
+        start_marker="original-root",
+        inspector=inspector,
+    )
+
+
 def test_nonzero_worker_cleanup_terminal_is_durable_but_never_clean(
     ledger: hotjoin.ConversationLedger,
 ) -> None:
@@ -15286,6 +15580,74 @@ def test_guarded_review_consumes_exact_runner_fd_and_replay_is_impossible(
     }
     with pytest.raises((OSError, hotjoin.HotJoinError)):
         hotjoin._guarded_review_drive_command(ledger, arguments)
+
+
+def test_guarded_review_runner_fence_survives_official_close_for_disposition(
+    ledger: hotjoin.ConversationLedger,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    boundary_id, cycle = _materialize_guarded_review_boundary(ledger)
+    monkeypatch.setitem(
+        hotjoin.REVIEW_CADENCE_POLICY, "guardian_enforcement_ready", True
+    )
+    pre_close = hotjoin._review_capability(ledger, "run-1", "5" * 64)
+    assert pre_close["_capability_authority"] == "runner_review"
+    assert pre_close["_review_boundary_id"] == boundary_id
+    fence = pre_close["_control_fence"]
+
+    with ledger._connect() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        action = connection.execute(
+            "SELECT * FROM cadence_actions WHERE cycle_id = ? AND kind = 'review_1'",
+            (cycle["cycle_id"],),
+        ).fetchone()
+        assert action is not None
+        sequence, _, _ = ledger._append_event(
+            connection,
+            run_id="run-1",
+            kind="guarded_review_test_official_close",
+            actor="test",
+            payload={"boundary_id": boundary_id},
+        )
+        connection.execute(
+            "INSERT INTO route_reviews("
+            "review_id, run_id, cycle_id, action_id, review_ordinal, route_id, "
+            "snapshot_sha256, request_sha256, expected_thread_id, "
+            "expected_turn_id, state, closed, official, "
+            "confirmed_progress_ids_json, created_sequence, updated_sequence"
+            ") VALUES (?, 'run-1', ?, ?, 1, 'route-a', ?, ?, "
+            "'thread-1', 'turn-1', 'completed', 1, 1, '[]', ?, ?)",
+            (
+                "review_" + "a" * 32,
+                cycle["cycle_id"],
+                action["action_id"],
+                "1" * 64,
+                "2" * 64,
+                sequence,
+                sequence,
+            ),
+        )
+        connection.execute(
+            "UPDATE cadence_cycles SET state = 'active', "
+            "allowed_action = 'one_bounded_cycle_on_fatal_doubt', "
+            "updated_sequence = ? WHERE cycle_id = ?",
+            (sequence, cycle["cycle_id"]),
+        )
+        connection.commit()
+
+    post_close = hotjoin._review_capability(ledger, "run-1", "5" * 64)
+    assert post_close["_capability_authority"] == "runner_review"
+    assert post_close["_review_boundary_id"] == boundary_id
+    with ledger._connect() as connection:
+        ledger._require_review_control_fence(connection, "run-1", fence)
+        connection.execute(
+            "UPDATE cadence_cycles SET state = 'operational_blocked' "
+            "WHERE cycle_id = ?",
+            (cycle["cycle_id"],),
+        )
+        connection.commit()
+    with pytest.raises(hotjoin.HotJoinError):
+        hotjoin._review_capability(ledger, "run-1", "5" * 64)
 
 
 @pytest.mark.parametrize("failure", ["wrong_token", "inactive_guardian"])
@@ -18968,7 +19330,7 @@ You may use local read-only shell/Python for the `q=7` arithmetic. Do not use th
     private_adapter.write_text(private_source, encoding="utf-8")
     private_adapter_sha256 = hashlib.sha256(private_adapter.read_bytes()).hexdigest()
     assert private_adapter_sha256 == (
-        "3bdfb659759a97318ad332440f1b58c90646c771a5c7fdd1c6eb033805bbef5b"
+        "f0554cd680b162e2a82c83458f43792dc8fc8daf002649262d3bd3b3ab61bc04"
     )
 
     monkeypatch.setattr(hotjoin, "__file__", str(private_adapter))

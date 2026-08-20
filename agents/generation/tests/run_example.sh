@@ -4407,6 +4407,18 @@ if (
 print(boundary["boundary_id"])
 PY
   )" || return 70
+  # Starting the root thread epoch advances the durable review-control fence.
+  # Rebind the same owner capability after the root Guardian has finalized so
+  # the due-review Guardian receives the current revision rather than the
+  # wrapper's pre-thread cached value.  The raw token and scope do not change.
+  if ! CONTROL_CAPABILITY_REVISION="$(control_capability_bind)"; then
+    echo "Could not refresh the scoped control fence for the due review." >&2
+    return 70
+  fi
+  if ! [[ "$CONTROL_CAPABILITY_REVISION" =~ ^[1-9][0-9]*$ ]]; then
+    echo "Due-review control fence refresh returned an invalid revision." >&2
+    return 70
+  fi
   if ! guardian_plan="$(guardian_launch_plan "$projection" review_drive_required)"; then
     echo "Could not derive the exact Guardian admission for the due review." >&2
     return 70

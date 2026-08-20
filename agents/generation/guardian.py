@@ -320,7 +320,9 @@ class GuardianClock:
 
     There is intentionally no API that accepts a duration or resets T0.  The
     hard boundary fires when *either* authenticated clock reaches its deadline.
-    A backwards sample fails closed instead of extending the cycle.
+    A backwards sample or wall lag behind monotonic fails closed instead of
+    extending the cycle.  A forward wall correction is safe because it can
+    only make the earliest-clock boundary arrive sooner.
     """
 
     def __init__(
@@ -330,14 +332,23 @@ class GuardianClock:
         boot_identity: str,
         wall_clock: Callable[[], float] = time.time,
         monotonic_clock: Callable[[], float] = time.monotonic,
-        rollback_tolerance: float = 1e-6,
+        wall_rollback_tolerance: float = MAX_PROJECTION_SKEW_SECONDS,
+        monotonic_rollback_tolerance: float = 1e-6,
     ) -> None:
         if projection.boot_identity != boot_identity:
             raise ClockViolation("boot identity changed across the deadline projection")
+        if (
+            not math.isfinite(wall_rollback_tolerance)
+            or wall_rollback_tolerance < 0
+            or not math.isfinite(monotonic_rollback_tolerance)
+            or monotonic_rollback_tolerance < 0
+        ):
+            raise ValueError("clock rollback tolerances must be finite and nonnegative")
         self.projection = projection
         self.wall_clock = wall_clock
         self.monotonic_clock = monotonic_clock
-        self.rollback_tolerance = rollback_tolerance
+        self.wall_rollback_tolerance = wall_rollback_tolerance
+        self.monotonic_rollback_tolerance = monotonic_rollback_tolerance
         # These are persisted host deadlines, not a new duration derived by
         # this process.  The consistency checks above only reject drift; they
         # never replace or extend either authoritative deadline.
@@ -350,9 +361,9 @@ class GuardianClock:
     def _read_sample(self) -> tuple[float, float]:
         wall = _finite_number(self.wall_clock(), "wall clock sample")
         monotonic = _finite_number(self.monotonic_clock(), "monotonic clock sample")
-        if wall + self.rollback_tolerance < self._last_wall:
+        if wall + self.wall_rollback_tolerance < self._last_wall:
             raise ClockViolation("wall clock rolled backwards")
-        if monotonic + self.rollback_tolerance < self._last_monotonic:
+        if monotonic + self.monotonic_rollback_tolerance < self._last_monotonic:
             raise ClockViolation("monotonic clock rolled backwards")
         return wall, monotonic
 
@@ -363,9 +374,9 @@ class GuardianClock:
         elapsed_monotonic = monotonic - self.projection.projected_monotonic
         if (
             check_projection_drift
-            and abs(elapsed_wall - elapsed_monotonic) > MAX_PROJECTION_SKEW_SECONDS
+            and elapsed_wall + MAX_PROJECTION_SKEW_SECONDS < elapsed_monotonic
         ):
-            raise ClockViolation("wall and monotonic clocks drifted out of projection")
+            raise ClockViolation("wall clock lagged monotonic deadline projection")
         self._last_wall = max(self._last_wall, wall)
         self._last_monotonic = max(self._last_monotonic, monotonic)
         return wall, monotonic
@@ -893,6 +904,14 @@ def _registered_group_state(group: PaidGroup, inspector: ProcessInspector) -> st
     # identity plus same-UID membership therefore remains exact STOP/KILL
     # coverage even after the leader exits.
     return "live"
+
+
+def _stabilized_registered_group_state(
+    group: PaidGroup, inspector: ProcessInspector
+) -> str:
+    """Classify once; transient uncertainty is retried by the main poll loop."""
+
+    return _registered_group_state(group, inspector)
 
 
 def _post_kill_bound_group_state(
@@ -1750,6 +1769,7 @@ def capture_descendant_process_groups(
     candidate_groups: dict[int, PaidGroup],
     inspector: ProcessInspector,
     owner_uid: int,
+    deadline_check: Callable[[], None] | None = None,
 ) -> None:
     """Stage exact same-UID descendant process groups without signalling.
 
@@ -1764,6 +1784,8 @@ def capture_descendant_process_groups(
         raise ValueError("descendant capture owner UID is invalid")
     ambiguities: list[int] = []
     for root_group in root_groups:
+        if deadline_check is not None:
+            deadline_check()
         if root_group.identity.uid != owner_uid:
             raise IdentityViolation("descendant capture root has the wrong UID")
         observed_root = inspector.identity(root_group.identity.pid)
@@ -1800,6 +1822,8 @@ def capture_descendant_process_groups(
                 ambiguities.append(seed.pgid)
                 continue
             for descendant in inspector.descendants(seed.pid):
+                if deadline_check is not None:
+                    deadline_check()
                 if descendant.pgid in registered_groups:
                     continue
                 existing_candidate = candidate_groups.get(descendant.pgid)
@@ -1809,11 +1833,13 @@ def capture_descendant_process_groups(
                     # later members of that same group must not be asked to
                     # reconstruct a leader which may already have exited.
                     try:
-                        candidate_state = _registered_group_state(
+                        candidate_state = _stabilized_registered_group_state(
                             existing_candidate, inspector
                         )
                     except IdentityViolation:
-                        ambiguities.append(descendant.pgid)
+                        # Keep the exact staged identity for the next main-loop
+                        # poll. Sleeping per group here can consume the entire
+                        # hard-stop lead window.
                         continue
                     if candidate_state == "ambiguous":
                         ambiguities.append(descendant.pgid)
@@ -1850,12 +1876,15 @@ def capture_descendant_process_groups(
                 ):
                     ambiguities.append(descendant.pgid)
                     continue
+                staged = PaidGroup("root", leader)
                 try:
-                    leader_state = _registered_group_state(
-                        PaidGroup("root", leader), inspector
+                    leader_state = _stabilized_registered_group_state(
+                        staged, inspector
                     )
                 except IdentityViolation:
-                    ambiguities.append(leader.pgid)
+                    # The descendant snapshot already supplied the exact
+                    # same-UID leader. Stage it for the next durable poll.
+                    candidate_groups[leader.pgid] = staged
                     continue
                 if leader_state == "ambiguous":
                     ambiguities.append(leader.pgid)
@@ -1864,7 +1893,7 @@ def capture_descendant_process_groups(
                 if existing is not None and existing.identity != leader:
                     ambiguities.append(leader.pgid)
                     continue
-                candidate_groups[leader.pgid] = PaidGroup("root", leader)
+                candidate_groups[leader.pgid] = staged
             observed_seed_after = inspector.identity(seed.pid)
             if observed_seed_after is not None and observed_seed_after != seed:
                 ambiguities.append(seed.pgid)
@@ -2012,6 +2041,7 @@ class Guardian:
         root_group: PaidGroup,
         registered_groups: dict[int, PaidGroup],
         candidate_groups: dict[int, PaidGroup],
+        deadline_check: Callable[[], None] | None = None,
     ) -> None:
         """Stage exact same-UID setsid descendants for host attestation or kill."""
 
@@ -2020,6 +2050,8 @@ class Guardian:
         # exact union to a fixed point so both normal polling and failure
         # cleanup retain coverage of that second generation.
         for _round in range(16):
+            if deadline_check is not None:
+                deadline_check()
             roots_by_pgid = {
                 root_group.identity.pgid: root_group,
                 **registered_groups,
@@ -2034,6 +2066,7 @@ class Guardian:
                 candidate_groups=candidate_groups,
                 inspector=self.inspector,
                 owner_uid=os.getuid(),
+                deadline_check=deadline_check,
             )
             if set(candidate_groups) == before:
                 return
@@ -2117,13 +2150,19 @@ class Guardian:
             )
             registered_groups[identity.pgid] = root_group
 
-            def monitor_paid_descendants() -> None:
+            def check_capture_deadline() -> None:
                 if clock.hard_stop_due():
-                    raise _HardStopDue("absolute hard stop during host callback")
+                    raise _HardStopDue(
+                        "absolute hard stop during descendant capture"
+                    )
+
+            def monitor_paid_descendants() -> None:
+                check_capture_deadline()
                 self._capture_escaped_groups(
                     root_group=root_group,
                     registered_groups=registered_groups,
                     candidate_groups=candidate_groups,
+                    deadline_check=check_capture_deadline,
                 )
 
             def clean_released_topology() -> _TerminalCleanupOutcome:
@@ -2349,6 +2388,9 @@ class Guardian:
                 if not isinstance(snapshot, PollSnapshot):
                     raise HostControlFailure("host poll returned a malformed snapshot")
                 self._validate_poll(snapshot, ack, request)
+                submitted_candidate_pgids = {
+                    item.identity.pgid for item in submitted_candidates
+                }
                 digest = snapshot.snapshot_sha256
                 if snapshot.sequence < last_sequence:
                     raise HostControlFailure("host poll sequence rolled backwards")
@@ -2465,10 +2507,37 @@ class Guardian:
                 monitor_paid_descendants()
                 retired_candidates: list[int] = []
                 for pgid, group in candidate_groups.items():
-                    state = _registered_group_state(group, self.inspector)
+                    try:
+                        state = _stabilized_registered_group_state(
+                            group, self.inspector
+                        )
+                    except IdentityViolation:
+                        if self.durably_attest_discovered_groups:
+                            # A group discovered after the completed host poll
+                            # can exit inside Darwin's enumeration window.  It
+                            # remains staged for the next durable poll, which
+                            # must either attest the exact identity or record
+                            # its already-empty disposition.  Do not signal or
+                            # locally launder it into terminal coverage.
+                            continue
+                        raise
                     if state == "empty":
+                        if (
+                            self.durably_attest_discovered_groups
+                            and pgid not in submitted_candidate_pgids
+                        ):
+                            # Keep a locally vanished exact candidate until a
+                            # successful host poll can durably record its
+                            # already-empty disposition.
+                            continue
                         retired_candidates.append(pgid)
-                        proven_empty_pgids.add(pgid)
+                        # Only a candidate included in this successfully
+                        # completed host poll has durable terminal coverage.
+                        # A helper discovered by the post-poll scan can exit
+                        # before the next submission; retire it locally without
+                        # laundering that unknown PGID into the final receipt.
+                        if pgid in submitted_candidate_pgids:
+                            proven_empty_pgids.add(pgid)
                         continue
                     if state == "ambiguous":
                         raise IdentityViolation(
@@ -2519,6 +2588,21 @@ class Guardian:
                         child.retire_after_empty(self.inspector)
                     except ResidualDescendants as residual_error:
                         cleanup_trigger = residual_error
+                    if (
+                        cleanup_trigger is not None
+                        and self.durably_attest_discovered_groups
+                    ):
+                        # A normal worker return can race with Codex teardown
+                        # helpers created after the preceding host poll.  Keep
+                        # the root shim and Guardian alive so the next poll can
+                        # durably attest or retire every exact group.  No next
+                        # paid turn is authorized before finalization, and the
+                        # original absolute hard stop still bounds this drain.
+                        remaining = clock.seconds_until_next_boundary(
+                            interrupt_sent=interrupt_sent
+                        )
+                        time.sleep(min(self.poll_interval, remaining))
+                        continue
                     if cleanup_trigger is None:
                         if child.reap() is None:
                             raise IdentityViolation(

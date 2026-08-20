@@ -720,3 +720,52 @@ an incident.
   policy with its own policy id and digest, plus exact daemon wait-status
   evidence. Compress only the test clock and label every receipt non-production;
   never change or claim equivalence with the production 30/60/90-minute policy.
+
+## 2026-08-20: accelerated guardian review chain completed after Codex 0.148 fixes
+
+- **Classification:** guardian/reviewer runtime compatibility failures; fixed.
+  The validating clock was an isolated, default-off non-production smoke and
+  does not establish production 30/60/90 timing equivalence.
+- **Root causes found by same-statement testing:** transient groups observed
+  after a completed host poll were omitted from durable terminal coverage;
+  PID/PGID reuse and Darwin group visibility were treated as live old groups;
+  forward NTP correction was rejected even though it only shortened the
+  earliest-clock deadline; and normal Codex teardown could create one final
+  helper group after root return. The independent critic then exposed stale
+  Codex configuration (`tools.view_image`), auth-status output on stderr, an
+  undersized process-wide file limit that killed the SQLite WAL, an implicit
+  shell-snapshot setsid process, unsupported JSON Schema `oneOf`, bounded
+  transport-error items outside the turn, and a runner fence that expired at
+  official close before disposition/handoff.
+- **Remediation:** exact locally observed groups remain staged until a
+  successful host poll records either their identity or already-empty state;
+  retirement requires the old group empty or exact PID+PGID leader reuse.
+  Descendant capture has no per-group sleep and rechecks the hard deadline
+  across large scans. Forward wall corrections are accepted while backward
+  drift remains fail-closed. Reviewer auth is copied before preflight and
+  accepts login status on either bounded stream. The critic disables shell
+  snapshot and all tool surfaces, carries its report in bounded JSONL, uses a
+  separate internal-state file cap, and validates one ordered attempt only
+  after every pipe reaches EOF. Review admission and completion use the
+  earliest same-boot wall/monotonic deadline, including a transaction-bound
+  check immediately before `Popen`. The post-close runner fence remains valid
+  only for the same live Guardian, cycle, terminal boundary, official review,
+  and unexpired dual-clock review window.
+- **Regression evidence:** final local suites passed 82 guardian tests with one
+  expected skip, 422 hot-join tests, 83 review client/contract tests, and 137
+  launcher/runner tests. Dedicated tests cover 256-group deadline pressure,
+  unsubmitted already-empty publication, PID reuse with leaderless residuals,
+  pre-dispatch deadline expiry, inherited pipe writers, ordered event streams,
+  and post-close fence revocation.
+- **Real-run evidence:** non-production run
+  `arxivhard-am2606047-guardian-fast-high-final-20260820-16` used the same
+  `am-2606-047` statement, `gpt-5.6-sol` at `high`, and a T+6m first review. It
+  accepted one reasoning checkpoint, observed and interrupted exactly three
+  active child turns plus the root, recorded zero control failures, completed
+  both root and review Guardians, launched one fresh tool-free critic, and
+  officially published a yellow review. The drive reached
+  `disposition_ready`; context handoff
+  `handoff_95ae1304f6d1e3f26c50bcc7554eb9afafcbd89b2af62c1b91a600fafadf5c59`
+  was validated from epoch 1 to pending epoch 2. The smoke stopped immediately
+  after that handoff, exited zero in 7m16s, and did not claim a proof or start a
+  second paid segment.

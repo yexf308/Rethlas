@@ -185,10 +185,10 @@ APPROVED_GUARDIAN_LAUNCHER_SHA256 = (
     "abf7b49c8989d746fe796a59b516357224615d56e28bccb7026180be03883b1c"
 )
 APPROVED_GUARDIAN_RUNNER_SHA256 = (
-    "12a3f577fa5ff22c0f5efca94bdf5d84f280016246aa22bb8ed3a9aae5900485"
+    "a952cae95c6217f6855b075a0e650ce0b77fa0f42fdf7eee425119dbc4055725"
 )
 APPROVED_GUARDIAN_SHA256 = (
-    "e2744d27efeda3c4bcaf2bb6b29c94672810eba8453644eefc8011bc5da36767"
+    "aa2f1c798fd8415bf850973f4ba0b100a8c142327e578a26bfd6416e09584266"
 )
 GUARDIAN_CONTROL_SCHEMA_REGISTRY = {
     "schema_version": "rethlas_guardian_control_registry_v1",
@@ -566,6 +566,8 @@ MAX_REVIEW_CONTROL_STDOUT_BYTES = 262_144
 MAX_REVIEW_EVENT_STREAM_BYTES = 8 * 1024 * 1024
 MAX_REVIEW_STDERR_BYTES = 256 * 1024
 MAX_REVIEW_DRIVER_STDERR_BYTES = 4_096
+MAX_REVIEW_PROCESS_FILE_BYTES = 32 * 1024 * 1024
+REVIEW_PIPE_DRAIN_TIMEOUT_SECONDS = 5.0
 REVIEW_DRIVER_PACKAGE_SCHEMA = "rethlas_review_driver_package_v1"
 REVIEW_DRIVER_PACKAGE_FILES = (
     "generation/mcp/__init__.py",
@@ -1064,7 +1066,9 @@ def _validate_released_runner_worker_command(
         ):
             raise HotJoinError("guardian review runner command is not exact")
         row = connection.execute(
-            "SELECT b.*, a.deadline_at, c.allowed_action, c.state AS cycle_state, "
+            "SELECT b.*, a.deadline_at, a.deadline_monotonic, "
+            "c.boot_identity AS cycle_boot_identity, "
+            "c.allowed_action, c.state AS cycle_state, "
             "r.active_turn_id FROM review_boundary_interrupts AS b "
             "JOIN cadence_actions AS a ON a.action_id = b.action_id "
             "JOIN cadence_cycles AS c ON c.cycle_id = b.cycle_id "
@@ -1078,7 +1082,13 @@ def _validate_released_runner_worker_command(
             or row["cycle_state"] != "review_due"
             or row["allowed_action"] != "host_review_driver_only"
             or row["active_turn_id"] is not None
-            or time.time() >= float(row["deadline_at"])
+            or _review_deadline_remaining(
+                row,
+                wall_epoch=time.time(),
+                monotonic_epoch=time.monotonic(),
+                boot_identity=str(row["cycle_boot_identity"]),
+            )
+            <= 0
         ):
             raise HotJoinError(
                 "guardian review runner missed its exact due review boundary"
@@ -2965,7 +2975,109 @@ class GuardianRunnerFence:
     capability_revision: int
     cycle_id: str
     cycle_generation: int
+    boot_identity: str
     operation: str
+
+
+def _guardian_review_drive_boundary_id(
+    connection: sqlite3.Connection,
+    *,
+    run_id: str,
+    cycle_id: str,
+    now_epoch: float | None = None,
+    monotonic_epoch: float | None = None,
+    boot_identity: str | None = None,
+) -> str | None:
+    """Return the one boundary where a guarded review may still finish.
+
+    The same runner must remain valid after an official close so it can read
+    the immutable disposition and prepare the fresh-epoch handoff.  That
+    extension is bounded by the original review deadline, exact Guardian
+    cycle, and one terminal boundary.  Pre-close work still requires the
+    scheduler's dedicated review lane; post-close work requires an official,
+    closed review and never admits an operationally blocked or hard-stopped
+    cycle.
+    """
+
+    observed = time.time() if now_epoch is None else float(now_epoch)
+    observed_monotonic = (
+        time.monotonic() if monotonic_epoch is None else float(monotonic_epoch)
+    )
+    cycle = connection.execute(
+        "SELECT state, allowed_action, close_disposition, boot_identity "
+        "FROM cadence_cycles WHERE run_id = ? AND cycle_id = ?",
+        (run_id, cycle_id),
+    ).fetchone()
+    rows = connection.execute(
+        "SELECT b.boundary_id, r.official, r.closed, a.deadline_monotonic "
+        "FROM cadence_actions AS a "
+        "JOIN review_boundary_interrupts AS b ON b.action_id = a.action_id "
+        "AND b.run_id = ? AND b.cycle_id = ? "
+        "LEFT JOIN route_reviews AS r ON r.action_id = a.action_id "
+        "AND r.run_id = b.run_id AND r.cycle_id = b.cycle_id "
+        "WHERE a.cycle_id = ? AND a.kind IN ('review_1','review_2') "
+        "AND a.state = 'completed' AND b.state = 'descendants_terminal' "
+        "AND a.deadline_at > ? AND a.deadline_monotonic > ?",
+        (run_id, cycle_id, cycle_id, observed, observed_monotonic),
+    ).fetchall()
+    if (
+        cycle is None
+        or not isinstance(boot_identity, str)
+        or cycle["boot_identity"] != boot_identity
+        or len(rows) != 1
+    ):
+        return None
+    row = rows[0]
+    pre_close = bool(
+        cycle["state"] in {"review_due", "review_running"}
+        and cycle["allowed_action"] == "host_review_driver_only"
+    )
+    post_close = bool(
+        bool(row["official"])
+        and bool(row["closed"])
+        and (
+            cycle["state"] in {"active", "verification_required"}
+            or (
+                cycle["state"] == "closed"
+                and cycle["close_disposition"] == "route_frozen"
+            )
+        )
+    )
+    return str(row["boundary_id"]) if pre_close or post_close else None
+
+
+def _review_deadline_remaining(
+    deadline: Mapping[str, Any] | sqlite3.Row,
+    *,
+    wall_epoch: float,
+    monotonic_epoch: float,
+    boot_identity: str | None,
+) -> float:
+    """Return the earliest comparable wall/monotonic review deadline."""
+
+    try:
+        wall_remaining = float(deadline["deadline_at"]) - float(wall_epoch)
+        deadline_monotonic = deadline["deadline_monotonic"]
+        cycle_boot_identity = deadline["cycle_boot_identity"]
+    except KeyError as exc:
+        keys = sorted(str(key) for key in deadline.keys())
+        raise HotJoinError(
+            "review deadline projection is incomplete: missing "
+            + str(exc.args[0])
+            + "; keys="
+            + ",".join(keys)
+        ) from exc
+    if (
+        deadline_monotonic is None
+        or not isinstance(boot_identity, str)
+        or not boot_identity
+        or cycle_boot_identity != boot_identity
+    ):
+        return wall_remaining
+    return min(
+        wall_remaining,
+        float(deadline_monotonic) - float(monotonic_epoch),
+    )
 
 
 @dataclass(frozen=True)
@@ -3319,6 +3431,36 @@ def _guardian_watchdog_process_coverage_is_exact(
             and registered_pgids == already_empty
         )
     return reason == "absolute_hard_stop"
+
+
+def _guardian_bound_group_retired(
+    *, pid: int, pgid: int, start_marker: str, inspector: Any
+) -> bool:
+    """Prove the exact bound group empty or numerically reused by a new leader."""
+
+    def old_group_empty() -> bool:
+        try:
+            return not inspector.group_members(pgid)
+        except IdentityViolation:
+            # An inaccessible or transiently unenumerable group is not an
+            # empty proof. Keep the durable old identity until a later poll.
+            return False
+
+    current = inspector.identity(pid)
+    if current is None:
+        return old_group_empty()
+    observed_marker = getattr(current, "start_marker", None)
+    if not isinstance(observed_marker, str) or observed_marker == start_marker:
+        return False
+    # Reuse of the exact numeric PID as the exact numeric PGID leader proves
+    # the old process group retired before the kernel could reuse both ids. If
+    # the new PID belongs to another PGID, leaderless members may still keep
+    # the old group alive, so require a separate empty proof.
+    return bool(
+        getattr(current, "pid", None) == pid
+        and getattr(current, "pgid", None) == pgid
+        and pid == pgid
+    ) or old_group_empty()
 
 
 class ConversationLedger:
@@ -10259,7 +10401,8 @@ class ConversationLedger:
                 )
             self._require_runner_fence(connection, run_id, fence)
             registration = connection.execute(
-                "SELECT leader_pgid, owner_uid, state FROM guardian_registrations "
+                "SELECT leader_pgid, owner_uid, state, boot_identity "
+                "FROM guardian_registrations "
                 "WHERE registration_id = ? AND run_id = ?",
                 (fence.registration_id, run_id),
             ).fetchone()
@@ -10272,7 +10415,13 @@ class ConversationLedger:
                 and (
                     (
                         fence.operation == "review_drive"
-                        and cycle["state"] in {"review_due", "review_running"}
+                        and _guardian_review_drive_boundary_id(
+                            connection,
+                            run_id=run_id,
+                            cycle_id=fence.cycle_id,
+                            boot_identity=fence.boot_identity,
+                        )
+                        is not None
                     )
                     or (
                         fence.operation == "cadence_admit"
@@ -10283,6 +10432,7 @@ class ConversationLedger:
             if (
                 registration is None
                 or registration["state"] not in {"active", "interrupting"}
+                or registration["boot_identity"] != fence.boot_identity
                 or not valid_cycle_state
                 or os.getpgrp() != int(registration["leader_pgid"])
                 or (hasattr(os, "getuid") and os.getuid() != int(registration["owner_uid"]))
@@ -10350,7 +10500,8 @@ class ConversationLedger:
                 """
                 SELECT l.*, g.registration_id, g.cycle_id,
                        c.generation AS cycle_generation,
-                       c.watchdog_registration_id
+                       c.watchdog_registration_id,
+                       g.boot_identity AS guardian_boot_identity
                 FROM guardian_launch_intents AS l
                 JOIN guardian_registrations AS g
                   ON g.launch_intent_sha256 = l.launch_intent_sha256
@@ -10379,6 +10530,7 @@ class ConversationLedger:
             capability_revision=int(row["capability_revision"]),
             cycle_id=str(row["cycle_id"]),
             cycle_generation=int(row["cycle_generation"]),
+            boot_identity=str(row["guardian_boot_identity"]),
             operation=operation,
         )
 
@@ -10392,7 +10544,8 @@ class ConversationLedger:
             """
             SELECT l.*, g.registration_id, g.cycle_id,
                    c.generation AS cycle_generation,
-                   c.watchdog_registration_id
+                   c.watchdog_registration_id,
+                   g.boot_identity AS guardian_boot_identity
             FROM guardian_launch_intents AS l
             JOIN guardian_registrations AS g
               ON g.launch_intent_sha256 = l.launch_intent_sha256
@@ -10418,6 +10571,7 @@ class ConversationLedger:
             or row["watchdog_registration_id"] != fence.registration_id
             or row["cycle_id"] != fence.cycle_id
             or int(row["cycle_generation"]) != fence.cycle_generation
+            or row["guardian_boot_identity"] != fence.boot_identity
             or not isinstance(allowed, list)
             or fence.operation not in allowed
         ):
@@ -10432,7 +10586,7 @@ class ConversationLedger:
         requested_state: str,
         reason_sha256: str,
         evidence_record_ids: Sequence[str],
-        control_fence: ReviewControlFence,
+        control_fence: ReviewControlFence | GuardianRunnerFence,
     ) -> dict[str, Any]:
         if requested_state not in {
             "waiting_cost_gate",
@@ -11906,7 +12060,12 @@ class ConversationLedger:
             or report.get("forced") is not False
             or report.get("direct_returncode") != 0
             or inspector.boot_identity() != registration["boot_identity"]
-            or inspector.identity(int(registration["daemon_pid"])) is not None
+            or not _guardian_bound_group_retired(
+                pid=int(registration["daemon_pid"]),
+                pgid=int(registration["daemon_pgid"]),
+                start_marker=str(registration["daemon_start_marker"]),
+                inspector=inspector,
+            )
         ):
             return False
         group_rows = connection.execute(
@@ -11942,13 +12101,21 @@ class ConversationLedger:
         return bool(
             coverage_pgids
             and all(
-                inspector.identity(int(row["pid"])) is None
-                and not inspector.group_members(int(row["pgid"]))
+                _guardian_bound_group_retired(
+                    pid=int(row["pid"]),
+                    pgid=int(row["pgid"]),
+                    start_marker=str(row["start_marker"]),
+                    inspector=inspector,
+                )
                 for row in group_rows
             )
             and all(
-                inspector.identity(int(group["identity"]["pid"])) is None
-                and not inspector.group_members(int(group["identity"]["pgid"]))
+                _guardian_bound_group_retired(
+                    pid=int(group["identity"]["pid"]),
+                    pgid=int(group["identity"]["pgid"]),
+                    start_marker=str(group["identity"]["start_marker"]),
+                    inspector=inspector,
+                )
                 for group in empty_groups
             )
         )
@@ -13806,9 +13973,12 @@ class ConversationLedger:
                     "AND state != 'terminal' ORDER BY pgid",
                     (registration_id,),
                 ).fetchall():
-                    if inspector.identity(int(row["pid"])) is not None:
-                        continue
-                    if inspector.group_members(int(row["pgid"])):
+                    if not _guardian_bound_group_retired(
+                        pid=int(row["pid"]),
+                        pgid=int(row["pgid"]),
+                        start_marker=str(row["start_marker"]),
+                        inspector=inspector,
+                    ):
                         continue
                     proven_empty.append(row)
             if proven_empty:
@@ -14686,12 +14856,20 @@ class ConversationLedger:
             durably_empty_pgids = empty_pgids
             root_rows = [row for row in group_rows if row["source_kind"] == "root"]
             all_empty = all(
-                inspector.identity(int(row["pid"])) is None
-                and not inspector.group_members(int(row["pgid"]))
+                _guardian_bound_group_retired(
+                    pid=int(row["pid"]),
+                    pgid=int(row["pgid"]),
+                    start_marker=str(row["start_marker"]),
+                    inspector=inspector,
+                )
                 for row in group_rows
             ) and all(
-                inspector.identity(int(group["identity"]["pid"])) is None
-                and not inspector.group_members(int(group["identity"]["pgid"]))
+                _guardian_bound_group_retired(
+                    pid=int(group["identity"]["pid"]),
+                    pgid=int(group["identity"]["pgid"]),
+                    start_marker=str(group["identity"]["start_marker"]),
+                    inspector=inspector,
+                )
                 for group in empty_groups
             )
             state = str(report["state"])
@@ -20402,6 +20580,9 @@ class ConversationLedger:
         boundary_id: str,
         driver_claim: str,
         control_fence: ReviewControlFence | GuardianRunnerFence,
+        wall_epoch: float,
+        monotonic_epoch: float,
+        boot_identity: str | None,
     ) -> dict[str, Any]:
         """Bind one owner-host drive to the immutable terminal review boundary."""
 
@@ -20446,7 +20627,17 @@ class ConversationLedger:
                 or action["state"] != "completed"
                 or run["active_turn_id"] is not None
                 or run["thread_id"] != boundary["expected_thread_id"]
-                or time.time() >= float(action["deadline_at"])
+                or _review_deadline_remaining(
+                    {
+                        "deadline_at": action["deadline_at"],
+                        "deadline_monotonic": action["deadline_monotonic"],
+                        "cycle_boot_identity": cycle["boot_identity"],
+                    },
+                    wall_epoch=wall_epoch,
+                    monotonic_epoch=monotonic_epoch,
+                    boot_identity=boot_identity,
+                )
+                <= 0
             ):
                 raise HotJoinError("owner review drive missed its exact host boundary")
             ordinal = int(boundary["review_ordinal"])
@@ -20527,6 +20718,12 @@ class ConversationLedger:
             **dict(existing),
             "cycle": "minute30" if ordinal == 1 else "minute60",
             "deadline_at": float(action["deadline_at"]),
+            "deadline_monotonic": (
+                float(action["deadline_monotonic"])
+                if action["deadline_monotonic"] is not None
+                else None
+            ),
+            "cycle_boot_identity": cycle["boot_identity"],
             "due_at": float(action["due_at"]),
             "review_ordinal": ordinal,
             "root_thread_id": boundary["expected_thread_id"],
@@ -20921,7 +21118,21 @@ class ConversationLedger:
                 or boundary["expected_turn_id"] != expected_turn_id
                 or boundary["root_terminal_sha256"] is None
                 or boundary["no_live_descendants_sha256"] is None
-                or time.time() >= float(action["deadline_at"])
+                or _review_deadline_remaining(
+                    {
+                        "deadline_at": action["deadline_at"],
+                        "deadline_monotonic": action["deadline_monotonic"],
+                        "cycle_boot_identity": cycle["boot_identity"],
+                    },
+                    wall_epoch=time.time(),
+                    monotonic_epoch=time.monotonic(),
+                    boot_identity=(
+                        control_fence.boot_identity
+                        if isinstance(control_fence, GuardianRunnerFence)
+                        else str(cycle["boot_identity"])
+                    ),
+                )
+                <= 0
             ):
                 raise HotJoinError(
                     "review request missed its terminal-bound host window"
@@ -25986,25 +26197,22 @@ def _review_capability(
                 "SELECT * FROM cadence_cycles WHERE cycle_id = ? AND run_id = ?",
                 (fence.cycle_id, run_id),
             ).fetchone()
-            boundaries = connection.execute(
-                "SELECT b.boundary_id FROM review_boundary_interrupts AS b "
-                "JOIN cadence_actions AS a ON a.action_id = b.action_id "
-                "WHERE b.run_id = ? AND b.cycle_id = ? "
-                "AND b.state = 'descendants_terminal' AND a.state = 'completed' "
-                "AND a.deadline_at > ?",
-                (run_id, fence.cycle_id, time.time()),
-            ).fetchall()
+            review_boundary_id = _guardian_review_drive_boundary_id(
+                connection,
+                run_id=run_id,
+                cycle_id=fence.cycle_id,
+                boot_identity=fence.boot_identity,
+            )
     if row is None:
         raise HotJoinError("review control capability is not bound")
     if authority == "runner_review" and (
         int(row["capability_revision"]) != fence.capability_revision
         or registration is None
         or registration["state"] not in {"active", "interrupting"}
+        or registration["boot_identity"] != fence.boot_identity
         or cycle is None
-        or cycle["state"] not in {"review_due", "review_running"}
-        or cycle["allowed_action"] != "host_review_driver_only"
         or cycle["watchdog_registration_id"] != fence.registration_id
-        or len(boundaries) != 1
+        or review_boundary_id is None
         or os.getpgrp() != int(registration["leader_pgid"])
         or (hasattr(os, "getuid") and os.getuid() != int(registration["owner_uid"]))
     ):
@@ -26015,7 +26223,7 @@ def _review_capability(
     result["_control_fence"] = fence
     result["_capability_authority"] = authority
     if authority == "runner_review":
-        result["_review_boundary_id"] = str(boundaries[0]["boundary_id"])
+        result["_review_boundary_id"] = review_boundary_id
     return result
 
 
@@ -26591,9 +26799,13 @@ def _invoke_review_contract_helper(
             check=False,
         )
     if completed.returncode != 0:
+        diagnostic = _safe_stderr_line(
+            completed.stderr[:4096].decode("utf-8", errors="replace")
+        )[:1024]
         raise HotJoinError(
             "review contract helper rejected input; stderr_sha256="
             + hashlib.sha256(completed.stderr[:4096]).hexdigest()
+            + ("; diagnostic=" + diagnostic if diagnostic else "")
         )
     if len(completed.stdout) > MAX_REVIEW_CONTROL_STDOUT_BYTES:
         raise HotJoinError("review contract helper output exceeds its byte bound")
@@ -28123,6 +28335,12 @@ def _review_drive_control(
     if guarded_boundary_id is not None and guarded_boundary_id != boundary_id:
         raise HotJoinError("guarded review drive changed its exact boundary")
     driver_claim = hashlib.sha256(os.urandom(32)).hexdigest()
+    review_fence = capability["_control_fence"]
+    review_boot_identity = (
+        review_fence.boot_identity
+        if isinstance(review_fence, GuardianRunnerFence)
+        else None
+    )
     lifecycle_lock = RunLifecycleLock(ledger.path, run_id)
     lifecycle_lock.acquire()
     try:
@@ -28130,7 +28348,10 @@ def _review_drive_control(
             run_id,
             boundary_id=boundary_id,
             driver_claim=driver_claim,
-            control_fence=capability["_control_fence"],
+            control_fence=review_fence,
+            wall_epoch=time.time(),
+            monotonic_epoch=time.monotonic(),
+            boot_identity=review_boot_identity,
         )
     finally:
         lifecycle_lock.release()
@@ -28153,10 +28374,22 @@ def _review_drive_control(
         return _review_drive_response(ledger, boundary_id=boundary_id, drive=drive)
 
     review_id = str(drive["review_id"])
-    review_deadline_at = float(drive["deadline_at"])
+    review_deadline = {
+        key: drive[key]
+        for key in (
+            "deadline_at",
+            "deadline_monotonic",
+            "cycle_boot_identity",
+        )
+    }
 
     def remaining_timeout() -> float:
-        remaining = review_deadline_at - time.time()
+        remaining = _review_deadline_remaining(
+            review_deadline,
+            wall_epoch=time.time(),
+            monotonic_epoch=time.monotonic(),
+            boot_identity=review_boot_identity,
+        )
         if remaining <= 0:
             raise HotJoinError("owner review drive crossed its absolute deadline")
         return min(360.0, remaining)
@@ -28273,7 +28506,8 @@ def _review_drive_control(
             control_fence=capability["_control_fence"],
         )
         raise HotJoinError(
-            "owner review driver wait crossed an unknown boundary"
+            "owner review driver wait crossed an unknown boundary: "
+            + _safe_error_text(exc)
         ) from exc
     waited_state = str(waited_result.get("state"))
     if waited_state == "verification_required":
@@ -28583,7 +28817,23 @@ def _review_due_status_control(
         or boundary["no_live_descendants_sha256"] is None
         or run["thread_id"] != action["expected_thread_id"]
         or run["active_turn_id"] is not None
-        or time.time() >= float(action["deadline_at"])
+        or _review_deadline_remaining(
+            {
+                "deadline_at": action["deadline_at"],
+                "deadline_monotonic": action["deadline_monotonic"],
+                "cycle_boot_identity": cycle["boot_identity"],
+            },
+            wall_epoch=time.time(),
+            monotonic_epoch=time.monotonic(),
+            boot_identity=(
+                capability["_control_fence"].boot_identity
+                if isinstance(
+                    capability["_control_fence"], GuardianRunnerFence
+                )
+                else str(cycle["boot_identity"])
+            ),
+        )
+        <= 0
     ):
         raise HotJoinError("review due status missed its exact host action binding")
     review_id, _identity_sha256 = _review_identity(
@@ -29388,7 +29638,23 @@ def _prepare_review_control(
         or boundary["expected_turn_id"] != snapshot.get("root_turn_id")
         or boundary["root_terminal_sha256"] != snapshot.get("root_terminal_sha256")
         or boundary["no_live_descendants_sha256"] is None
-        or time.time() >= float(action["deadline_at"])
+        or _review_deadline_remaining(
+            {
+                "deadline_at": action["deadline_at"],
+                "deadline_monotonic": action["deadline_monotonic"],
+                "cycle_boot_identity": cycle["boot_identity"],
+            },
+            wall_epoch=time.time(),
+            monotonic_epoch=time.monotonic(),
+            boot_identity=(
+                capability["_control_fence"].boot_identity
+                if isinstance(
+                    capability["_control_fence"], GuardianRunnerFence
+                )
+                else str(cycle["boot_identity"])
+            ),
+        )
+        <= 0
     ):
         raise HotJoinError("review snapshot missed its exact durable action binding")
     progress = snapshot.get("progress_records")
@@ -31252,11 +31518,12 @@ def _pin_reviewer_executable(
 
 
 def _reviewer_preexec_limits() -> None:
-    # `--output-last-message` is the only reviewer-controlled regular file.
-    # Kernel enforcement prevents it from growing past validation limits.
+    # The bounded JSONL pipe carries the reviewer report.  This separate,
+    # larger limit is defense in depth for Codex's internal ephemeral SQLite
+    # state, whose WAL legitimately exceeds the report-size contract.
     resource.setrlimit(
         resource.RLIMIT_FSIZE,
-        (MAX_REVIEW_CONTROL_STDOUT_BYTES, MAX_REVIEW_CONTROL_STDOUT_BYTES),
+        (MAX_REVIEW_PROCESS_FILE_BYTES, MAX_REVIEW_PROCESS_FILE_BYTES),
     )
 
 
@@ -31265,7 +31532,7 @@ def _communicate_reviewer_bounded(
     *,
     stdin_bytes: bytes,
     timeout_seconds: float,
-) -> tuple[bytes, bytes, bool, bool, bool]:
+) -> tuple[bytes, bytes, bool, bool, bool, bool]:
     """Drain both pipes with physical caps while enforcing one wall timeout."""
 
     buffers = {"stdout": bytearray(), "stderr": bytearray()}
@@ -31326,9 +31593,12 @@ def _communicate_reviewer_bounded(
             process.kill()
         with contextlib.suppress(BaseException):
             process.wait(timeout=5)
-    writer.join(timeout=5)
+    writer.join(timeout=REVIEW_PIPE_DRAIN_TIMEOUT_SECONDS)
     for thread in readers:
-        thread.join(timeout=5)
+        thread.join(timeout=REVIEW_PIPE_DRAIN_TIMEOUT_SECONDS)
+    drain_incomplete = writer.is_alive() or any(thread.is_alive() for thread in readers)
+    # A descendant may have inherited a pipe after the observed reviewer
+    # parent exited. Never treat the prefix as a complete tool-free trace.
     if writer_error and not timed_out and not any(exceeded.values()):
         raise HotJoinError("route reviewer stdin dispatch failed") from writer_error[0]
     return (
@@ -31337,6 +31607,7 @@ def _communicate_reviewer_bounded(
         exceeded["stdout"],
         exceeded["stderr"],
         timed_out,
+        drain_incomplete,
     )
 
 
@@ -31399,15 +31670,15 @@ def _copy_isolated_codex_auth(destination_home: Path) -> None:
         os.close(source_fd)
 
 
-def _preflight_reviewer_authentication(executable: Path) -> None:
+def _preflight_reviewer_authentication(
+    executable: Path, *, codex_home: Path
+) -> None:
     environment = {
+        "CODEX_HOME": str(codex_home),
         "LANG": os.environ.get("LANG", "C.UTF-8"),
         "LC_ALL": os.environ.get("LC_ALL", "C.UTF-8"),
         "PATH": os.pathsep.join((str(executable.parent), "/usr/bin", "/bin")),
     }
-    configured_home = os.environ.get("CODEX_HOME")
-    if configured_home:
-        environment["CODEX_HOME"] = configured_home
     try:
         result = subprocess.run(
             [str(executable), "login", "status"],
@@ -31423,12 +31694,17 @@ def _preflight_reviewer_authentication(executable: Path) -> None:
         result.returncode != 0
         or len(result.stdout) > 4096
         or len(result.stderr) > 4096
-        or not result.stdout.startswith(b"Logged in")
+        or not (
+            result.stdout.startswith(b"Logged in")
+            or result.stderr.startswith(b"Logged in")
+        )
     ):
         raise HotJoinError("Codex reviewer is not authenticated")
 
 
-def _validate_tool_free_reviewer_events(raw: bytes) -> dict[str, Any]:
+def _validate_tool_free_reviewer_events(
+    raw: bytes,
+) -> tuple[dict[str, Any], bytes]:
     if len(raw) > MAX_REVIEW_EVENT_STREAM_BYTES:
         raise HotJoinError("route reviewer event stream exceeds its byte bound")
     allowed_events = {
@@ -31439,9 +31715,13 @@ def _validate_tool_free_reviewer_events(raw: bytes) -> dict[str, Any]:
         "item.completed",
         "turn.completed",
     }
-    allowed_items = {"reasoning", "agent_message", "agentMessage"}
+    allowed_items = {"reasoning", "agent_message", "agentMessage", "error"}
     terminal_count = 0
+    thread_started_count = 0
+    turn_started_count = 0
     event_count = 0
+    phase = "expect_thread"
+    completed_agent_messages: list[bytes] = []
     for line_number, line in enumerate(raw.splitlines(), start=1):
         if not line.strip():
             continue
@@ -31459,7 +31739,37 @@ def _validate_tool_free_reviewer_events(raw: bytes) -> dict[str, Any]:
                 "route reviewer emitted a forbidden or unknown capability event: "
                 + event_type[:128]
             )
-        item = event.get("item")
+        raw_item = event.get("item")
+        prelude_transport_error = bool(
+            event_type == "item.completed"
+            and isinstance(raw_item, dict)
+            and raw_item.get("type") == "error"
+        )
+        if phase == "terminal":
+            raise HotJoinError("route reviewer emitted events after its terminal")
+        if event_type == "thread.started":
+            if phase != "expect_thread":
+                raise HotJoinError("route reviewer thread start order is invalid")
+            thread_started_count += 1
+            phase = "expect_turn"
+        elif event_type == "turn.started":
+            if phase != "expect_turn":
+                raise HotJoinError("route reviewer turn start order is invalid")
+            turn_started_count += 1
+            phase = "in_turn"
+        elif event_type == "turn.completed":
+            if phase != "in_turn":
+                raise HotJoinError("route reviewer terminal order is invalid")
+            terminal_count += 1
+            phase = "terminal"
+        elif phase != "in_turn" and not prelude_transport_error:
+            raise HotJoinError(
+                "route reviewer item appeared outside its turn: "
+                + phase
+                + "/"
+                + event_type
+            )
+        item = raw_item
         if item is not None:
             if (
                 not isinstance(item, dict)
@@ -31474,19 +31784,54 @@ def _validate_tool_free_reviewer_events(raw: bytes) -> dict[str, Any]:
                 raise HotJoinError(
                     "route reviewer used a forbidden tool/item capability: " + item_type
                 )
+            if item["type"] == "error":
+                diagnostic = item.get("message")
+                if (
+                    event_type != "item.completed"
+                    or not isinstance(diagnostic, str)
+                    or not diagnostic
+                    or len(diagnostic.encode("utf-8")) > 4_096
+                ):
+                    raise HotJoinError(
+                        "route reviewer emitted a malformed transport diagnostic"
+                    )
+            if event_type == "item.completed" and item["type"] in {
+                "agent_message",
+                "agentMessage",
+            }:
+                text = item.get("text")
+                if not isinstance(text, str):
+                    raise HotJoinError(
+                        "route reviewer completed an agent message without text"
+                    )
+                report_bytes = text.encode("utf-8")
+                if len(report_bytes) > MAX_REVIEW_CONTROL_STDOUT_BYTES:
+                    raise HotJoinError("route reviewer report exceeds its byte bound")
+                completed_agent_messages.append(report_bytes)
         event_count += 1
-        if event_type == "turn.completed":
-            terminal_count += 1
-    if event_count == 0 or terminal_count != 1:
+    if (
+        event_count == 0
+        or thread_started_count != 1
+        or turn_started_count != 1
+        or terminal_count != 1
+        or phase != "terminal"
+    ):
         raise HotJoinError(
-            "route reviewer event stream lacks one exact terminal observation"
+            "route reviewer event stream lacks one exact ordered attempt"
         )
-    return {
-        "event_count": event_count,
-        "event_stream_sha256": hashlib.sha256(raw).hexdigest(),
-        "terminal_count": terminal_count,
-        "tool_free": True,
-    }
+    if len(completed_agent_messages) != 1:
+        raise HotJoinError(
+            "route reviewer event stream lacks one exact completed report"
+        )
+    return (
+        {
+            "event_count": event_count,
+            "event_stream_sha256": hashlib.sha256(raw).hexdigest(),
+            "terminal_count": terminal_count,
+            "tool_free": True,
+        },
+        completed_agent_messages[0],
+    )
 
 
 def _record_reviewer_launch_receipt(
@@ -31532,6 +31877,69 @@ def _record_reviewer_launch_receipt(
             (_canonical_json(dict(receipt)), sequence, review["review_id"]),
         )
         connection.commit()
+
+
+def _reviewer_dispatch_admission_remaining(
+    ledger: ConversationLedger,
+    review: Mapping[str, Any],
+    capability: Mapping[str, Any],
+) -> float:
+    """Recheck the exact attempt, fence, and dual deadline just before Popen."""
+
+    fence = capability["_control_fence"]
+    boot_identity = (
+        fence.boot_identity
+        if isinstance(fence, GuardianRunnerFence)
+        else None
+    )
+    wall_epoch = time.time()
+    monotonic_epoch = time.monotonic()
+    with ledger._connect() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        ledger._require_review_control_fence(
+            connection, str(review["run_id"]), fence
+        )
+        current = connection.execute(
+            "SELECT r.state, r.request_sha256, r.snapshot_sha256, "
+            "a.state AS action_state, a.deadline_at, a.deadline_monotonic, "
+            "c.boot_identity AS cycle_boot_identity "
+            "FROM route_reviews AS r "
+            "JOIN cadence_actions AS a ON a.action_id = r.action_id "
+            "JOIN cadence_cycles AS c ON c.cycle_id = r.cycle_id "
+            "WHERE r.review_id = ? AND r.run_id = ?",
+            (review["review_id"], review["run_id"]),
+        ).fetchone()
+        attempts = connection.execute(
+            "SELECT COUNT(*) AS count FROM review_attempts "
+            "WHERE review_id = ? AND state = 'dispatching' "
+            "AND request_sha256 = ?",
+            (review["review_id"], review["request_sha256"]),
+        ).fetchone()
+        if (
+            current is None
+            or attempts is None
+            or int(attempts["count"]) != 1
+            or current["state"] != "running"
+            or current["action_state"] != "completed"
+            or current["request_sha256"] != review["request_sha256"]
+            or current["snapshot_sha256"] != review["snapshot_sha256"]
+        ):
+            connection.rollback()
+            raise HotJoinError(
+                "route reviewer lost its exact dispatch admission"
+            )
+        remaining = _review_deadline_remaining(
+            current,
+            wall_epoch=wall_epoch,
+            monotonic_epoch=monotonic_epoch,
+            boot_identity=boot_identity,
+        )
+        connection.commit()
+    if remaining <= 0:
+        raise HotJoinError(
+            "absolute review deadline elapsed during reviewer preflight"
+        )
+    return remaining
 
 
 def _launch_route_reviewer(
@@ -31598,14 +32006,15 @@ def _launch_route_reviewer(
                 executable,
                 expected_sha256=executable_commitment,
             )
-            _preflight_reviewer_authentication(executable)
             codex_home = root / "codex-home"
             work = root / "empty-workspace"
             codex_home.mkdir(mode=0o700)
             _copy_isolated_codex_auth(codex_home)
+            _preflight_reviewer_authentication(
+                executable, codex_home=codex_home
+            )
             work.mkdir(mode=0o500)
             schema_path = root / "report-schema.json"
-            last_message_path = root / "last-message.json"
             schema_path.write_text(
                 _canonical_json(invocation["output_schema"]), encoding="utf-8"
             )
@@ -31653,8 +32062,6 @@ def _launch_route_reviewer(
                 str(work),
                 "--output-schema",
                 str(schema_path),
-                "--output-last-message",
-                str(last_message_path),
                 "--config",
                 "model_reasoning_effort="
                 + json.dumps(str(invocation["reasoning_effort"])),
@@ -31671,9 +32078,17 @@ def _launch_route_reviewer(
                 "--config",
                 "features.shell_tool=false",
                 "--config",
+                "features.shell_snapshot=false",
+                "--config",
+                "features.shell_zsh_fork=false",
+                "--config",
                 "features.unified_exec=false",
                 "--config",
+                "features.unified_exec_zsh_fork=false",
+                "--config",
                 "features.multi_agent=false",
+                "--config",
+                "features.multi_agent_v2=false",
                 "--config",
                 "agents.enabled=false",
                 "--config",
@@ -31685,7 +32100,35 @@ def _launch_route_reviewer(
                 "--config",
                 "features.skill_mcp_dependency_install=false",
                 "--config",
-                "tools.view_image=false",
+                "features.skill_search=false",
+                "--config",
+                "features.plugins=false",
+                "--config",
+                "features.plugin_sharing=false",
+                "--config",
+                "features.recommended_plugins=false",
+                "--config",
+                "features.image_generation=false",
+                "--config",
+                "features.view_image=false",
+                "--config",
+                "features.browser_use=false",
+                "--config",
+                "features.browser_use_external=false",
+                "--config",
+                "features.in_app_browser=false",
+                "--config",
+                "features.computer_use=false",
+                "--config",
+                "features.goals=false",
+                "--config",
+                "features.memories=false",
+                "--config",
+                "features.workspace_dependencies=false",
+                "--config",
+                "features.standalone_web_search=false",
+                "--config",
+                "features.tool_suggest=false",
                 "--config",
                 "tools.web_search=false",
                 "--config",
@@ -31702,6 +32145,9 @@ def _launch_route_reviewer(
                 "PYTHONDONTWRITEBYTECODE": "1",
             }
             try:
+                dispatch_remaining = _reviewer_dispatch_admission_remaining(
+                    ledger, review, capability
+                )
                 process = subprocess.Popen(
                     command,
                     stdin=subprocess.PIPE,
@@ -31736,10 +32182,11 @@ def _launch_route_reviewer(
                 event_limit_exceeded,
                 stderr_limit_exceeded,
                 timed_out,
+                drain_incomplete,
             ) = _communicate_reviewer_bounded(
                 process,
                 stdin_bytes=prompt,
-                timeout_seconds=timeout_seconds,
+                timeout_seconds=min(timeout_seconds, dispatch_remaining),
             )
             terminal_observed = process.returncode is not None
             if timed_out:
@@ -31747,6 +32194,12 @@ def _launch_route_reviewer(
                     review,
                     state="execution_unknown",
                     error="route reviewer exceeded its one bounded attempt",
+                )
+            if drain_incomplete:
+                return _review_execution_failure(
+                    review,
+                    state="execution_unknown",
+                    error="route reviewer event pipes did not reach EOF",
                 )
             if event_limit_exceeded:
                 return _review_execution_failure(
@@ -31767,12 +32220,7 @@ def _launch_route_reviewer(
                     error="route reviewer exited non-zero; stderr_sha256="
                     + hashlib.sha256(stderr_bytes).hexdigest(),
                 )
-            trace = _validate_tool_free_reviewer_events(event_bytes)
-            if not last_message_path.is_file():
-                raise HotJoinError("route reviewer omitted its final report")
-            report_bytes = last_message_path.read_bytes()
-            if len(report_bytes) > MAX_REVIEW_CONTROL_STDOUT_BYTES:
-                raise HotJoinError("route reviewer report exceeds its byte bound")
+            trace, report_bytes = _validate_tool_free_reviewer_events(event_bytes)
             report = _json_loads_strict(report_bytes.decode("utf-8"))
             validated = _invoke_review_contract_helper(
                 capability,
@@ -32044,16 +32492,29 @@ def _review_wait_with_execution_lock(
     with ledger._connect() as connection:
         deadline = connection.execute(
             """
-            SELECT a.deadline_at FROM cadence_actions AS a
+            SELECT a.deadline_at, a.deadline_monotonic,
+                   c.boot_identity AS cycle_boot_identity
+            FROM cadence_actions AS a
             JOIN route_reviews AS r ON r.action_id = a.action_id
+            JOIN cadence_cycles AS c ON c.cycle_id = r.cycle_id
             WHERE r.review_id = ?
             """,
             (review["review_id"],),
         ).fetchone()
     if deadline is None:
         raise HotJoinError("review has no absolute scheduler deadline")
-    deadline_at = float(deadline["deadline_at"])
-    remaining = deadline_at - time.time()
+    fence = capability["_control_fence"]
+    boot_identity = (
+        fence.boot_identity
+        if isinstance(fence, GuardianRunnerFence)
+        else None
+    )
+    remaining = _review_deadline_remaining(
+        deadline,
+        wall_epoch=time.time(),
+        monotonic_epoch=time.monotonic(),
+        boot_identity=boot_identity,
+    )
     if remaining <= 0:
         execution = _review_execution_failure(
             review,
@@ -32077,7 +32538,12 @@ def _review_wait_with_execution_lock(
             capability,
             timeout_seconds=min(300.0, remaining),
         )
-        if execution.get("state") == "completed" and time.time() > deadline_at:
+        if execution.get("state") == "completed" and _review_deadline_remaining(
+            deadline,
+            wall_epoch=time.time(),
+            monotonic_epoch=time.monotonic(),
+            boot_identity=boot_identity,
+        ) <= 0:
             execution = _review_execution_failure(
                 review,
                 state="operational_blocked",

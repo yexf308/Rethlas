@@ -279,27 +279,7 @@ REPORT_JSON_SCHEMA: dict[str, Any] = {
                     },
                 },
                 "next_milestone": {
-                    "oneOf": [
-                        {"type": "null"},
-                        {
-                            "type": "object",
-                            "additionalProperties": False,
-                            "required": ["description", "test"],
-                            "properties": {
-                                "description": {"type": "string", "minLength": 1},
-                                "test": {"type": "string", "minLength": 1},
-                            },
-                        },
-                    ]
-                },
-            },
-        },
-        "verdict": {"enum": ["green", "yellow", "red"]},
-        "fatal_doubt": {
-            "oneOf": [
-                {"type": "null"},
-                {
-                    "type": "object",
+                    "type": ["object", "null"],
                     "additionalProperties": False,
                     "required": ["description", "test"],
                     "properties": {
@@ -307,23 +287,28 @@ REPORT_JSON_SCHEMA: dict[str, Any] = {
                         "test": {"type": "string", "minLength": 1},
                     },
                 },
-            ]
+            },
+        },
+        "verdict": {"enum": ["green", "yellow", "red"]},
+        "fatal_doubt": {
+            "type": ["object", "null"],
+            "additionalProperties": False,
+            "required": ["description", "test"],
+            "properties": {
+                "description": {"type": "string", "minLength": 1},
+                "test": {"type": "string", "minLength": 1},
+            },
         },
         "freeze_reason": {"type": ["string", "null"]},
         "load_bearing_claim": {
-            "oneOf": [
-                {"type": "null"},
-                {
-                    "type": "object",
-                    "additionalProperties": False,
-                    "required": ["blueprint_item_label", "claim_sha256", "reason"],
-                    "properties": {
-                        "blueprint_item_label": {"type": "string", "minLength": 1},
-                        "claim_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
-                        "reason": {"type": "string", "minLength": 1},
-                    },
-                },
-            ]
+            "type": ["object", "null"],
+            "additionalProperties": False,
+            "required": ["blueprint_item_label", "claim_sha256", "reason"],
+            "properties": {
+                "blueprint_item_label": {"type": "string", "minLength": 1},
+                "claim_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+                "reason": {"type": "string", "minLength": 1},
+            },
         },
     },
 }
@@ -373,6 +358,11 @@ load_bearing_claim to null for red. Review is not fact checking. Set
 load_bearing_claim only when one exact blueprint claim is truly
 load-bearing and needs targeted, non-publishing verification. Copy its label
 and claim_sha256 exactly from snapshot.blueprint_items; never invent either.
+Before emitting, enforce this exact verdict matrix:
+- green: next_milestone is an object; fatal_doubt and freeze_reason are null.
+- yellow: next_milestone and fatal_doubt are identical objects; freeze_reason is null.
+- red: next_milestone and fatal_doubt are null; freeze_reason is a non-empty string;
+  load_bearing_claim is null.
 Never claim that the proof or whole blueprint is verified. Output one JSON object and nothing
 else."""
 

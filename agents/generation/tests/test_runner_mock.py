@@ -3673,7 +3673,7 @@ def test_due_review_uses_guarded_runner_then_starts_fresh_epoch(
     )
 
     assert completed.returncode == 1, completed.stdout + completed.stderr
-    assert len(_cadence_calls(calls_path, "control-capability-bind")) == 1
+    assert len(_cadence_calls(calls_path, "control-capability-bind")) == 2
     drives = _cadence_calls(calls_path, "guarded-review-drive")
     assert len(drives) == 1
     assert drives[0]["control_envelope"] is None
@@ -3696,6 +3696,8 @@ def test_due_review_uses_guarded_runner_then_starts_fresh_epoch(
         "run-generator"
     )
     state = json.loads(state_path.read_text(encoding="utf-8"))
+    assert state["capability_revision"] == 2
+    assert len(state["token_digests"]) == 2
     assert state["review_drive_count"] == 1
     assert state["reviewed_handoff_consumed_count"] == 1
     assert state["cycle_history"] == ["cycle_" + f"{1:032x}"]
@@ -3758,7 +3760,7 @@ def test_due_review_red_freezes_route_without_owner_yield_or_paid_root(
         check=False,
     )
     assert restarted.returncode == 1, restarted.stdout + restarted.stderr
-    assert len(_cadence_calls(calls_path, "control-capability-bind")) == 1
+    assert len(_cadence_calls(calls_path, "control-capability-bind")) == 2
     assert len(_cadence_calls(calls_path, "guarded-review-drive")) == 1
     assert not _cadence_calls(calls_path, "run-generator")
     assert "state=route_frozen" in restarted.stderr

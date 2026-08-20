@@ -23,6 +23,7 @@ from agents.generation.guardian import (
     GuardianClock,
     GroupStopFailure,
     IdentityViolation,
+    MAX_PROJECTION_SKEW_SECONDS,
     PaidGroup,
     PollSnapshot,
     ProcessIdentity,
@@ -219,14 +220,16 @@ def test_clock_rollback_fails_closed(which: str) -> None:
     )
     clock.sample()
     if which == "wall":
-        wall.value -= 1.0
+        wall.value -= MAX_PROJECTION_SKEW_SECONDS + 0.01
     else:
         monotonic.value -= 1.0
     with pytest.raises(ClockViolation, match="rolled backwards"):
         clock.sample()
 
 
-def test_runtime_wall_monotonic_drift_fails_closed() -> None:
+def test_subsecond_wall_adjustment_uses_monotonic_without_extending_deadline() -> (
+    None
+):
     wall = MutableClock(1_000.0)
     monotonic = MutableClock(50.0)
     clock = GuardianClock(
@@ -235,10 +238,45 @@ def test_runtime_wall_monotonic_drift_fails_closed() -> None:
         wall_clock=wall,
         monotonic_clock=monotonic,
     )
-    wall.value += 2.0
-    monotonic.value += 0.5
-    with pytest.raises(ClockViolation, match="drifted"):
+    clock.sample()
+    wall.value -= 0.25
+    monotonic.value += 0.25
+
+    assert clock.sample() == (999.75, 50.25)
+    assert clock.seconds_until_hard_stop() == pytest.approx(
+        clock.hard_stop_monotonic - monotonic.value
+    )
+
+
+def test_runtime_wall_lag_behind_monotonic_fails_closed() -> None:
+    wall = MutableClock(1_000.0)
+    monotonic = MutableClock(50.0)
+    clock = GuardianClock(
+        projection(),
+        boot_identity="boot-1",
+        wall_clock=wall,
+        monotonic_clock=monotonic,
+    )
+    wall.value += 0.5
+    monotonic.value += 2.0
+    with pytest.raises(ClockViolation, match="lagged monotonic"):
         clock.sample()
+
+
+def test_forward_wall_correction_is_safe_and_shortens_deadline() -> None:
+    wall = MutableClock(1_000.0)
+    monotonic = MutableClock(50.0)
+    clock = GuardianClock(
+        projection(),
+        boot_identity="boot-1",
+        wall_clock=wall,
+        monotonic_clock=monotonic,
+    )
+    wall.value += 56.0
+    monotonic.value += 0.5
+
+    assert clock.sample() == (1_056.0, 50.5)
+    assert clock.seconds_until_hard_stop() == pytest.approx(4_444.0)
 
 
 def test_reused_pid_is_rejected_before_any_signal() -> None:
@@ -876,6 +914,74 @@ def test_descendant_capture_stages_just_exited_leader_with_same_uid_members() ->
     assert candidates == {exited.pgid: PaidGroup("root", exited)}
 
 
+def test_descendant_capture_stages_transient_group_without_per_group_sleep() -> None:
+    uid = os.getuid()
+    root = ProcessIdentity(101, uid, 101, "root")
+    exited = ProcessIdentity(202, uid, 202, "short-lived-leader")
+
+    class TransientGroupInspector(FakeInspector):
+        group_reads = 0
+
+        def descendants(self, pid: int) -> tuple[ProcessIdentity, ...]:
+            assert pid == root.pid
+            return (exited,)
+
+        def group_members(self, pgid: int) -> tuple[ProcessIdentity, ...]:
+            if pgid == exited.pgid:
+                self.group_reads += 1
+                if self.group_reads == 1:
+                    raise IdentityViolation("transient Darwin group visibility")
+            return super().group_members(pgid)
+
+    inspector = TransientGroupInspector([root])
+    candidates: dict[int, PaidGroup] = {}
+    guardian_module.capture_descendant_process_groups(
+        (PaidGroup("root", root),),
+        registered_groups={root.pgid: PaidGroup("root", root)},
+        candidate_groups=candidates,
+        inspector=inspector,
+        owner_uid=uid,
+    )
+
+    assert inspector.group_reads == 1
+    assert candidates == {exited.pgid: PaidGroup("root", exited)}
+
+
+def test_descendant_capture_rechecks_deadline_across_many_groups() -> None:
+    uid = os.getuid()
+    root = ProcessIdentity(101, uid, 101, "root")
+    descendants = tuple(
+        ProcessIdentity(1_000 + index, uid, 1_000 + index, f"child-{index}")
+        for index in range(256)
+    )
+
+    class ManyGroupsInspector(FakeInspector):
+        def descendants(self, pid: int) -> tuple[ProcessIdentity, ...]:
+            return descendants if pid == root.pid else ()
+
+    monotonic = MutableClock(0.0)
+    checks = 0
+
+    def deadline_check() -> None:
+        nonlocal checks
+        checks += 1
+        monotonic.value += 1.0
+        if monotonic.value >= 5.0:
+            raise guardian_module._HardStopDue("test hard stop")  # noqa: SLF001
+
+    with pytest.raises(guardian_module._HardStopDue, match="test hard stop"):  # noqa: SLF001
+        guardian_module.capture_descendant_process_groups(
+            (PaidGroup("root", root),),
+            registered_groups={root.pgid: PaidGroup("root", root)},
+            candidate_groups={},
+            inspector=ManyGroupsInspector([root, *descendants]),
+            owner_uid=uid,
+            deadline_check=deadline_check,
+        )
+
+    assert checks == 5
+
+
 def test_descendant_capture_preserves_exact_subset_but_rejects_root_pid_swap() -> None:
     uid = os.getuid()
     root = ProcessIdentity(101, uid, 101, "root")
@@ -1301,7 +1407,11 @@ def test_hung_callback_is_preempted_by_authoritative_clock_change(
             if clock_event == "wall_crosses_t90":
                 wall.value = projected.hard_stop_wall_epoch
             else:
-                wall.value = projected.projected_wall_epoch - 1.0
+                wall.value = (
+                    projected.projected_wall_epoch
+                    - MAX_PROJECTION_SKEW_SECONDS
+                    - 0.01
+                )
             release_poll.wait(10)
             return super().poll(registration_id)
 
@@ -1818,6 +1928,114 @@ def test_worker_rc_terminal_cleanup_cannot_launder_unattested_candidate(
     assert inspector.identities == {}
 
 
+def test_durable_worker_return_waits_for_post_poll_candidate_attestation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    uid = os.getuid()
+    root = ProcessIdentity(101, uid, 101, "root-start")
+    candidate = ProcessIdentity(202, uid, 202, "teardown-helper-start")
+
+    class PostPollCandidateInspector(FakeInspector):
+        def __init__(self) -> None:
+            super().__init__([root, candidate])
+            self.root_descendant_scans = 0
+
+        def descendants(self, pid: int) -> tuple[ProcessIdentity, ...]:
+            if pid != root.pid:
+                return ()
+            self.root_descendant_scans += 1
+            if self.root_descendant_scans == 1:
+                return ()
+            return (candidate,) if candidate.pid in self.identities else ()
+
+    inspector = PostPollCandidateInspector()
+    now_wall = time.time()
+
+    class AttestingCallbacks(RecordingCallbacks):
+        def poll(
+            self,
+            registration_id: str,
+            discovered_groups: tuple[PaidGroup, ...] = (),
+        ) -> PollSnapshot:
+            assert self.request is not None
+            self.poll_count += 1
+            paid_groups = [self.request.root_group]
+            if discovered_groups:
+                assert self.poll_count >= 2
+                paid_groups.extend(discovered_groups)
+                for group in discovered_groups:
+                    inspector.identities.pop(group.identity.pid, None)
+            return PollSnapshot(
+                self.poll_count,
+                registration_id,
+                self.request.request_sha256,
+                self.request.boot_identity,
+                tuple(paid_groups),
+            )
+
+    callbacks = AttestingCallbacks(
+        projection(
+            start=now_wall,
+            projected_wall=now_wall,
+            projected_monotonic=time.monotonic(),
+            boot=inspector.boot_identity(),
+        )
+    )
+
+    class FakeBlockedChild:
+        leader_pid = root.pid
+        command_sha256 = "b" * 64
+
+        @classmethod
+        def spawn(cls, *_args, **_kwargs):  # noqa: ANN002, ANN003
+            return cls()
+
+        def release(self) -> None:
+            return None
+
+        @property
+        def worker_returncode(self) -> int:
+            return 0
+
+        def retire_after_empty(self, _inspector) -> int:  # noqa: ANN001
+            inspector.identities.pop(root.pid, None)
+            return 0
+
+        def reap(self, timeout: float = 2.0) -> int:  # noqa: ARG002
+            return 0
+
+        def leader_returncode(self) -> int | None:
+            return None
+
+        def close_without_release(self) -> None:
+            return None
+
+        def close(self) -> None:
+            return None
+
+    monkeypatch.setattr(guardian_module, "BlockedProcessGroup", FakeBlockedChild)
+    signaler = FakeSignaler()
+    read_fd, write_fd = os.pipe()
+    try:
+        report = Guardian(
+            callbacks,
+            inspector=inspector,
+            signaler=signaler,
+            poll_interval=0,
+            durably_attest_discovered_groups=True,
+        ).run([sys.executable, "-c", "pass"], **guardian_kwargs(read_fd))
+    finally:
+        os.close(read_fd)
+        os.close(write_fd)
+
+    assert callbacks.poll_count >= 2
+    assert report.state == "completed", report.reason
+    assert report.reason == "paid_group_empty"
+    assert report.already_empty_pgids == (root.pgid, candidate.pgid)
+    assert signaler.calls == []
+    assert callbacks.finalized == [report]
+
+
 def test_worker_rc_cleanup_crossing_t90_is_watchdog_and_not_resignalled(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2264,6 +2482,91 @@ def test_opaque_candidate_is_promoted_only_after_durable_snapshot_echo_and_exits
         assert escaped_pgid in report.already_empty_pgids
         assert inspector.identity(escaped_pgid) is None
         assert inspector.group_members(escaped_pgid) == ()
+    finally:
+        os.close(read_fd)
+        os.close(write_fd)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="requires POSIX process groups")
+def test_locally_expired_candidate_is_submitted_before_terminal_receipt() -> None:
+    delegate = SystemProcessInspector()
+    uid = os.getuid()
+    synthetic = ProcessIdentity(999_991, uid, 999_991, "unsubmitted-short-lived")
+
+    class OnePostPollCandidateInspector:
+        root_pid: int | None = None
+        root_descendant_calls = 0
+
+        def boot_identity(self) -> str:
+            return delegate.boot_identity()
+
+        def identity(self, pid: int) -> ProcessIdentity | None:
+            return delegate.identity(pid)
+
+        def group_members(self, pgid: int) -> tuple[ProcessIdentity, ...]:
+            return delegate.group_members(pgid)
+
+        def descendants(self, pid: int) -> tuple[ProcessIdentity, ...]:
+            if self.root_pid is None:
+                self.root_pid = pid
+            if pid == self.root_pid:
+                self.root_descendant_calls += 1
+                if self.root_descendant_calls in {2, 3}:
+                    return (synthetic,)
+            return delegate.descendants(pid)
+
+    inspector = OnePostPollCandidateInspector()
+    now_wall = time.time()
+
+    class RootOnlyCallbacks(RecordingCallbacks):
+        def __init__(self) -> None:
+            super().__init__(
+                projection(
+                    start=now_wall,
+                    projected_wall=now_wall,
+                    projected_monotonic=time.monotonic(),
+                    boot=inspector.boot_identity(),
+                )
+            )
+            self.discovered_submissions: list[tuple[PaidGroup, ...]] = []
+
+        def poll(
+            self,
+            registration_id: str,
+            discovered_groups: tuple[PaidGroup, ...] = (),
+        ) -> PollSnapshot:
+            assert self.request is not None
+            self.poll_count += 1
+            self.discovered_submissions.append(discovered_groups)
+            return PollSnapshot(
+                self.poll_count,
+                registration_id,
+                self.request.request_sha256,
+                self.request.boot_identity,
+                (self.request.root_group,),
+            )
+
+    callbacks = RootOnlyCallbacks()
+    read_fd, write_fd = os.pipe()
+    try:
+        report = Guardian(
+            callbacks,
+            inspector=inspector,
+            poll_interval=0.005,
+            durably_attest_discovered_groups=True,
+        ).run(
+            [sys.executable, "-c", "import time; time.sleep(0.08)"],
+            **guardian_kwargs(read_fd),
+        )
+
+        assert inspector.root_descendant_calls >= 3
+        assert any(
+            group.identity.pgid == synthetic.pgid
+            for groups in callbacks.discovered_submissions
+            for group in groups
+        )
+        assert report.state == "completed", report.reason
+        assert synthetic.pgid in report.already_empty_pgids
     finally:
         os.close(read_fd)
         os.close(write_fd)
