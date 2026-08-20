@@ -32617,6 +32617,7 @@ def _context_handoff_prepare_control(
             "new_record_ids",
             "obligations",
             "next_action",
+            "pending",
         }
         or not isinstance(assertions, dict)
         or set(assertions)
@@ -32723,6 +32724,7 @@ def _context_handoff_prepare_control(
         and _json_loads_strict(str(latest_review["decision_json"]))["route_frozen"]
     )
     active_route = proposal.get("active_route")
+    pending = proposal.get("pending")
     proposed_route_id = (
         active_route.get("route_id") if isinstance(active_route, dict) else None
     )
@@ -32743,6 +32745,8 @@ def _context_handoff_prepare_control(
         or assertions.get("route_frozen") is not route_frozen
         or not isinstance(active_route, dict)
         or set(active_route) != {"route_id", "core_bridge"}
+        or not isinstance(pending, dict)
+        or set(pending) != {"verification_ticket_id", "advisor_checkpoint_id"}
         or (
             proposed_route_id != cycle["active_route_id"]
             and not initial_handoff_route_binding
@@ -32778,10 +32782,7 @@ def _context_handoff_prepare_control(
         "new_record_ids": proposal["new_record_ids"],
         "yellow_streak": int(cycle["yellow_streak"]),
         "route_frozen": route_frozen,
-        "pending": {
-            "verification_ticket_id": None,
-            "advisor_checkpoint_id": None,
-        },
+        "pending": dict(pending),
         "obligations": proposal["obligations"],
         "next_action": proposal["next_action"],
     }

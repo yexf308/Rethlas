@@ -1821,7 +1821,13 @@ def _validate_handoff_response(
 def context_handoff_prepare(
     *, purpose: str, proposal: Mapping[str, Any], assertions: Mapping[str, Any]
 ) -> dict[str, Any]:
-    proposal_keys = {"active_route", "new_record_ids", "obligations", "next_action"}
+    proposal_keys = {
+        "active_route",
+        "new_record_ids",
+        "obligations",
+        "next_action",
+        "pending",
+    }
     assertion_keys = {
         "run_id",
         "problem_id",

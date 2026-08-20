@@ -4329,6 +4329,10 @@ def test_context_handoff_prepare_v2_is_host_derived_and_purpose_bound(
                 "description": "resume the quantitative bridge",
                 "test": "derive the committed estimate",
             },
+            "pending": {
+                "verification_ticket_id": None,
+                "advisor_checkpoint_id": "mem_" + "a" * 64,
+            },
         },
         "assertions": {
             "run_id": "run-1",
@@ -4366,6 +4370,7 @@ def test_context_handoff_prepare_v2_is_host_derived_and_purpose_bound(
     assert response["binding"] is None
     assert response["content"]["purpose"] == "owner_yield"
     assert response["content"]["blueprint_sha256"] is None
+    assert response["content"]["pending"] == payload["proposal"]["pending"]
     assert response["content"]["active_route"]["route_id"] == "route-a"
     assert response["content"]["from_thread_epoch"] == "1"
     assert response["content"]["cadence"]["cycle_started_at_utc"] == (
@@ -19439,7 +19444,7 @@ You may use local read-only shell/Python for the `q=7` arithmetic. Do not use th
     private_adapter.write_text(private_source, encoding="utf-8")
     private_adapter_sha256 = hashlib.sha256(private_adapter.read_bytes()).hexdigest()
     assert private_adapter_sha256 == (
-        "6ffcfcb8a78178d6c7cde80e257217ec8e28c003f878f949cc755a28bfec1900"
+        "1a5783b5fb874ec665daa9c04b0c5ecdefe4837c81da70e5cc260bda9d54d676"
     )
 
     monkeypatch.setattr(hotjoin, "__file__", str(private_adapter))

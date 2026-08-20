@@ -980,6 +980,7 @@ def test_handoff_prepare_and_get_are_content_addressed(
             }
             assert payload["payload"]["purpose"] == "context_guard"
             assert "pending" not in payload["payload"]["assertions"]
+            assert payload["payload"]["proposal"]["pending"] == content["pending"]
         return {
             "schema_version": review_client.ADAPTER_RESPONSE_SCHEMA,
             "operation": payload["command"],
@@ -1009,7 +1010,13 @@ def test_handoff_prepare_and_get_are_content_addressed(
         purpose="context_guard",
         proposal={
             key: deepcopy(content[key])
-            for key in ("active_route", "new_record_ids", "obligations", "next_action")
+            for key in (
+                "active_route",
+                "new_record_ids",
+                "obligations",
+                "next_action",
+                "pending",
+            )
         },
         assertions={
             key: deepcopy(content[key])

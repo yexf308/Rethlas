@@ -5779,6 +5779,7 @@ def context_handoff_prepare(
         and active_route.get("route_id") != expected_route
     ):
         raise ValueError("handoff active route disagrees with the official disposition")
+    pending = _authoritative_handoff_pending(problem_id)
     result = _adapter_context_handoff_prepare(
         purpose=purpose,
         proposal={
@@ -5786,6 +5787,7 @@ def context_handoff_prepare(
             "new_record_ids": record_ids,
             "obligations": deepcopy(obligations),
             "next_action": deepcopy(next_action),
+            "pending": deepcopy(pending),
         },
         assertions={
             "run_id": run_id,

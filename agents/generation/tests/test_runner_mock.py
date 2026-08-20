@@ -1931,7 +1931,7 @@ if command == "context-handoff-prepare":
     proposal = payload["proposal"]
     assertions = payload["assertions"]
     assert set(proposal) == {
-        "active_route", "new_record_ids", "obligations", "next_action"
+        "active_route", "new_record_ids", "obligations", "next_action", "pending"
     }
     assert set(assertions) == {
         "run_id", "problem_id", "statement_sha256", "blueprint_sha256",
@@ -1958,15 +1958,7 @@ if command == "context-handoff-prepare":
         "new_record_ids": proposal["new_record_ids"],
         "yellow_streak": assertions["yellow_streak"],
         "route_frozen": assertions["route_frozen"],
-        "pending": {
-            "verification_ticket_id": None,
-            "advisor_checkpoint_id": (
-                state.get("owner_yield_advisor_record_id")
-                if state.get("pending_yield_state")
-                == "waiting_owner_advisor_decision"
-                else None
-            ),
-        },
+        "pending": proposal["pending"],
         "obligations": proposal["obligations"],
         "next_action": proposal["next_action"],
     }
