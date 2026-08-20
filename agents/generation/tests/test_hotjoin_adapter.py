@@ -2202,6 +2202,19 @@ def test_policy_contract_and_initial_cadence_admission_are_exact(
     assert state["review_cadence"]["state"] == "not_started"
 
 
+@pytest.mark.skipif(sys.platform != "darwin", reason="Darwin uses boot session UUID")
+def test_current_boot_identity_matches_guardian_and_is_stable() -> None:
+    observed = {
+        hotjoin._current_boot_identity(),
+        hotjoin._current_boot_identity(),
+        hotjoin._system_guardian_process_inspector().boot_identity(),
+        hotjoin._system_guardian_process_inspector().boot_identity(),
+    }
+
+    assert len(observed) == 1
+    assert len(observed.pop()) == 64
+
+
 @pytest.mark.parametrize(
     ("review_policy", "context_policy"),
     [
@@ -13201,6 +13214,75 @@ def test_guardian_poll_commits_candidate_that_exits_before_host_attestation(
         )
 
 
+def test_guardian_poll_attests_discovered_leaderless_same_uid_group(
+    ledger: hotjoin.ConversationLedger,
+) -> None:
+    registered = _arm_initial_guardian(
+        ledger, wall_epoch=1_000.0, monotonic_epoch=2_000.0
+    )
+    ack = registered["registration_ack"]
+    root = _GuardianIdentity(
+        pid=10_101,
+        uid=os.getuid(),
+        pgid=10_101,
+        start_marker="root-birth-1",
+    )
+    vanished = _GuardianIdentity(
+        pid=30_303,
+        uid=os.getuid(),
+        pgid=30_303,
+        start_marker="vanished-leader",
+    )
+    residual = _GuardianIdentity(
+        pid=30_304,
+        uid=os.getuid(),
+        pgid=30_303,
+        start_marker="same-uid-residual",
+    )
+    inspector = _GuardianInspector(
+        boot_identity="boot-test-1",
+        identities=[root, residual],
+        descendants={10_101: []},
+    )
+
+    first = ledger.poll_guardian(
+        "run-1",
+        registration_id=ack["registration_id"],
+        request_sha256=ack["request_sha256"],
+        discovered_groups=[{"role": "root", "identity": vanished.as_dict()}],
+        expected_previous_snapshot_sha256=None,
+        guardian_token="4" * 64,
+        inspector=inspector,
+    )
+
+    assert [
+        group["identity"]["pgid"] for group in first["snapshot"]["paid_groups"]
+    ] == [10_101, 30_303]
+    with ledger._connect() as connection:
+        row = connection.execute(
+            "SELECT * FROM guardian_paid_groups "
+            "WHERE registration_id = ? AND pgid = 30303",
+            (ack["registration_id"],),
+        ).fetchone()
+        assert row is not None
+        assert row["state"] == "released"
+        assert row["source_kind"] == "guardian_discovered"
+
+    inspector.remove(30_304)
+    second = ledger.poll_guardian(
+        "run-1",
+        registration_id=ack["registration_id"],
+        request_sha256=ack["request_sha256"],
+        discovered_groups=[],
+        expected_previous_snapshot_sha256=first["snapshot_sha256"],
+        guardian_token="4" * 64,
+        inspector=inspector,
+    )
+    assert [
+        group["identity"]["pgid"] for group in second["snapshot"]["paid_groups"]
+    ] == [10_101]
+
+
 def test_guardian_poll_discovery_rejects_ancestry_toctou_atomically(
     ledger: hotjoin.ConversationLedger,
 ) -> None:
@@ -18052,6 +18134,222 @@ def test_default_release_policy_enables_the_documented_owner_cost_gate() -> None
     assert hotjoin.REVIEW_CADENCE_POLICY["owner_cost_gate_enabled"] is True
 
 
+def test_descendant_snapshot_normalizes_codex_per_thread_session_ids(
+    ledger: hotjoin.ConversationLedger,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rpc = _RpcStub()
+    rpc.add(
+        "thread/list",
+        {
+            "data": [
+                _listed_subagent(
+                    "thread-proof-a",
+                    "thread-1",
+                    status="active",
+                    session_id="thread-proof-a",
+                ),
+                _listed_subagent(
+                    "thread-proof-b",
+                    "thread-1",
+                    status="active",
+                    session_id="thread-proof-b",
+                ),
+            ],
+            "nextCursor": None,
+        },
+    )
+    rpc.add(
+        "thread/read",
+        _history(_turn("turn-proof-a", "inProgress"), thread_id="thread-proof-a"),
+    )
+    rpc.add(
+        "thread/read",
+        _history(_turn("turn-proof-b", "inProgress"), thread_id="thread-proof-b"),
+    )
+    adapter = _leased_adapter(ledger, rpc)
+    sleeps: list[float] = []
+    monkeypatch.setattr(hotjoin.time, "sleep", sleeps.append)
+
+    descendants = adapter._review_boundary_descendant_snapshot("thread-1")
+
+    assert [item["thread_id"] for item in descendants] == [
+        "thread-proof-a",
+        "thread-proof-b",
+    ]
+    assert {item["session_id"] for item in descendants} == {"thread-1"}
+    assert [item["active_turn_id"] for item in descendants] == [
+        "turn-proof-a",
+        "turn-proof-b",
+    ]
+    assert sleeps == []
+
+
+def test_released_tick_retries_transient_cross_session_descendant_snapshot(
+    ledger: hotjoin.ConversationLedger,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    lease, _cycle = _materialize_cadence_turn(
+        ledger, started_at=time.time() - 120.0
+    )
+    ledger.ensure_initial_thread_epoch(
+        "run-1", thread_id="thread-1", turn_id="turn-1", lease=lease
+    )
+    owner_token = _bind_continuation_capability(ledger)
+    ledger.activate_reasoning_epoch_capability("run-1", owner_token=owner_token)
+    child_a_mixed = _listed_subagent(
+        "thread-proof-a",
+        "thread-1",
+        status="active",
+        session_id="session-root",
+    )
+    child_b_mixed = _listed_subagent(
+        "thread-proof-b",
+        "thread-1",
+        status="active",
+        session_id="session-transient-child",
+    )
+    child_a_stable = _listed_subagent(
+        "thread-proof-a",
+        "thread-1",
+        status="active",
+        session_id="session-root",
+    )
+    child_b_stable = _listed_subagent(
+        "thread-proof-b",
+        "thread-1",
+        status="active",
+        session_id="session-root",
+    )
+    rpc = _RpcStub()
+    rpc.add(
+        "thread/list",
+        {"data": [child_a_mixed, child_b_mixed], "nextCursor": None},
+    )
+    rpc.add(
+        "thread/list",
+        {"data": [child_a_stable, child_b_stable], "nextCursor": None},
+    )
+    rpc.add(
+        "thread/read",
+        _history(_turn("turn-proof-a", "inProgress"), thread_id="thread-proof-a"),
+    )
+    rpc.add(
+        "thread/read",
+        _history(_turn("turn-proof-b", "inProgress"), thread_id="thread-proof-b"),
+    )
+    adapter = hotjoin.GeneratorHotJoin(
+        ledger,
+        "run-1",
+        rpc,  # type: ignore[arg-type]
+        review_cadence_policy=hotjoin.REVIEW_CADENCE_POLICY_ID,
+        context_guard_policy=hotjoin.CONTEXT_GUARD_POLICY_ID,
+    )
+    adapter.lease = lease
+    adapter.thread_id = "thread-1"
+    adapter.active_turn_id = "turn-1"
+    sleeps: list[float] = []
+    monkeypatch.setattr(hotjoin.time, "sleep", sleeps.append)
+    monkeypatch.setitem(
+        hotjoin.REVIEW_CADENCE_POLICY, "guardian_enforcement_ready", True
+    )
+
+    adapter._process_cadence_tick()
+
+    assert [method for method, _params in rpc.calls] == [
+        "thread/list",
+        "thread/list",
+        "thread/read",
+        "thread/read",
+    ]
+    assert sleeps == [hotjoin.DESCENDANT_SESSION_STABILIZATION_SECONDS]
+    with ledger._connect() as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM control_failures WHERE run_id = 'run-1'"
+        ).fetchone()[0] == 0
+    projection = ledger.cadence_control_state("run-1")
+    assert projection["paid_turn_allowed"] is False
+    assert projection["review_cadence"]["state"] == "active"
+
+
+def test_released_tick_blocks_persistent_cross_session_descendant_snapshot(
+    ledger: hotjoin.ConversationLedger,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    lease, _cycle = _materialize_cadence_turn(
+        ledger, started_at=time.time() - 120.0
+    )
+    ledger.ensure_initial_thread_epoch(
+        "run-1", thread_id="thread-1", turn_id="turn-1", lease=lease
+    )
+    owner_token = _bind_continuation_capability(ledger)
+    ledger.activate_reasoning_epoch_capability("run-1", owner_token=owner_token)
+    mixed_page = {
+        "data": [
+            _listed_subagent(
+                "thread-proof-a",
+                "thread-1",
+                status="active",
+                session_id="session-root",
+            ),
+            _listed_subagent(
+                "thread-proof-b",
+                "thread-1",
+                status="active",
+                session_id="session-other",
+            ),
+        ],
+        "nextCursor": None,
+    }
+    rpc = _RpcStub()
+    for _attempt in range(hotjoin.DESCENDANT_SESSION_STABILIZATION_ATTEMPTS):
+        rpc.add("thread/list", mixed_page)
+    adapter = hotjoin.GeneratorHotJoin(
+        ledger,
+        "run-1",
+        rpc,  # type: ignore[arg-type]
+        review_cadence_policy=hotjoin.REVIEW_CADENCE_POLICY_ID,
+        context_guard_policy=hotjoin.CONTEXT_GUARD_POLICY_ID,
+    )
+    adapter.lease = lease
+    adapter.thread_id = "thread-1"
+    adapter.active_turn_id = "turn-1"
+    sleeps: list[float] = []
+    monkeypatch.setattr(hotjoin.time, "sleep", sleeps.append)
+    monkeypatch.setitem(
+        hotjoin.REVIEW_CADENCE_POLICY, "guardian_enforcement_ready", True
+    )
+
+    with pytest.raises(
+        hotjoin.ProtocolError,
+        match="descendant closure crossed app-server sessions",
+    ):
+        adapter._process_cadence_tick()
+
+    assert [method for method, _params in rpc.calls] == [
+        "thread/list"
+    ] * hotjoin.DESCENDANT_SESSION_STABILIZATION_ATTEMPTS
+    assert sleeps == [hotjoin.DESCENDANT_SESSION_STABILIZATION_SECONDS] * (
+        hotjoin.DESCENDANT_SESSION_STABILIZATION_ATTEMPTS - 1
+    )
+    projection = ledger.cadence_control_state("run-1")
+    assert projection["disposition"] == "operational_blocked"
+    assert projection["review_cadence"]["state"] == "operational_blocked"
+    with ledger._connect() as connection:
+        failure = connection.execute(
+            "SELECT operation, reason, state FROM control_failures "
+            "WHERE run_id = 'run-1'"
+        ).fetchone()
+    assert failure is not None
+    assert failure["operation"] == "continuous_proof_lane_scan"
+    assert failure["reason"] == (
+        "descendant closure crossed app-server sessions after "
+        f"{hotjoin.DESCENDANT_SESSION_STABILIZATION_ATTEMPTS} "
+        "authoritative scans"
+    )
+    assert failure["state"] == "operational_blocked"
+
+
 def test_released_tick_allows_three_and_blocks_fourth_live_proof_lane(
     ledger: hotjoin.ConversationLedger,
     monkeypatch: pytest.MonkeyPatch,
@@ -18670,7 +18968,7 @@ You may use local read-only shell/Python for the `q=7` arithmetic. Do not use th
     private_adapter.write_text(private_source, encoding="utf-8")
     private_adapter_sha256 = hashlib.sha256(private_adapter.read_bytes()).hexdigest()
     assert private_adapter_sha256 == (
-        "d186cef8b01bdbda2403ad1ed2572f5c5f0a1c00e44a115834c02a40eeb0b082"
+        "3bdfb659759a97318ad332440f1b58c90646c771a5c7fdd1c6eb033805bbef5b"
     )
 
     monkeypatch.setattr(hotjoin, "__file__", str(private_adapter))

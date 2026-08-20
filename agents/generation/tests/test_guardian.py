@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ctypes
+import hashlib
 import os
 import json
 import signal
@@ -263,6 +264,36 @@ def test_system_start_marker_is_kernel_precision_not_coarse_ps_time() -> None:
         assert 0 <= int(microseconds) < 1_000_000
     elif sys.platform.startswith("linux"):
         assert identity.start_marker.startswith("proc-start-ticks:")
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="Darwin uses boot session UUID")
+def test_darwin_boot_identity_uses_stable_kernel_session_uuid() -> None:
+    inspector = object.__new__(SystemProcessInspector)
+    raw_uuid = b"5C199D58-9DD0-487A-BF17-4CFE684DF3FA\x00"
+    names: list[bytes] = []
+
+    def sysctlbyname(
+        name: bytes,
+        output: object,
+        size_pointer: object,
+        _new_value: object,
+        _new_size: int,
+    ) -> int:
+        names.append(name)
+        ctypes.memmove(output, raw_uuid, len(raw_uuid))
+        ctypes.cast(
+            size_pointer, ctypes.POINTER(ctypes.c_size_t)
+        ).contents.value = len(raw_uuid)
+        return 0
+
+    inspector._darwin_sysctlbyname = sysctlbyname  # type: ignore[attr-defined]
+    expected = hashlib.sha256(
+        b"darwin-bootsessionuuid:5c199d58-9dd0-487a-bf17-4cfe684df3fa"
+    ).hexdigest()
+
+    assert inspector.boot_identity() == expected
+    assert inspector.boot_identity() == expected
+    assert names == [b"kern.bootsessionuuid", b"kern.bootsessionuuid"]
 
 
 @pytest.mark.skipif(sys.platform != "darwin", reason="Darwin uses native libproc")
@@ -793,6 +824,56 @@ def test_capture_continues_after_ambiguous_descendant_and_keeps_later_exact_grou
         )
 
     assert candidates == {exact.pgid: PaidGroup("root", exact)}
+
+
+def test_descendant_capture_stages_just_exited_empty_group_leader() -> None:
+    uid = os.getuid()
+    root = ProcessIdentity(101, uid, 101, "root")
+    exited = ProcessIdentity(202, uid, 202, "short-lived-leader")
+
+    class JustExitedLeaderInspector(FakeInspector):
+        def descendants(self, pid: int) -> tuple[ProcessIdentity, ...]:
+            assert pid == root.pid
+            return (exited,)
+
+    candidates: dict[int, PaidGroup] = {}
+    guardian_module.capture_descendant_process_groups(
+        (PaidGroup("root", root),),
+        registered_groups={root.pgid: PaidGroup("root", root)},
+        candidate_groups=candidates,
+        inspector=JustExitedLeaderInspector([root]),
+        owner_uid=uid,
+    )
+
+    assert candidates == {exited.pgid: PaidGroup("root", exited)}
+
+
+def test_descendant_capture_stages_just_exited_leader_with_same_uid_members() -> (
+    None
+):
+    uid = os.getuid()
+    root = ProcessIdentity(101, uid, 101, "root")
+    exited = ProcessIdentity(202, uid, 202, "short-lived-leader")
+    residual = ProcessIdentity(203, uid, 202, "residual-member")
+
+    class LeaderlessGroupInspector(FakeInspector):
+        def descendants(self, pid: int) -> tuple[ProcessIdentity, ...]:
+            assert pid == root.pid
+            # The native descendant snapshot saw both processes before the
+            # leader exited.  Subsequent exact identity reads see only the
+            # same-UID residual member of that still-live process group.
+            return (exited, residual)
+
+    candidates: dict[int, PaidGroup] = {}
+    guardian_module.capture_descendant_process_groups(
+        (PaidGroup("root", root),),
+        registered_groups={root.pgid: PaidGroup("root", root)},
+        candidate_groups=candidates,
+        inspector=LeaderlessGroupInspector([root, residual]),
+        owner_uid=uid,
+    )
+
+    assert candidates == {exited.pgid: PaidGroup("root", exited)}
 
 
 def test_descendant_capture_preserves_exact_subset_but_rejects_root_pid_swap() -> None:

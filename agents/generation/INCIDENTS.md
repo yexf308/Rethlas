@@ -637,3 +637,86 @@ an incident.
   and hot-join-only yields. Host tests admit three live proof lanes and
   operationally block four. The final repository suite passed 1,121 tests and
   53 subtests, with one expected skip.
+
+## 2026-08-20: guardian rejected valid Codex descendants and short-lived groups
+
+- **Classification:** fail-closed guardian liveness incompatibility; fixed. No
+  mathematical result or untrusted descendant was accepted.
+- **Trigger:** a real protected run on `arxivmath/am-2606-047` used Codex CLI
+  0.148 and the required simultaneous three-route fanout.
+- **Observed effect:** the original run stopped at the review boundary with
+  `descendant closure crossed app-server sessions`. Later repair smokes exposed
+  `paid descendants escaped into ambiguous process groups`. No candidate,
+  verifier receipt, or verified blueprint was published by the failed runs, so
+  the safety boundary remained closed.
+- **Root causes:** Codex 0.148 reports each persisted child thread's own thread
+  id as its raw `sessionId`, although rollout metadata binds the descendants to
+  the root session. The guardian had treated the raw field as one shared durable
+  identity. Separately, millisecond-lived Codex helper processes could be exact
+  process-group leaders at the descendant snapshot and exit before the later
+  identity recheck, leaving a valid but already-empty group. Codex
+  0.148.0-alpha.15 also left short-lived same-UID members alive after their
+  exact process-group leader exited. Finally, Darwin's `kern.boottime.tv_usec`
+  changed repeatedly within the same boot, so hashing it caused a false reboot
+  classification.
+- **Remediation:** descendant review now validates the full parent chain,
+  collaboration source, declared depth, and absence of cycles. It accepts only
+  one shared raw session id or root-and-child-local raw ids, then normalizes the
+  durable projection to the root thread id. Only unexplained mixed ids receive
+  three bounded authoritative rescans before a fail-closed stop. Process-group
+  capture may stage a vanished exact leader only when its group is provably
+  empty or contains only same-UID leaderless members of the still-live original
+  POSIX group. The host independently rechecks that membership before durable
+  attestation. PID reuse, identity change, a vanished nonleader without an
+  already-bound leader, foreign members, or ambiguous inspection still fail
+  closed. Darwin boot identity now uses the stable native
+  `kern.bootsessionuuid` instead of the drifting boot-time microseconds, with
+  the guardian and adapter deriving the same content digest.
+- **Regression evidence:** three session-projection tests cover child-local ids,
+  transient convergence, and persistent unexplained mixing. The guardian TOCTOU
+  tests cover just-exited empty and same-UID leaderless groups. Darwin tests
+  bind the exact boot-session UUID format and guardian/adapter agreement. Final
+  suites passed 412 hot-join tests, 76 guardian tests with one expected skip,
+  and 137 launcher and runner tests.
+- **Real-run evidence:** run
+  `arxivhard-am2606047-guardian-sessionfix-e2e-20260820-04` admitted exactly
+  three live proof children whose raw `sessionId` values equalled their own
+  child ids. It recorded zero control failures, 23 paid-group discoveries, and
+  17 safely classified already-empty groups while the guardian remained active.
+  The smoke was then intentionally interrupted rather than allowed to solve the
+  full problem. Its terminal state was therefore `execution_unknown`; exact
+  process-group cleanup left no generation or guardian process behind.
+
+## 2026-08-20: production T+30 review lost the guardian terminal report
+
+- **Classification:** unresolved post-boundary lifecycle failure; fail-closed.
+  The review snapshot and interruption completed, but the independent critic
+  was not launched and no mathematical success was claimed.
+- **Trigger:** three fresh, retrieval-disabled same-statement runs under Codex
+  0.148.0-alpha.15 reached the first production review boundary after the
+  session, process-group, and Darwin boot fixes. The last run was
+  `arxivhard-am2606047-guardian-live-20260820-r9`.
+- **Observed effect:** the root and exactly three active proof children were
+  observed, all four interrupt requests were accepted, all turns became
+  terminal, and `review_boundary_no_live_descendants_confirmed` was committed.
+  About 2.5 seconds after the T+30 due instant, the guardian daemon disappeared
+  without a final or `daemon_error` frame. Owner offline cleanup proved the
+  complete topology empty and committed `watchdog_forced`; the wrapper exited
+  `70` before `review_drive` or a critic could start.
+- **Evidence:** the final run's 211-event ledger chain verifies successfully and
+  contains zero control failures, one accepted reasoning checkpoint, 34
+  paid-group discovery events, three descendant observations, three accepted
+  descendant interrupts, one accepted root interrupt, one root-terminal
+  confirmation, and one no-live-descendants receipt. Discovery dispositions
+  comprised 24 live registrations and 20 already-empty groups.
+- **Isolation attempts:** the same boundary outcome occurred under the ordinary
+  foreground launcher, a reparented independent process session, and detached
+  GNU Screen. A `launchd` job would have provided a separate process coalition,
+  but macOS TCC denied that service access to the Documents checkout before any
+  model call. Host process-lifetime interference is therefore plausible but is
+  not proven; the early offline-result branch also omits the daemon wait status,
+  preventing exact signal attribution.
+- **Next validation:** add a separate default-off accelerated guardian smoke
+  policy with its own policy id and digest, plus exact daemon wait-status
+  evidence. Compress only the test clock and label every receipt non-production;
+  never change or claim equivalence with the production 30/60/90-minute policy.

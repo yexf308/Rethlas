@@ -188,7 +188,7 @@ APPROVED_GUARDIAN_RUNNER_SHA256 = (
     "12a3f577fa5ff22c0f5efca94bdf5d84f280016246aa22bb8ed3a9aae5900485"
 )
 APPROVED_GUARDIAN_SHA256 = (
-    "475ccd703e6a3c601f3ee5000bdcc6f6fe5a2659e033b561ba31d09653334b9b"
+    "e2744d27efeda3c4bcaf2bb6b29c94672810eba8453644eefc8011bc5da36767"
 )
 GUARDIAN_CONTROL_SCHEMA_REGISTRY = {
     "schema_version": "rethlas_guardian_control_registry_v1",
@@ -606,6 +606,8 @@ REVIEW_BOUNDARY_SOURCE_KINDS = (
 REVIEW_BOUNDARY_THREAD_PAGE_LIMIT = 100
 MAX_REVIEW_BOUNDARY_DESCENDANTS = 64
 MAX_CONCURRENT_PROOF_LANES = 3
+DESCENDANT_SESSION_STABILIZATION_ATTEMPTS = 3
+DESCENDANT_SESSION_STABILIZATION_SECONDS = 0.05
 THREAD_START_RECOVERY_PAGE_LIMIT = 100
 MAX_THREAD_START_RECOVERY_THREADS = 512
 
@@ -743,6 +745,10 @@ class ProtocolError(HotJoinError):
     """The app-server violated its JSONL/RPC contract."""
 
 
+class _DescendantSessionTreeMismatch(ProtocolError):
+    """One authoritative descendant scan observed mixed session-tree ids."""
+
+
 class RpcError(HotJoinError):
     """One app-server RPC returned an error object."""
 
@@ -811,9 +817,6 @@ def _current_boot_identity() -> str:
     if sys.platform != "darwin":
         raise HotJoinError("cannot establish host boot identity")
 
-    class DarwinTimeval(ctypes.Structure):
-        _fields_ = [("tv_sec", ctypes.c_long), ("tv_usec", ctypes.c_int)]
-
     try:
         system = ctypes.CDLL("/usr/lib/libSystem.B.dylib", use_errno=True)
         sysctlbyname = system.sysctlbyname
@@ -825,25 +828,30 @@ def _current_boot_identity() -> str:
             ctypes.c_size_t,
         ]
         sysctlbyname.restype = ctypes.c_int
-        boot_time = DarwinTimeval()
-        size = ctypes.c_size_t(ctypes.sizeof(boot_time))
+        buffer = ctypes.create_string_buffer(128)
+        size = ctypes.c_size_t(ctypes.sizeof(buffer))
         result = sysctlbyname(
-            b"kern.boottime",
-            ctypes.byref(boot_time),
+            b"kern.bootsessionuuid",
+            ctypes.byref(buffer),
             ctypes.byref(size),
             None,
             0,
         )
     except (AttributeError, OSError) as exc:
         raise HotJoinError("cannot establish native Darwin boot identity") from exc
+    raw = bytes(buffer.raw[: size.value])
     if (
         result != 0
-        or size.value != ctypes.sizeof(boot_time)
-        or boot_time.tv_sec <= 0
-        or not 0 <= boot_time.tv_usec < 1_000_000
+        or size.value != 37
+        or not raw.endswith(b"\x00")
+        or re.fullmatch(
+            rb"[0-9A-Fa-f]{8}(?:-[0-9A-Fa-f]{4}){3}-[0-9A-Fa-f]{12}",
+            raw[:-1],
+        )
+        is None
     ):
         raise HotJoinError("cannot establish native Darwin boot identity")
-    marker = f"{boot_time.tv_sec}:{boot_time.tv_usec}".encode("ascii")
+    marker = b"darwin-bootsessionuuid:" + raw[:-1].lower()
     return hashlib.sha256(marker).hexdigest()
 
 
@@ -13543,7 +13551,26 @@ class ConversationLedger:
                 )
                 owner_uid = int(registration["owner_uid"])
                 live_discovered: list[tuple[dict[str, Any], str]] = []
+                ancestry_bound_discovered: list[
+                    tuple[dict[str, Any], str]
+                ] = []
+                leaderless_live_discovered: list[
+                    tuple[dict[str, Any], str]
+                ] = []
                 empty_discovered: list[tuple[dict[str, Any], str]] = []
+
+                def exact_leaderless_members(
+                    identity: Mapping[str, Any], members: Sequence[Any]
+                ) -> bool:
+                    pgid = int(identity["pgid"])
+                    uid = int(identity["uid"])
+                    return bool(members) and all(
+                        member.pgid == pgid
+                        and member.uid == uid
+                        and member.pid != pgid
+                        for member in members
+                    )
+
                 for group, source_id in new_discovered:
                     identity = group["identity"]
                     if (
@@ -13559,21 +13586,33 @@ class ConversationLedger:
                         )
                     observed = inspector.identity(int(identity["pid"]))
                     if observed is None:
-                        if inspector.group_members(int(identity["pgid"])):
+                        members = inspector.group_members(int(identity["pgid"]))
+                        if not members:
+                            empty_discovered.append((group, source_id))
+                        elif exact_leaderless_members(identity, members):
+                            # Guardian observed the exact leader while it was a
+                            # root descendant.  Its same-UID residual members
+                            # keep the original POSIX process group alive and
+                            # prevent numeric PGID reuse, so retain that bound
+                            # identity as live kill coverage.
+                            live_discovered.append((group, source_id))
+                            leaderless_live_discovered.append((group, source_id))
+                        else:
                             raise HotJoinError(
-                                "guardian discovered leader vanished with live members"
+                                "guardian discovered leader vanished with "
+                                "ambiguous members"
                             )
-                        empty_discovered.append((group, source_id))
                     elif observed.as_dict() != identity:
                         raise HotJoinError(
                             "guardian discovered group identity is not exact"
                         )
                     else:
                         live_discovered.append((group, source_id))
+                        ancestry_bound_discovered.append((group, source_id))
                 first_descendants = self._guardian_extend_descendant_topology_snapshot(
                     inspector=inspector,
                     initial_descendants=first_descendants,
-                    groups=live_discovered,
+                    groups=ancestry_bound_discovered,
                 )
                 if inspector.boot_identity() != registration["boot_identity"]:
                     raise HotJoinError("guardian discovery boot changed during validation")
@@ -13591,9 +13630,9 @@ class ConversationLedger:
                 second_descendants = self._guardian_extend_descendant_topology_snapshot(
                     inspector=inspector,
                     initial_descendants=second_descendants,
-                    groups=live_discovered,
+                    groups=ancestry_bound_discovered,
                 )
-                for group, _source_id in live_discovered:
+                for group, _source_id in ancestry_bound_discovered:
                     identity = group["identity"]
                     observed = inspector.identity(int(identity["pid"]))
                     if (
@@ -13603,6 +13642,18 @@ class ConversationLedger:
                     ):
                         raise HotJoinError(
                             "guardian discovered ancestry changed during validation"
+                        )
+                for group, _source_id in leaderless_live_discovered:
+                    identity = group["identity"]
+                    if inspector.identity(int(identity["pid"])) is not None:
+                        raise HotJoinError(
+                            "guardian discovered leaderless PID was reused"
+                        )
+                    members = inspector.group_members(int(identity["pgid"]))
+                    if members and not exact_leaderless_members(identity, members):
+                        raise HotJoinError(
+                            "guardian discovered leaderless membership changed "
+                            "during validation"
                         )
                 for group, _source_id in empty_discovered:
                     identity = group["identity"]
@@ -22804,6 +22855,36 @@ class GeneratorHotJoin:
     def _review_boundary_descendant_snapshot(
         self, root_thread_id: str
     ) -> list[dict[str, Any]]:
+        """Read a descendant closure after bounded session-tree stabilization.
+
+        Codex 0.148 may project each stored sub-agent's own thread id as its
+        ``sessionId`` even though its rollout metadata binds the complete tree
+        to the root session.  The one-shot reader validates and normalizes that
+        known projection.  Retry only an otherwise unexplained mixed-session,
+        side-effect-free inconsistency.  Every other protocol failure remains
+        immediately fatal, and an unexplained mismatch that survives the
+        bounded authoritative rescans still fails closed.
+        """
+
+        for attempt in range(DESCENDANT_SESSION_STABILIZATION_ATTEMPTS):
+            try:
+                return self._review_boundary_descendant_snapshot_once(
+                    root_thread_id
+                )
+            except _DescendantSessionTreeMismatch as exc:
+                if attempt + 1 >= DESCENDANT_SESSION_STABILIZATION_ATTEMPTS:
+                    raise ProtocolError(
+                        "descendant closure crossed app-server sessions after "
+                        f"{DESCENDANT_SESSION_STABILIZATION_ATTEMPTS} "
+                        "authoritative scans"
+                    ) from exc
+                self._renew_lease_if_due()
+                time.sleep(DESCENDANT_SESSION_STABILIZATION_SECONDS)
+        raise AssertionError("descendant session stabilization exhausted")
+
+    def _review_boundary_descendant_snapshot_once(
+        self, root_thread_id: str
+    ) -> list[dict[str, Any]]:
         """Read one bounded, fully paginated descendant closure from app-server."""
 
         cursor: str | None = None
@@ -22902,6 +22983,9 @@ class GeneratorHotJoin:
                         "thread_id": thread_id,
                         "parent_thread_id": parent_id,
                         "session_id": session_id,
+                        "declared_depth": (
+                            int(spawn["depth"]) if proof_lane else None
+                        ),
                         "proof_lane": proof_lane,
                         "observed_status": status["type"],
                     }
@@ -22926,13 +23010,42 @@ class GeneratorHotJoin:
         ids = {item["thread_id"] for item in raw_threads}
         if len(ids) != len(raw_threads):
             raise ProtocolError("thread/list repeated a descendant across pages")
-        if len({item["session_id"] for item in raw_threads}) > 1:
-            raise ProtocolError("descendant closure crossed app-server sessions")
+        raw_session_ids = {item["session_id"] for item in raw_threads}
+        structurally_local_session_ids = ids | {root_thread_id}
+        if len(raw_session_ids) > 1 and not raw_session_ids.issubset(
+            structurally_local_session_ids
+        ):
+            raise _DescendantSessionTreeMismatch(
+                "descendant closure crossed app-server sessions"
+            )
+        by_id = {item["thread_id"]: item for item in raw_threads}
         for item in raw_threads:
             parent = item["parent_thread_id"]
-            if parent != root_thread_id and parent not in ids:
+            chain = {item["thread_id"]}
+            depth = 1
+            while parent != root_thread_id:
+                if parent in chain:
+                    raise ProtocolError(
+                        "thread/list descendant closure contains a parent cycle"
+                    )
+                ancestor = by_id.get(parent)
+                if ancestor is None:
+                    raise ProtocolError(
+                        "thread/list descendant closure omitted an ancestor"
+                    )
+                chain.add(parent)
+                parent = ancestor["parent_thread_id"]
+                depth += 1
+                if depth > MAX_REVIEW_BOUNDARY_DESCENDANTS:
+                    raise ProtocolError(
+                        "thread/list descendant ancestry exceeded its bound"
+                    )
+            if (
+                item["declared_depth"] is not None
+                and item["declared_depth"] != depth
+            ):
                 raise ProtocolError(
-                    "thread/list descendant closure omitted an ancestor"
+                    "thread_spawn depth disagrees with the descendant closure"
                 )
         projected: list[dict[str, Any]] = []
         for item in sorted(raw_threads, key=lambda value: value["thread_id"]):
@@ -22965,7 +23078,12 @@ class GeneratorHotJoin:
                     status = "idle"
             projected.append(
                 {
-                    **item,
+                    "thread_id": item["thread_id"],
+                    "parent_thread_id": item["parent_thread_id"],
+                    # Normalize Codex's root-shared and per-thread projections
+                    # to one stable tree identity before durable comparison.
+                    "session_id": root_thread_id,
+                    "proof_lane": item["proof_lane"],
                     "observed_status": status,
                     "active_turn_id": active_turn_id,
                 }

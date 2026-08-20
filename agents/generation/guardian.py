@@ -21,6 +21,7 @@ import json
 import math
 import os
 import queue
+import re
 import select
 import signal
 import sys
@@ -457,12 +458,6 @@ class SystemProcessInspector:
             ("pbi_start_tvusec", ctypes.c_uint64),
         ]
 
-    class _DarwinTimeval(ctypes.Structure):
-        _fields_ = [
-            ("tv_sec", ctypes.c_long),
-            ("tv_usec", ctypes.c_int),
-        ]
-
     def __init__(self) -> None:
         self._darwin_proc_pidinfo = None
         self._darwin_proc_listallpids = None
@@ -517,23 +512,32 @@ class SystemProcessInspector:
                 return value
         if sys.platform != "darwin" or self._darwin_sysctlbyname is None:
             raise IdentityViolation("cannot establish host boot identity")
-        boot_time = self._DarwinTimeval()
-        size = ctypes.c_size_t(ctypes.sizeof(boot_time))
+        # ``kern.boottime.tv_usec`` is not a stable boot identifier on Darwin:
+        # it can change within one boot after host clock reconciliation.  The
+        # kernel's per-session UUID is the native identity intended for this
+        # purpose and remains distinct across actual boots.
+        buffer = ctypes.create_string_buffer(128)
+        size = ctypes.c_size_t(ctypes.sizeof(buffer))
         result = self._darwin_sysctlbyname(
-            b"kern.boottime",
-            ctypes.byref(boot_time),
+            b"kern.bootsessionuuid",
+            ctypes.byref(buffer),
             ctypes.byref(size),
             None,
             0,
         )
+        raw = bytes(buffer.raw[: size.value])
         if (
             result != 0
-            or size.value != ctypes.sizeof(boot_time)
-            or boot_time.tv_sec <= 0
-            or not 0 <= boot_time.tv_usec < 1_000_000
+            or size.value != 37
+            or not raw.endswith(b"\x00")
+            or re.fullmatch(
+                rb"[0-9A-Fa-f]{8}(?:-[0-9A-Fa-f]{4}){3}-[0-9A-Fa-f]{12}",
+                raw[:-1],
+            )
+            is None
         ):
             raise IdentityViolation("cannot establish native Darwin boot identity")
-        marker = f"{boot_time.tv_sec}:{boot_time.tv_usec}".encode("ascii")
+        marker = b"darwin-bootsessionuuid:" + raw[:-1].lower()
         return hashlib.sha256(marker).hexdigest()
 
     def _darwin_info(self, pid: int) -> _DarwinProcBSDInfo | None:
@@ -1798,24 +1802,62 @@ def capture_descendant_process_groups(
             for descendant in inspector.descendants(seed.pid):
                 if descendant.pgid in registered_groups:
                     continue
-                if inspector.identity(descendant.pid) != descendant:
+                existing_candidate = candidate_groups.get(descendant.pgid)
+                if existing_candidate is not None:
+                    # One process-group snapshot can contain both the leader
+                    # and its members.  Once the exact leader has been staged,
+                    # later members of that same group must not be asked to
+                    # reconstruct a leader which may already have exited.
+                    try:
+                        candidate_state = _registered_group_state(
+                            existing_candidate, inspector
+                        )
+                    except IdentityViolation:
+                        ambiguities.append(descendant.pgid)
+                        continue
+                    if candidate_state == "ambiguous":
+                        ambiguities.append(descendant.pgid)
+                    continue
+                if descendant.uid != owner_uid:
                     ambiguities.append(descendant.pgid)
                     continue
-                leader = (
-                    descendant
-                    if descendant.pid == descendant.pgid
-                    else inspector.identity(descendant.pgid)
-                )
+                observed_descendant = inspector.identity(descendant.pid)
+                if observed_descendant is None:
+                    # Codex creates short-lived helper process groups while a
+                    # sub-agent is materializing.  If the exact descendant
+                    # snapshot identified the group leader, retain that bound
+                    # identity while the group is empty or has only same-UID
+                    # leaderless members.  POSIX cannot reuse the numeric PGID
+                    # while those members keep the original group alive.  A
+                    # non-leader cannot reconstruct a vanished leader identity.
+                    if descendant.pid != descendant.pgid:
+                        ambiguities.append(descendant.pgid)
+                        continue
+                    leader = descendant
+                elif observed_descendant != descendant:
+                    ambiguities.append(descendant.pgid)
+                    continue
+                else:
+                    leader = (
+                        descendant
+                        if descendant.pid == descendant.pgid
+                        else inspector.identity(descendant.pgid)
+                    )
                 if (
-                    descendant.uid != owner_uid
-                    or leader is None
+                    leader is None
                     or leader.pid != leader.pgid
                     or leader.uid != owner_uid
                 ):
                     ambiguities.append(descendant.pgid)
                     continue
-                current = inspector.identity(leader.pid)
-                if current != leader:
+                try:
+                    leader_state = _registered_group_state(
+                        PaidGroup("root", leader), inspector
+                    )
+                except IdentityViolation:
+                    ambiguities.append(leader.pgid)
+                    continue
+                if leader_state == "ambiguous":
                     ambiguities.append(leader.pgid)
                     continue
                 existing = candidate_groups.get(leader.pgid)
