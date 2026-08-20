@@ -623,6 +623,19 @@ def _validate_context_envelope(
     if context.get("requested_item_id") != expected_item_id:
         raise ValueError("context requested_item_id does not match the proof item")
     if context.get("complete") is not True or context.get("truncated") is not False:
+        omitted = context.get("omitted")
+        if (
+            context.get("current_item") is None
+            and isinstance(omitted, list)
+            and omitted
+            and omitted[0] == expected_item_id
+        ):
+            raise ValueError(
+                "complete current proof-item record exceeds its per-item "
+                f"context budget ({context.get('max_chars')} characters); "
+                "VERIFY_MAX_PROOF_CHARS is the aggregate request cap, not a "
+                "guaranteed single-item model-context size"
+            )
         raise ValueError("proof context is incomplete or truncated")
     missing = context.get("missing")
     omitted = context.get("omitted")

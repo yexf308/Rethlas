@@ -57,10 +57,18 @@ the candidate directly.
   external receipt.
 - Owner-wait states and `generation_yield` are hot-join-only. Legacy runs persist
   truthful failures and return unverified without fabricating an owner gate.
+- `RETHLAS_COST_GATE_POLICY=owner_gated` is the default and is hash-bound into
+  the hot-join policy contract. `disabled_by_owner` retains telemetry but cannot
+  enter a cost-gate owner wait.
+- Review-driven hardening isolates every trusted runner Python invocation,
+  rebuilds publication attestations from the pinned `proof_context` snapshot,
+  binds one-click advisor state to its immutable event, makes terminal receipts
+  recoverable after SQL/filesystem crash cuts, and rejects noncanonical
+  checkpoint inputs before publication.
 
 The current release was validated with a real three-solver fanout, a complete
 generation-to-verification publication smoke, and the full repository suite:
-1,121 tests and 53 subtests passed, with one expected skip.
+1,135 tests and 56 subtests passed, with one expected skip.
 
 ## Repository Layout
 
@@ -144,9 +152,12 @@ usage (or `unavailable`), never proof/model stream content.
 
 The verifier is resource-bounded by default. The main controls are:
 
-- `VERIFY_CONTEXT_MAX_CHARS=200000` per proof item
+- `VERIFY_CONTEXT_MAX_CHARS=200000` per complete proof-item context; a single
+  current item whose canonical record exceeds this bound is rejected explicitly
 - `VERIFY_MAX_TOTAL_CONTEXT_CHARS=5000000` per blueprint
-- `VERIFY_MAX_PROOF_CHARS=2000000`
+- `VERIFY_MAX_PROOF_CHARS=2000000` for the complete blueprint request; this is
+  an aggregate transport bound, not a promise that one 2M-character item fits
+  the per-item verifier context
 - `VERIFY_MAX_REQUEST_BYTES=25265536` before JSON parsing (derived default)
 - `VERIFY_BODY_TIMEOUT_SECONDS=30` for the complete request upload
 - `VERIFY_MAX_ITEMS=128`
@@ -158,6 +169,7 @@ The verifier is resource-bounded by default. The main controls are:
 - `VERIFY_MAX_EXPANDED_PROOF_CHARS=200000` using complete canonical records
 - `VERIFY_MAX_CONCURRENT_REQUESTS=1`
 - `CODEX_TIMEOUT_SECONDS=3600` per item
+- `RETHLAS_PUBLICATION_LOCK_TIMEOUT_SECONDS=10` for the bounded final publish lock
 - `VERIFY_REQUEST_TIMEOUT_SECONDS=3500` for the complete HTTP request
 
 `VERIFY_REQUEST_TIMEOUT_SECONDS` should remain lower than the generation
@@ -224,7 +236,9 @@ retrieval path. For a named knowledge gap about a theorem, lemma, or definition
 from published journals or books, prefer the trusted
 `search_matlas_theorems` MCP tool. It calls the official Matlas search API at
 `https://matlas.ai/api/search` (OAS 0.1.0; no authentication; `query` plus
-`num_results`, whose minimum is 10). The distinct legacy
+`num_results`, whose minimum is 10). Override it only with the repo-specific
+`RETHLAS_MATLAS_URL`; the generic `MATLAS_URL` is intentionally ignored because
+Danus historically used that name for a different arXiv index. The distinct legacy
 `search_arxiv_theorems` tool queries the Danus/LeanSearch arXiv provider at
 `https://leansearch.net/thm/search`; it is neither an alias nor an implicit
 fallback for Matlas. Both surfaces return bounded external leads, not proof

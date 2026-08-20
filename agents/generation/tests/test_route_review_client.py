@@ -659,6 +659,25 @@ def test_review_drive_cli_loads_under_isolated_python_without_cwd_imports() -> N
     assert b"owner-host authority" in completed.stderr
 
 
+def test_review_drive_preloads_the_official_mcp_sdk_before_snapshot_paths() -> None:
+    driver_path = str(Path(server_driver.__file__).resolve())
+    code = (
+        "import runpy; "
+        f"ns=runpy.run_path({driver_path!r}, run_name='_rethlas_driver_probe'); "
+        "server=ns['server']; "
+        "assert server.FastMCP is not None; "
+        "print(server.FastMCP.__module__)"
+    )
+    completed = subprocess.run(
+        [sys.executable, "-I", "-B", "-c", code],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr.decode(errors="replace")
+    assert completed.stdout.decode().strip().startswith("mcp.server.")
+
+
 def test_review_memory_is_explicitly_control_only_not_mathematical_evidence() -> None:
     request = critic.build_review_request(
         review_id=REVIEW_ID,

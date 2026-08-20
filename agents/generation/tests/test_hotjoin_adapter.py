@@ -18005,9 +18005,11 @@ def test_quarantined_seed_cli_is_owner_only_replay_exact_and_data_only(
     assert ledger.verify_chain("paid-cycle-v2")["valid"] is True
 
 
-def test_release_policy_rejects_valid_owner_cost_gate_without_mutation(
+def test_disabled_release_policy_rejects_valid_owner_cost_gate_without_mutation(
     ledger: hotjoin.ConversationLedger,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setitem(hotjoin.REVIEW_CADENCE_POLICY, "owner_cost_gate_enabled", False)
     lease, _cycle = _materialize_cadence_turn(
         ledger, started_at=time.time() - 120.0
     )
@@ -18042,6 +18044,12 @@ def test_release_policy_rejects_valid_owner_cost_gate_without_mutation(
         assert connection.execute(
             "SELECT COUNT(*) FROM owner_yield_admissions WHERE run_id = 'run-1'"
         ).fetchone()[0] == 0
+
+
+def test_default_release_policy_enables_the_documented_owner_cost_gate() -> None:
+    assert hotjoin.OWNER_COST_GATE_POLICY == "owner_gated"
+    assert hotjoin.REVIEW_CADENCE_POLICY["owner_cost_gate_policy"] == "owner_gated"
+    assert hotjoin.REVIEW_CADENCE_POLICY["owner_cost_gate_enabled"] is True
 
 
 def test_released_tick_allows_three_and_blocks_fourth_live_proof_lane(
@@ -18514,14 +18522,14 @@ def test_private_opaque_real_codex_binary_stream_attestation_is_zero_model() -> 
     if not codex.is_file():
         pytest.skip("desktop Codex binary is not installed")
     expected_sha256 = (
-        "6170ff5578170ee9b74ad92bfcff96e6"
-        "186f41d02b60815a7c2b01ad424c754f"
+        "7645c3caf5607e4528eb3a15b12496c2"
+        "84c2a918939aed34e863c760c1b421e7"
     )
 
     attestation = hotjoin._attest_readonly_executable(codex, expected_sha256)
 
     assert attestation["sha256"] == expected_sha256
-    assert attestation["size"] == 219_666_000
+    assert attestation["size"] == 212_613_840
     assert attestation["path"] == str(codex)
 
 
@@ -18533,8 +18541,8 @@ def test_private_opaque_manifest_allows_only_frozen_paid_probe_command(
     if not codex.is_file():
         pytest.skip("desktop Codex binary is not installed")
     codex_sha256 = (
-        "6170ff5578170ee9b74ad92bfcff96e6"
-        "186f41d02b60815a7c2b01ad424c754f"
+        "7645c3caf5607e4528eb3a15b12496c2"
+        "84c2a918939aed34e863c760c1b421e7"
     )
     prompt = """This is a paid Guardian transport staging probe, not a request to solve or claim progress on the full open Chowla problem.
 
@@ -18662,7 +18670,7 @@ You may use local read-only shell/Python for the `q=7` arithmetic. Do not use th
     private_adapter.write_text(private_source, encoding="utf-8")
     private_adapter_sha256 = hashlib.sha256(private_adapter.read_bytes()).hexdigest()
     assert private_adapter_sha256 == (
-        "a84519e687e5a6e28b8d20ad06571051360b736cbc13197eacd7a73285f3952c"
+        "d186cef8b01bdbda2403ad1ed2572f5c5f0a1c00e44a115834c02a40eeb0b082"
     )
 
     monkeypatch.setattr(hotjoin, "__file__", str(private_adapter))

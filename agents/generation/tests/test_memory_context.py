@@ -1655,7 +1655,7 @@ class MemoryContextTests(unittest.TestCase):
                 "channel": "proof_steps",
                 "record": {"claim": "same checkpoint"},
                 "active": True,
-                "supersedes": ["mem_old", "mem_old"],
+                "supersedes": ["mem_old"],
             }
         ]
 
@@ -1677,6 +1677,81 @@ class MemoryContextTests(unittest.TestCase):
         logical = server._load_memory_entries("exact-retry")
         self.assertEqual(len(logical["proof_steps"]), 1)
         self.assertEqual(len(logical["events"]), 1)
+
+    def test_memory_append_batch_rejects_noncanonical_receipt_inputs(self) -> None:
+        with self.assertRaisesRegex(ValueError, "problem_id must already"):
+            server.memory_append_batch(
+                "category//problem/",
+                [{"channel": "events", "record": {"phase": "root"}}],
+            )
+        for supersedes in (["mem_old", "mem_old"], [" mem_old"], None):
+            with self.subTest(supersedes=supersedes):
+                with self.assertRaisesRegex(ValueError, "supersedes must already"):
+                    server.memory_append_batch(
+                        "canonical-problem",
+                        [
+                            {
+                                "channel": "proof_steps",
+                                "record": {"claim": "x"},
+                                "supersedes": supersedes,
+                            }
+                        ],
+                    )
+
+    def test_legacy_jsonl_corruption_fails_closed(self) -> None:
+        path = server._channel_path("corrupt-jsonl", "proof_steps")
+        server.memory_init("corrupt-jsonl")
+        path.write_text('{"record_id":"ok"}\n{"torn":\n', encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "invalid JSONL"):
+            list(server._iter_jsonl(path))
+
+    def test_memory_init_refreshes_updated_at_without_changing_created_at(self) -> None:
+        with mock.patch.object(
+            server,
+            "_utc_now",
+            side_effect=(
+                "2026-08-10T00:00:00+00:00",
+                "2026-08-10T01:00:00+00:00",
+            ),
+        ):
+            first = server.memory_init("meta-refresh")
+            second = server.memory_init("meta-refresh")
+        first_meta = json.loads(Path(first["meta_path"]).read_text(encoding="utf-8"))
+        second_meta = json.loads(Path(second["meta_path"]).read_text(encoding="utf-8"))
+        assert first_meta["created_at_utc"] == "2026-08-10T00:00:00+00:00"
+        assert second_meta["created_at_utc"] == first_meta["created_at_utc"]
+        assert second_meta["updated_at_utc"] == "2026-08-10T01:00:00+00:00"
+
+    def test_legacy_verify_helper_supplies_a_canonical_deadline(self) -> None:
+        with mock.patch.object(
+            server.requests,
+            "post",
+            side_effect=RuntimeError("stop after request capture"),
+        ) as post:
+            with self.assertRaisesRegex(RuntimeError, "request capture"):
+                server.verify_proof_service("S", "proof", timeout_seconds=17)
+        payload = post.call_args.kwargs["json"]
+        deadline = datetime.fromisoformat(payload["verification_deadline_utc"])
+        self.assertIsNotNone(deadline.tzinfo)
+        self.assertGreater(deadline.timestamp(), time.time())
+
+    def test_commit_wall_clock_rollback_is_clamped_to_checkpoint_time(self) -> None:
+        with (
+            mock.patch.object(
+                server, "_utc_now", return_value="2030-01-01T00:00:00+00:00"
+            ),
+            mock.patch.object(
+                server,
+                "_require_memory_batch_publication_open",
+                return_value=(1.0, 123.0),
+            ),
+        ):
+            receipt = server.memory_append_batch(
+                "clock-rollback",
+                [{"channel": "events", "record": {"phase": "root"}}],
+            )
+        self.assertEqual(receipt["timestamp_utc"], "2030-01-01T00:00:00+00:00")
+        self.assertEqual(receipt["committed_at_utc"], receipt["timestamp_utc"])
 
     def test_memory_append_batch_exact_retry_replays_winner_without_clock_sampling(
         self,

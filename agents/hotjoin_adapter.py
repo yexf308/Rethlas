@@ -185,7 +185,7 @@ APPROVED_GUARDIAN_LAUNCHER_SHA256 = (
     "abf7b49c8989d746fe796a59b516357224615d56e28bccb7026180be03883b1c"
 )
 APPROVED_GUARDIAN_RUNNER_SHA256 = (
-    "a8dfc8ba17a9ccd03c987595652d560df2d48bbc58f375d850dff037cd3e0255"
+    "12a3f577fa5ff22c0f5efca94bdf5d84f280016246aa22bb8ed3a9aae5900485"
 )
 APPROVED_GUARDIAN_SHA256 = (
     "475ccd703e6a3c601f3ee5000bdcc6f6fe5a2659e033b561ba31d09653334b9b"
@@ -357,6 +357,16 @@ GUARDIAN_CONTROL_SCHEMA_SHA256 = hashlib.sha256(
 REVIEW_CADENCE_POLICY_ID = "rethlas_route_review_90m_v1"
 CONTEXT_GUARD_POLICY_ID = "rethlas_context_guard_v1"
 DISABLED_POLICY_ID = "disabled"
+OWNER_COST_GATE_POLICY_ENV = "RETHLAS_COST_GATE_POLICY"
+OWNER_COST_GATE_POLICY_VALUES = frozenset({"owner_gated", "disabled_by_owner"})
+OWNER_COST_GATE_POLICY = os.getenv(
+    OWNER_COST_GATE_POLICY_ENV, "owner_gated"
+).strip()
+if OWNER_COST_GATE_POLICY not in OWNER_COST_GATE_POLICY_VALUES:
+    raise RuntimeError(
+        f"{OWNER_COST_GATE_POLICY_ENV} must be one of "
+        + ", ".join(sorted(OWNER_COST_GATE_POLICY_VALUES))
+    )
 REVIEW_CADENCE_POLICY = {
     "policy_id": REVIEW_CADENCE_POLICY_ID,
     "clock": "earliest_durable_wall_and_same_boot_monotonic",
@@ -385,7 +395,11 @@ REVIEW_CADENCE_POLICY = {
     "hard_stop_interrupt_is_expected": True,
     "max_concurrent_proof_lanes": 3,
     "proof_lane_enforcement": "continuous_owner_host_scan",
-    "owner_cost_gate_enabled": False,
+    # This resolved value is included in REVIEW_CADENCE_POLICY_SHA256 and the
+    # wrapper's policy contract.  A restart with a different owner policy
+    # therefore cannot silently resume an already-bound cadence cycle.
+    "owner_cost_gate_policy": OWNER_COST_GATE_POLICY,
+    "owner_cost_gate_enabled": OWNER_COST_GATE_POLICY == "owner_gated",
     "guardian_worker_modes": ["runner_control"],
     "private_opaque_worker_command_sha256": None,
     "private_opaque_worker_executable_sha256": None,

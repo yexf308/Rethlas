@@ -18,6 +18,15 @@ import sys
 from pathlib import Path
 from typing import Any, Mapping
 
+# Load the official MCP SDK before the pinned runtime parent is added to
+# ``sys.path``.  That parent also contains Rethlas's local ``mcp`` package; if it
+# wins package resolution, ``server.py`` silently loses FastMCP/MCPServer and the
+# owner review driver runs with a degraded module graph.
+try:  # MCP SDK 1.x
+    from mcp.server.fastmcp import FastMCP as _OfficialMCPServer  # noqa: F401
+except ImportError:  # MCP SDK 2.x
+    from mcp.server.mcpserver import MCPServer as _OfficialMCPServer  # noqa: F401
+
 
 INPUT_SCHEMA = "rethlas_review_drive_step_v1"
 OUTPUT_SCHEMA = "rethlas_review_drive_step_result_v1"

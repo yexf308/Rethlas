@@ -12,6 +12,7 @@ import pytest
 
 GENERATION_ROOT = Path(__file__).resolve().parents[1]
 AGENTS = GENERATION_ROOT / "AGENTS.md"
+RUNNER = GENERATION_ROOT / "tests" / "run_example.sh"
 POLICY_RE = re.compile(
     r"<!-- rethlas-safe-three-route-policy\s*(\{.*?\})\s*-->", re.DOTALL
 )
@@ -22,6 +23,17 @@ def _policy() -> tuple[dict[str, object], str]:
     match = POLICY_RE.search(text)
     assert match is not None
     return json.loads(match.group(1)), text
+
+
+def test_trusted_runner_python_is_isolated_and_receipt_uses_snapshot_context() -> None:
+    runner = RUNNER.read_text(encoding="utf-8")
+    assert re.search(r'"\$TRUSTED_PYTHON_BIN"\s+-B(?:\s|$)', runner) is None
+    receipt = runner.split("receipt_is_valid() {", 1)[1].split(
+        "\n}\n\nif [[ -e \"$verified_path\"", 1
+    )[0]
+    assert '"$MCP_PROOF_CONTEXT_PATH" "$MCP_PROOF_CONTEXT_SHA256"' in receipt
+    assert 'sys.path.insert(0, str(root / "mcp"))' not in receipt
+    assert "load_attested_proof_context()" in receipt
 
 
 def _node_binary() -> Path:

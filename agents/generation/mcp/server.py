@@ -167,7 +167,7 @@ GENERATION_CONTROL_ROOT = REPO_ROOT.parent / ".generation_control"
 RECEIPTS_ROOT = REPO_ROOT.parent / ".verification_receipts"
 
 MATLAS_SEARCH_URL = os.getenv(
-    "MATLAS_URL",
+    "RETHLAS_MATLAS_URL",
     "https://matlas.ai/api/search",
 )
 LEGACY_ARXIV_THEOREM_URL = os.getenv(
@@ -923,22 +923,30 @@ def _iter_jsonl(path: Path) -> Iterable[Dict[str, Any]]:
         except FileNotFoundError:
             return
         try:
+            fcntl.flock(descriptor, fcntl.LOCK_SH)
             with os.fdopen(
                 descriptor,
                 "r",
                 encoding="utf-8",
                 closefd=False,
             ) as handle:
-                for line in handle:
+                for line_number, line in enumerate(handle, start=1):
                     line = line.strip()
                     if not line:
                         continue
                     try:
                         payload = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
-                    if isinstance(payload, dict):
-                        yield payload
+                    except json.JSONDecodeError as exc:
+                        raise ValueError(
+                            f"memory channel {path} contains invalid JSONL at "
+                            f"line {line_number}"
+                        ) from exc
+                    if not isinstance(payload, dict):
+                        raise ValueError(
+                            f"memory channel {path} contains a non-object JSONL "
+                            f"record at line {line_number}"
+                        )
+                    yield payload
             _verify_open_regular_at(
                 parent,
                 name,
@@ -946,6 +954,10 @@ def _iter_jsonl(path: Path) -> Iterable[Dict[str, Any]]:
                 label=f"memory channel {path}",
             )
         finally:
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+            except OSError:
+                pass
             os.close(descriptor)
     finally:
         os.close(parent)
@@ -2049,13 +2061,18 @@ def _publish_memory_batch_commit_once(
     committed_at_wall, committed_at_monotonic = (
         _require_memory_batch_publication_open(initial_cutoffs)
     )
+    committed_datetime = datetime.fromtimestamp(committed_at_wall, timezone.utc)
+    checkpoint_datetime = datetime.fromisoformat(str(checkpoint["timestamp_utc"]))
+    if committed_datetime < checkpoint_datetime:
+        # Wall clocks can move backwards while the monotonic cutoff remains
+        # sound.  The receipt contract promises timestamp_utc <= committed_at_utc,
+        # so preserve that ordering instead of publishing an unreplayable commit.
+        committed_datetime = checkpoint_datetime
     payload: Dict[str, Any] = {
         "schema": MEMORY_BATCH_COMMIT_SCHEMA,
         "batch_id": checkpoint["batch_id"],
         "checkpoint_sha256": checkpoint["checkpoint_sha256"],
-        "committed_at_utc": datetime.fromtimestamp(
-            committed_at_wall, timezone.utc
-        ).isoformat(),
+        "committed_at_utc": committed_datetime.astimezone(timezone.utc).isoformat(),
         "committed_at_monotonic": committed_at_monotonic,
     }
     payload["commit_sha256"] = _memory_batch_commit_sha256(payload)
@@ -2886,6 +2903,9 @@ def verify_proof_service(
     payload = {
         "statement": statement,
         "proof": proof,
+        "verification_deadline_utc": (
+            datetime.now(timezone.utc) + timedelta(seconds=timeout_seconds)
+        ).isoformat(),
     }
 
     request_kwargs: Dict[str, Any] = {
@@ -3048,14 +3068,15 @@ def memory_init(
                 raise ValueError("memory metadata must be a JSON object")
             existing_meta = loaded
 
-        merged_meta: Dict[str, Any] = {
-            "problem_id": sanitized_problem_id,
-            "created_at_utc": existing_meta.get("created_at_utc", _utc_now()),
-            "updated_at_utc": _utc_now(),
-        }
-        merged_meta.update(existing_meta)
+        now_utc = _utc_now()
+        merged_meta: Dict[str, Any] = dict(existing_meta)
         if meta:
             merged_meta.update(meta)
+        merged_meta["problem_id"] = sanitized_problem_id
+        merged_meta["created_at_utc"] = existing_meta.get(
+            "created_at_utc", now_utc
+        )
+        merged_meta["updated_at_utc"] = now_utc
 
         _write_atomic_json_replace(meta_path, merged_meta)
     finally:
@@ -3174,6 +3195,10 @@ def memory_append_batch(
     back into the model context.
     """
 
+    if not isinstance(problem_id, str) or sanitize_problem_id(problem_id) != problem_id:
+        raise ValueError(
+            "problem_id must already be the canonical normalized identifier"
+        )
     if not isinstance(items, list) or not items:
         raise ValueError("items must be a non-empty JSON array")
     if len(items) > MAX_MEMORY_BATCH_RECORDS:
@@ -3205,7 +3230,13 @@ def memory_append_batch(
             raise ValueError(f"items[{index}].record must be a JSON object")
         if not isinstance(active, bool):
             raise ValueError(f"items[{index}].active must be a boolean")
-        supersedes = _validate_supersedes(item.get("supersedes"))
+        raw_supersedes = item.get("supersedes")
+        supersedes = _validate_supersedes(raw_supersedes)
+        if "supersedes" in item and raw_supersedes != supersedes:
+            raise ValueError(
+                f"items[{index}].supersedes must already be trimmed, "
+                "duplicate-free canonical record ids"
+            )
         normalized_items.append(
             {
                 "channel": channel,

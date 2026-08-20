@@ -905,6 +905,27 @@ def test_authorization_projection_tamper_never_reaches_click_boundary(
     assert ledger.events(request_id) == before
 
 
+def test_dispatch_projection_rearm_is_rejected_by_append_only_event(
+    tmp_path: Path,
+) -> None:
+    ledger = _ledger(tmp_path)
+    request_id = _prepare(ledger)
+    ledger.begin_dispatch(request_id)
+    before = ledger.events(request_id)
+    with sqlite3.connect(ledger.path) as connection:
+        connection.execute(
+            "UPDATE jobs SET state = 'authorized', dispatch_count = 0, "
+            "conversation_url_sha256 = NULL WHERE request_id = ?",
+            (request_id,),
+        )
+
+    with pytest.raises(advisor.AdvisorConflict, match="dispatch"):
+        ledger.begin_dispatch(request_id)
+    with pytest.raises(advisor.AdvisorConflict, match="dispatch"):
+        ledger.verify_chain()
+    assert ledger.events(request_id) == before
+
+
 @pytest.mark.parametrize(
     ("field", "value"),
     (
@@ -1804,6 +1825,110 @@ def test_receipt_write_before_sql_commit_is_idempotently_recoverable(
         )["state"]
         == "completed"
     )
+
+
+def test_committed_terminal_without_receipt_is_repaired_on_status(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ledger = _ledger(tmp_path)
+    request_id = _submitted(ledger)
+    answer_sha = hashlib.sha256(ANSWER.encode()).hexdigest()
+    original = ledger._atomic_write
+
+    def fail_publication(*_args: Any, **_kwargs: Any) -> None:
+        raise OSError("fault after terminal SQL commit")
+
+    monkeypatch.setattr(ledger, "_atomic_write", fail_publication)
+    with pytest.raises(OSError, match="after terminal SQL commit"):
+        ledger.complete(
+            request_id,
+            answer=ANSWER,
+            answer_snapshot_a_sha256=answer_sha,
+            answer_snapshot_b_sha256=answer_sha,
+            ui_mode="Pro",
+            response_actions_present=True,
+            composer_available=True,
+            working_indicators_absent=True,
+        )
+    with sqlite3.connect(ledger.path) as connection:
+        assert connection.execute(
+            "SELECT state, receipt_published FROM jobs WHERE request_id = ?",
+            (request_id,),
+        ).fetchone() == ("completed", 0)
+
+    monkeypatch.setattr(ledger, "_atomic_write", original)
+    status = ledger.status(request_id)
+    assert status["state"] == "completed"
+    with sqlite3.connect(ledger.path) as connection:
+        assert connection.execute(
+            "SELECT receipt_published FROM jobs WHERE request_id = ?",
+            (request_id,),
+        ).fetchone()[0] == 1
+
+
+def test_legacy_orphan_receipt_cannot_wedge_an_alternate_terminal(
+    tmp_path: Path,
+) -> None:
+    ledger = _ledger(tmp_path)
+    request_id = _submitted(ledger)
+    clarification = "Which normalization should be used?"
+    with ledger._connect() as connection:
+        row = ledger._job(connection, request_id)
+        orphan = advisor._needs_user_input_receipt_payload(
+            row,
+            clarification_bytes=len(clarification.encode()),
+            clarification_sha256=hashlib.sha256(clarification.encode()).hexdigest(),
+        )
+    orphan_raw = (advisor._canonical_json(orphan) + "\n").encode()
+    ledger._atomic_write(
+        ledger.receipts_root / f"{request_id}.json", orphan_raw
+    )
+
+    answer_sha = hashlib.sha256(ANSWER.encode()).hexdigest()
+    status = ledger.complete(
+        request_id,
+        answer=ANSWER,
+        answer_snapshot_a_sha256=answer_sha,
+        answer_snapshot_b_sha256=answer_sha,
+        ui_mode="Pro",
+        response_actions_present=True,
+        composer_available=True,
+        working_indicators_absent=True,
+    )
+    assert status["state"] == "completed"
+    assert (
+        ledger.receipts_root / f"{request_id}.json"
+    ).read_bytes() != orphan_raw
+
+
+def test_prepare_replay_survives_predecessor_completed_to_imported_transition(
+    tmp_path: Path,
+) -> None:
+    ledger = _ledger(tmp_path)
+    predecessor_id = _completed(ledger)
+    followup_id = "adv_" + "9" * 32
+    kwargs = {
+        "request_id": followup_id,
+        "run_id": "run-1",
+        "problem_id": "problem/example",
+        "question": FOLLOWUP_QUESTION,
+        "query_skill_sha256": SKILL_SHA,
+        "computer_use_skill_sha256": COMPUTER_SHA,
+        "predecessor_request_id": predecessor_id,
+    }
+    first = ledger.prepare(**kwargs)
+    assert first["lineage"]["predecessor_state_at_prepare"] == "completed"
+
+    join = _hotjoin(tmp_path)
+    ledger.import_report(
+        predecessor_id,
+        hotjoin_db=join.path,
+        mode="steer",
+        answer=ANSWER,
+    )
+    replay = ledger.prepare(**kwargs)
+    assert replay["request_id"] == followup_id
+    assert replay["lineage"]["predecessor_state_at_prepare"] == "completed"
 
 
 def test_advisor_report_reader_is_exact_digest_bound_and_untrusted(

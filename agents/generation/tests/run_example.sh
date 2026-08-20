@@ -2050,7 +2050,7 @@ mkdir -p "$trusted_receipts_root"
 export RETHLAS_RECEIPTS_ROOT="$trusted_receipts_root"
 export RETHLAS_EXPECTED_PROBLEM_ID="$problem_rel"
 export RETHLAS_EXPECTED_STATEMENT_SHA256="$(
-  "$TRUSTED_PYTHON_BIN" -B -c 'import hashlib, pathlib, sys; print(hashlib.sha256(pathlib.Path(sys.argv[1]).read_bytes()).hexdigest())' \
+  "$TRUSTED_PYTHON_BIN" -I -B -c 'import hashlib, pathlib, sys; print(hashlib.sha256(pathlib.Path(sys.argv[1]).read_bytes()).hexdigest())' \
     "$ROOT_DIR/$PROBLEM_FILE"
 )"
 receipt_path="$RETHLAS_RECEIPTS_ROOT/$problem_rel.json"
@@ -2108,12 +2108,15 @@ fi
 trusted_runtime_manifest() {
   local manifest_root="${1:-$ROOT_DIR}"
   local review_root="${2:-$ROOT_DIR/../review}"
-  "$TRUSTED_PYTHON_BIN" -B - "$manifest_root" "$review_root" <<'PY'
+  "$TRUSTED_PYTHON_BIN" -I -B - "$manifest_root" "$review_root" <<'PY'
 import hashlib
 import os
 import stat
 import sys
 from pathlib import Path
+
+if not sys.flags.isolated or not sys.dont_write_bytecode:
+    raise SystemExit("trusted runtime manifest requires Python -I -B")
 
 root = Path(sys.argv[1]).resolve(strict=True)
 review_input = Path(sys.argv[2]).absolute()
@@ -2658,15 +2661,15 @@ else
   unset RETHLAS_REVIEW_CONTRACT_CLI_SHA256
 fi
 TRUSTED_PYTHON_COMMAND_TOML="$(
-  "$TRUSTED_PYTHON_BIN" -B -c 'import json, sys; print(json.dumps(sys.argv[1]))' \
+  "$TRUSTED_PYTHON_BIN" -I -B -c 'import json, sys; print(json.dumps(sys.argv[1]))' \
     "$trusted_python_command"
 )"
 TRUSTED_MCP_ARGS_TOML="$(
-  "$TRUSTED_PYTHON_BIN" -B -c 'import json, sys; print(json.dumps(sys.argv[1:]))' \
+  "$TRUSTED_PYTHON_BIN" -I -B -c 'import json, sys; print(json.dumps(sys.argv[1:]))' \
     "${TRUSTED_MCP_LOADER_ARGS[@]}"
 )"
 TRUSTED_MCP_CWD_TOML="$(
-  "$TRUSTED_PYTHON_BIN" -B -c 'import json, sys; print(json.dumps(sys.argv[1]))' "$ROOT_DIR"
+  "$TRUSTED_PYTHON_BIN" -I -B -c 'import json, sys; print(json.dumps(sys.argv[1]))' "$ROOT_DIR"
 )"
 
 trusted_runtime_unchanged() {
@@ -2883,15 +2886,21 @@ generation_control_state_from_receipt() {
 }
 
 receipt_is_valid() {
-  "$TRUSTED_PYTHON_BIN" -B - "$ROOT_DIR" "$receipt_path" "$verified_path" "$problem_rel" \
-    "$RETHLAS_EXPECTED_STATEMENT_SHA256" "$ROOT_DIR/$PROBLEM_FILE" <<'PY'
+  "$TRUSTED_PYTHON_BIN" -I -B - "$ROOT_DIR" "$receipt_path" "$verified_path" "$problem_rel" \
+    "$RETHLAS_EXPECTED_STATEMENT_SHA256" "$ROOT_DIR/$PROBLEM_FILE" \
+    "$MCP_PROOF_CONTEXT_PATH" "$MCP_PROOF_CONTEXT_SHA256" <<'PY'
 import hashlib
+import hmac
 import json
 import os
 import re
 import stat
 import sys
+import types
 from pathlib import Path
+
+if not sys.flags.isolated or not sys.dont_write_bytecode:
+    raise SystemExit("publication receipt validation requires Python -I -B")
 
 root = Path(sys.argv[1]).absolute()
 receipt_path = Path(sys.argv[2]).absolute()
@@ -2899,10 +2908,13 @@ verified_path = Path(sys.argv[3]).absolute()
 problem_id = sys.argv[4]
 statement_digest = sys.argv[5]
 problem_path = Path(sys.argv[6]).absolute()
+proof_context_path = Path(sys.argv[7]).absolute()
+proof_context_sha256 = sys.argv[8]
 receipt_root = root.parent / ".verification_receipts"
 results_root = root / "results"
 max_receipt_bytes = 65536
 max_blueprint_bytes = 8_000_000
+max_module_bytes = 8_000_000
 
 def open_parent(root_path: Path, parts: list[str]) -> int:
     flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
@@ -2945,6 +2957,65 @@ def bounded_regular_bytes(parent: Path, relative_parent: list[str], name: str, l
         if descriptor >= 0:
             os.close(descriptor)
         os.close(parent_fd)
+
+def load_attested_proof_context():
+    snapshot_root = root.parent / ".trusted_generation_runtime"
+    try:
+        proof_context_path.resolve(strict=True).relative_to(snapshot_root.resolve(strict=True))
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise ValueError("proof_context is not inside the trusted runtime snapshot") from exc
+    before = proof_context_path.lstat()
+    if (
+        proof_context_path.is_symlink()
+        or not stat.S_ISREG(before.st_mode)
+        or before.st_nlink != 1
+        or before.st_size < 1
+        or before.st_size > max_module_bytes
+        or stat.S_IMODE(before.st_mode) & 0o222
+        or (hasattr(os, "getuid") and before.st_uid not in {0, os.getuid()})
+    ):
+        raise ValueError("proof_context snapshot is not a bounded read-only regular file")
+    descriptor = os.open(
+        proof_context_path,
+        os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
+    )
+    try:
+        opened = os.fstat(descriptor)
+        identity = (opened.st_dev, opened.st_ino, opened.st_size, opened.st_mtime_ns)
+        if identity != (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns):
+            raise ValueError("proof_context snapshot changed during secure open")
+        chunks = []
+        remaining = int(opened.st_size)
+        while remaining:
+            chunk = os.read(descriptor, min(65_536, remaining))
+            if not chunk:
+                raise ValueError("proof_context snapshot produced a short read")
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        if os.read(descriptor, 1):
+            raise ValueError("proof_context snapshot grew during secure read")
+        after = os.fstat(descriptor)
+        if identity != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns):
+            raise ValueError("proof_context snapshot changed during secure read")
+    finally:
+        os.close(descriptor)
+    raw = b"".join(chunks)
+    if not hmac.compare_digest(hashlib.sha256(raw).hexdigest(), proof_context_sha256):
+        raise ValueError("proof_context snapshot digest mismatch")
+    module_name = "_rethlas_receipt_proof_context"
+    module = types.ModuleType(module_name)
+    module.__file__ = str(proof_context_path)
+    module.__package__ = ""
+    sys.modules[module_name] = module
+    try:
+        exec(
+            compile(raw, str(proof_context_path), "exec", dont_inherit=True),
+            module.__dict__,
+        )
+    except BaseException:
+        sys.modules.pop(module_name, None)
+        raise
+    return module
 
 try:
     components = problem_id.split("/")
@@ -2995,13 +3066,11 @@ try:
         raise ValueError("invalid item coverage")
     if re.fullmatch(r"[0-9a-f]{64}", receipt["context_digest"]) is None:
         raise ValueError("invalid context digest")
-    sys.path.insert(0, str(root / "mcp"))
-    from proof_context import (
-        aggregate_adaptive_context_digest,
-        aggregate_context_digest,
-        build_item_context,
-        parse_blueprint,
-    )
+    proof_context = load_attested_proof_context()
+    aggregate_adaptive_context_digest = proof_context.aggregate_adaptive_context_digest
+    aggregate_context_digest = proof_context.aggregate_context_digest
+    build_item_context = proof_context.build_item_context
+    parse_blueprint = proof_context.parse_blueprint
     proof_text = verified_raw.decode("utf-8")
     statement_text = problem_raw.decode("utf-8")
     manifest = parse_blueprint(proof_text, target_statement=statement_text)
@@ -3034,7 +3103,7 @@ try:
         manifest, attestations
     ):
         raise ValueError("adaptive context digest mismatch")
-except (OSError, ValueError, TypeError, UnicodeError, json.JSONDecodeError, ImportError) as exc:
+except (OSError, RuntimeError, ValueError, TypeError, UnicodeError, json.JSONDecodeError, ImportError) as exc:
     if os.environ.get("RETHLAS_RECEIPT_DEBUG") == "1":
         print(f"invalid publication receipt: {exc}", file=sys.stderr)
     raise SystemExit(1)
@@ -3507,7 +3576,7 @@ echo ""
 VERIFY_HEALTH_URL="${VERIFY_HEALTH_URL:-${VERIFY_URL:-http://127.0.0.1:8091/health}}"
 verify_base_url="${VERIFY_HEALTH_URL%/health}"
 export VERIFY_PROOF_URL="${VERIFY_PROOF_URL:-${verify_base_url%/}/verify}"
-if ! "$TRUSTED_PYTHON_BIN" -B - "$VERIFY_PROOF_URL" <<'PY'
+if ! "$TRUSTED_PYTHON_BIN" -I -B - "$VERIFY_PROOF_URL" <<'PY'
 import sys
 from urllib.parse import urlsplit
 url = urlsplit(sys.argv[1])
@@ -3527,7 +3596,7 @@ if ! curl -sf "$VERIFY_HEALTH_URL" >/dev/null 2>&1; then
   echo "         Start it first if you need verified proofs."
   echo ""
 fi
-TRUSTED_MCP_ENV_TOML="$("$TRUSTED_PYTHON_BIN" -B - <<'PY'
+TRUSTED_MCP_ENV_TOML="$("$TRUSTED_PYTHON_BIN" -I -B - <<'PY'
 import json
 import os
 

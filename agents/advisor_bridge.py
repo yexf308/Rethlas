@@ -30,7 +30,7 @@ from urllib.parse import urlsplit
 import uuid
 
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 RECEIPT_SCHEMA_VERSION = "rethlas-advisor-v1"
 LINEAGE_RECEIPT_SCHEMA_VERSION = "rethlas-advisor-v2"
 COMPLETION_RECEIPT_SCHEMA_VERSION = "rethlas-advisor-completion-v1"
@@ -751,6 +751,168 @@ class AdvisorLedger:
         finally:
             os.close(directory_fd)
 
+    def _discard_uncommitted_terminal_receipt(self, request_id: str) -> None:
+        """Remove only an orphan that has no committed ledger digest.
+
+        Version-4 code could publish ``<request_id>.json`` and then roll back
+        SQLite.  The nonterminal row is authoritative evidence that such bytes
+        never became a terminal receipt.  Validate the inode before unlinking so
+        a symlink or special-file substitution still fails closed.
+        """
+
+        request_id = _validate_request_id(request_id)
+        path = self.receipts_root / f"{request_id}.json"
+        directory_fd, _ = _open_secure_directory(
+            path.parent, expected_identity=self._receipts_root_identity
+        )
+        descriptor = -1
+        try:
+            try:
+                descriptor = os.open(
+                    path.name,
+                    os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+                    dir_fd=directory_fd,
+                )
+            except FileNotFoundError:
+                return
+            metadata, identity = _validate_open_regular_file(
+                descriptor,
+                label="uncommitted advisor receipt",
+                require_owner_only=True,
+            )
+            visible = os.stat(path.name, dir_fd=directory_fd, follow_symlinks=False)
+            if (
+                metadata.st_nlink != 1
+                or identity != (int(visible.st_dev), int(visible.st_ino))
+            ):
+                raise AdvisorError("uncommitted advisor receipt changed before cleanup")
+            os.unlink(path.name, dir_fd=directory_fd)
+            os.fsync(directory_fd)
+        except OSError as exc:
+            raise AdvisorError(
+                "uncommitted advisor receipt must be an owner-only regular "
+                "non-symlink file"
+            ) from exc
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
+            os.close(directory_fd)
+
+    @staticmethod
+    def _terminal_receipt_raw(row: Mapping[str, Any]) -> bytes | None:
+        state = str(row["state"])
+        if state in {"completed", "delivery_unknown", "imported"}:
+            answer_bytes = row["answer_bytes"]
+            answer_sha256 = row["answer_sha256"]
+            if (
+                isinstance(answer_bytes, bool)
+                or not isinstance(answer_bytes, int)
+                or answer_bytes <= 0
+                or not isinstance(answer_sha256, str)
+                or SHA256_RE.fullmatch(answer_sha256) is None
+            ):
+                raise AdvisorError("completed advisor receipt fields are incomplete")
+            payload = _completion_receipt_payload(
+                row,
+                answer_bytes=answer_bytes,
+                answer_sha256=answer_sha256,
+            )
+        elif state == "failed_not_submitted":
+            dispatch_count = row["dispatch_count"]
+            reason = row["terminal_reason"]
+            if dispatch_count not in {0, 1} or not isinstance(reason, str):
+                raise AdvisorError(
+                    "failed_not_submitted terminal ledger fields are invalid"
+                )
+            payload = _failed_not_submitted_receipt_payload(
+                row,
+                reason=reason,
+                prior_state="dispatching" if dispatch_count == 1 else "authorized",
+            )
+        elif state == "needs_user_input":
+            clarification_bytes = row["clarification_bytes"]
+            clarification_sha256 = row["clarification_sha256"]
+            if (
+                isinstance(clarification_bytes, bool)
+                or not isinstance(clarification_bytes, int)
+                or clarification_bytes <= 0
+                or not isinstance(clarification_sha256, str)
+                or SHA256_RE.fullmatch(clarification_sha256) is None
+            ):
+                raise AdvisorError(
+                    "needs_user_input terminal ledger fields are invalid"
+                )
+            payload = _needs_user_input_receipt_payload(
+                row,
+                clarification_bytes=clarification_bytes,
+                clarification_sha256=clarification_sha256,
+            )
+        elif state == "owner_abandoned_outcome_unknown":
+            reason = row["terminal_reason"]
+            if row["outcome_unknown_abandoned"] != 1 or not isinstance(reason, str):
+                raise AdvisorError("unknown-abandon terminal ledger fields are invalid")
+            payload = _abandoned_unknown_receipt_payload(row, reason=reason)
+        else:
+            return None
+        raw = (_canonical_json(payload) + "\n").encode("utf-8")
+        if len(raw) > MAX_RECEIPT_BYTES:
+            raise AdvisorError("advisor receipt exceeds its durable size limit")
+        return raw
+
+    def _publish_pending_terminal_receipt(self, request_id: str) -> None:
+        """Finish the recoverable filesystem half of a committed terminal."""
+
+        request_id = _validate_request_id(request_id)
+        with self._connect() as connection:
+            row = self._job(connection, request_id)
+            self._attest_lineage(connection, row)
+            raw = self._terminal_receipt_raw(row)
+            if raw is None or int(row["receipt_published"]) == 1:
+                return
+            expected_sha256 = _sha256_bytes(raw)
+            if row["receipt_sha256"] != expected_sha256:
+                raise AdvisorConflict(
+                    "pending terminal receipt differs from its committed digest"
+                )
+
+        receipt_path = self.receipts_root / f"{request_id}.json"
+        if self._receipt_exists(receipt_path):
+            if self._existing_receipt_bytes(receipt_path) != raw:
+                raise AdvisorConflict(
+                    "pending terminal receipt path contains different bytes"
+                )
+        else:
+            try:
+                self._atomic_write(receipt_path, raw)
+            except FileExistsError:
+                if self._existing_receipt_bytes(receipt_path) != raw:
+                    raise AdvisorConflict(
+                        "concurrent terminal receipt publication used other bytes"
+                    )
+
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            current = self._job(connection, request_id)
+            self._attest_lineage(connection, current)
+            current_raw = self._terminal_receipt_raw(current)
+            if (
+                current_raw != raw
+                or current["receipt_sha256"] != expected_sha256
+                or int(current["receipt_published"]) not in {0, 1}
+            ):
+                raise AdvisorConflict(
+                    "terminal receipt commitment changed during publication"
+                )
+            if int(current["receipt_published"]) == 0:
+                changed = connection.execute(
+                    "UPDATE jobs SET receipt_published = 1, updated_at_utc = ? "
+                    "WHERE request_id = ? AND receipt_published = 0",
+                    (_utc_now(), request_id),
+                ).rowcount
+                if changed != 1:
+                    raise AdvisorConflict("terminal receipt publication lost its CAS")
+            connection.commit()
+
     def _initialize(self) -> None:
         states = ",".join(f"'{state}'" for state in sorted(STATES))
         with self._connect() as connection:
@@ -804,6 +966,8 @@ class AdvisorLedger:
                     stable_answer_sha256 TEXT,
                     completed_at_utc TEXT,
                     receipt_sha256 TEXT,
+                    receipt_published INTEGER NOT NULL DEFAULT 0
+                        CHECK(receipt_published IN (0, 1)),
                     report_receipt_sha256 TEXT,
                     clarification TEXT,
                     clarification_bytes INTEGER,
@@ -876,6 +1040,38 @@ class AdvisorLedger:
                     )
                     connection.execute(
                         "UPDATE metadata SET value = ? WHERE key = 'schema_version'",
+                        ("4",),
+                    )
+                    connection.commit()
+                except Exception:
+                    connection.rollback()
+                    raise
+                version = connection.execute(
+                    "SELECT value FROM metadata WHERE key = 'schema_version'"
+                ).fetchone()
+            if version is not None and str(version["value"]) == "4":
+                columns = {
+                    str(row["name"])
+                    for row in connection.execute("PRAGMA table_info(jobs)").fetchall()
+                }
+                connection.execute("BEGIN IMMEDIATE")
+                try:
+                    if "receipt_published" not in columns:
+                        connection.execute(
+                            "ALTER TABLE jobs ADD COLUMN receipt_published "
+                            "INTEGER NOT NULL DEFAULT 0 "
+                            "CHECK(receipt_published IN (0, 1))"
+                        )
+                    # Version-4 terminal rows wrote their receipt before the SQL
+                    # commit.  A committed digest therefore denotes an already
+                    # published legacy receipt; missing/damaged files still fail
+                    # closed in the ordinary verifier.
+                    connection.execute(
+                        "UPDATE jobs SET receipt_published = 1 "
+                        "WHERE receipt_sha256 IS NOT NULL"
+                    )
+                    connection.execute(
+                        "UPDATE metadata SET value = ? WHERE key = 'schema_version'",
                         (str(SCHEMA_VERSION),),
                     )
                     connection.commit()
@@ -906,6 +1102,7 @@ class AdvisorLedger:
                 "predecessor_request_id",
                 "predecessor_state_at_prepare",
                 "report_receipt_sha256",
+                "receipt_published",
                 "terminal_reason",
             }
             missing_columns = sorted(required_columns - columns)
@@ -996,6 +1193,7 @@ class AdvisorLedger:
                 )
             self._attest_prepared_lineage_event(connection, row)
             self._attest_authorization_event(connection, row)
+            self._attest_dispatch_event(connection, row)
             return
 
         if (
@@ -1033,6 +1231,7 @@ class AdvisorLedger:
                 raise AdvisorConflict("local predecessor lineage binding changed")
             self._attest_prepared_lineage_event(connection, row)
             self._attest_authorization_event(connection, row)
+            self._attest_dispatch_event(connection, row)
             return
 
         if any(value is not None for value in predecessor_fields):
@@ -1052,6 +1251,7 @@ class AdvisorLedger:
             raise AdvisorConflict("owner-asserted external lineage is inconsistent")
         self._attest_prepared_lineage_event(connection, row)
         self._attest_authorization_event(connection, row)
+        self._attest_dispatch_event(connection, row)
 
     @staticmethod
     def _attest_exact_event(
@@ -1168,6 +1368,62 @@ class AdvisorLedger:
             connection,
             row,
             kind="advisor_question_authorized",
+            actor="owner",
+            expected_payload=expected,
+        )
+
+    def _attest_dispatch_event(
+        self,
+        connection: sqlite3.Connection,
+        row: Mapping[str, Any],
+    ) -> None:
+        """Bind the one-click projection to its append-only dispatch event."""
+
+        dispatch_count = row["dispatch_count"]
+        if (
+            isinstance(dispatch_count, bool)
+            or not isinstance(dispatch_count, int)
+            or dispatch_count not in {0, 1}
+        ):
+            raise AdvisorConflict("advisor dispatch_count projection is invalid")
+        state = str(row["state"])
+        post_dispatch_states = {
+            "dispatching",
+            "submitted",
+            "submission_unknown",
+            "completed",
+            "needs_user_input",
+            "owner_abandoned_outcome_unknown",
+            "imported",
+            "delivery_unknown",
+        }
+        if state == "failed_not_submitted":
+            expected_dispatch = dispatch_count == 1
+        else:
+            expected_dispatch = state in post_dispatch_states
+        if expected_dispatch != (dispatch_count == 1):
+            raise AdvisorConflict(
+                "advisor state and dispatch_count have no coherent click boundary"
+            )
+        expected = None
+        if dispatch_count == 1:
+            conversation_digest = (
+                None
+                if row["lineage_kind"] == "none"
+                else row["lineage_conversation_url_sha256"]
+            )
+            expected = {
+                "dispatch_count": 1,
+                "question_sha256": row["question_sha256"],
+                "lineage_kind": row["lineage_kind"],
+                "lineage_conversation_url_sha256": conversation_digest,
+                "transport": TRANSPORT,
+                "ui_mode": UI_MODE,
+            }
+        self._attest_exact_event(
+            connection,
+            row,
+            kind="advisor_browser_dispatch_started",
             actor="owner",
             expected_payload=expected,
         )
@@ -1301,6 +1557,42 @@ class AdvisorLedger:
             lineage_kind = "none"
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
+            existing = connection.execute(
+                "SELECT * FROM jobs WHERE request_id = ?", (request_id,)
+            ).fetchone()
+            if existing is not None:
+                self._attest_lineage(connection, existing)
+                replay_fields = {
+                    "computer_use_skill_sha256": computer_use_skill_sha256,
+                    "external_owner_ack": external_owner_ack,
+                    "external_receipt_sha256": external_receipt_sha256,
+                    "external_request_id": external_request_id,
+                    "external_source_context_sha256": external_source_context_sha256,
+                    "external_source_repo": external_source_repo,
+                    "lineage_kind": lineage_kind,
+                    "predecessor_request_id": predecessor_request_id,
+                    "problem_id": problem_id,
+                    "query_skill_sha256": query_skill_sha256,
+                    "question": question,
+                    "run_id": run_id,
+                }
+                if any(existing[key] != value for key, value in replay_fields.items()):
+                    raise AdvisorConflict(
+                        "request_id is already bound to different immutable input"
+                    )
+                if lineage_kind == "owner_asserted_external":
+                    supplied_url_digest = _conversation_url_digest(
+                        str(external_conversation_url)
+                    )
+                    if (
+                        supplied_url_digest
+                        != existing["lineage_conversation_url_sha256"]
+                    ):
+                        raise AdvisorConflict(
+                            "external conversation URL changed on prepare replay"
+                        )
+                connection.commit()
+                return self.status(request_id)
             predecessor_receipt_sha256: str | None = None
             predecessor_state_at_prepare: str | None = None
             if lineage_kind == "rethlas_predecessor":
@@ -1344,9 +1636,6 @@ class AdvisorLedger:
                 lineage_root_request_id = request_id
                 lineage_depth = 0
                 lineage_conversation_url_sha256 = None
-            existing = connection.execute(
-                "SELECT * FROM jobs WHERE request_id = ?", (request_id,)
-            ).fetchone()
             immutable = {
                 "computer_use_skill_sha256": computer_use_skill_sha256,
                 "external_owner_ack": external_owner_ack,
@@ -1366,13 +1655,6 @@ class AdvisorLedger:
                 "question": question,
                 "run_id": run_id,
             }
-            if existing is not None:
-                if any(existing[key] != value for key, value in immutable.items()):
-                    raise AdvisorConflict(
-                        "request_id is already bound to different immutable input"
-                    )
-                connection.commit()
-                return self.status(request_id)
             blocked = connection.execute(
                 """
                 SELECT request_id FROM jobs
@@ -1780,15 +2062,7 @@ class AdvisorLedger:
             )
             raw = (_canonical_json(receipt) + "\n").encode("utf-8")
             receipt_sha = _sha256_bytes(raw)
-            receipt_path = self.receipts_root / f"{request_id}.json"
-            if self._receipt_exists(receipt_path):
-                existing = self._existing_receipt_bytes(receipt_path)
-                if existing != raw:
-                    raise AdvisorConflict(
-                        "failed_not_submitted receipt already exists with other bytes"
-                    )
-            else:
-                self._atomic_write(receipt_path, raw)
+            self._discard_uncommitted_terminal_receipt(request_id)
             self._append_event(
                 connection,
                 request_id=request_id,
@@ -1804,7 +2078,8 @@ class AdvisorLedger:
             )
             connection.execute(
                 "UPDATE jobs SET state = 'failed_not_submitted', "
-                "receipt_sha256 = ?, terminal_reason = ?, updated_at_utc = ? "
+                "receipt_sha256 = ?, receipt_published = 0, "
+                "terminal_reason = ?, updated_at_utc = ? "
                 "WHERE request_id = ?",
                 (receipt_sha, reason, _utc_now(), request_id),
             )
@@ -1865,15 +2140,7 @@ class AdvisorLedger:
             if len(raw) > MAX_RECEIPT_BYTES:
                 raise AdvisorError("advisor receipt exceeds its durable size limit")
             receipt_sha = _sha256_bytes(raw)
-            receipt_path = self.receipts_root / f"{request_id}.json"
-            if self._receipt_exists(receipt_path):
-                existing = self._existing_receipt_bytes(receipt_path)
-                if existing != raw:
-                    raise AdvisorConflict(
-                        "advisor receipt already exists with other bytes"
-                    )
-            else:
-                self._atomic_write(receipt_path, raw)
+            self._discard_uncommitted_terminal_receipt(request_id)
             self._append_event(
                 connection,
                 request_id=request_id,
@@ -1891,7 +2158,8 @@ class AdvisorLedger:
                 """
                 UPDATE jobs SET state = 'completed', answer = NULL, answer_sha256 = ?,
                     answer_bytes = ?, stable_answer_sha256 = ?, completed_at_utc = ?,
-                    receipt_sha256 = ?, updated_at_utc = ? WHERE request_id = ?
+                    receipt_sha256 = ?, receipt_published = 0,
+                    updated_at_utc = ? WHERE request_id = ?
                 """,
                 (
                     answer_sha,
@@ -1938,14 +2206,7 @@ class AdvisorLedger:
             )
             raw = (_canonical_json(receipt) + "\n").encode("utf-8")
             receipt_sha = _sha256_bytes(raw)
-            receipt_path = self.receipts_root / f"{request_id}.json"
-            if self._receipt_exists(receipt_path):
-                if self._existing_receipt_bytes(receipt_path) != raw:
-                    raise AdvisorConflict(
-                        "needs_user_input receipt already exists with other bytes"
-                    )
-            else:
-                self._atomic_write(receipt_path, raw)
+            self._discard_uncommitted_terminal_receipt(request_id)
             self._append_event(
                 connection,
                 request_id=request_id,
@@ -1963,7 +2224,7 @@ class AdvisorLedger:
                 UPDATE jobs SET state = 'needs_user_input',
                     clarification = NULL, clarification_bytes = ?,
                     clarification_sha256 = ?,
-                    receipt_sha256 = ?, updated_at_utc = ?
+                    receipt_sha256 = ?, receipt_published = 0, updated_at_utc = ?
                 WHERE request_id = ?
                 """,
                 (
@@ -2128,6 +2389,27 @@ class AdvisorLedger:
         """Fail closed unless every durable terminal receipt matches its job."""
 
         state = str(row["state"])
+        receipt_states = {
+            "completed",
+            "delivery_unknown",
+            "imported",
+            "failed_not_submitted",
+            "needs_user_input",
+            "owner_abandoned_outcome_unknown",
+        }
+        published = row["receipt_published"]
+        if (
+            isinstance(published, bool)
+            or not isinstance(published, int)
+            or published not in {0, 1}
+        ):
+            raise AdvisorError("advisor receipt publication projection is invalid")
+        if state in receipt_states and published != 1:
+            raise AdvisorError(f"{state} terminal receipt publication is incomplete")
+        if state not in receipt_states and published != 0:
+            raise AdvisorConflict(
+                "non-receipt advisor state unexpectedly claims publication"
+            )
         if state in {"completed", "delivery_unknown", "imported"}:
             self._verify_completion_receipt(row)
             if state in {"delivery_unknown", "imported"}:
@@ -2230,6 +2512,7 @@ class AdvisorLedger:
             answer, label="answer", maximum=MAX_ANSWER_BYTES
         )
         answer_sha = _sha256_text(answer)
+        self._publish_pending_terminal_receipt(request_id)
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             row = self._job(connection, request_id)
@@ -2570,6 +2853,7 @@ class AdvisorLedger:
                 )
             receipt_sha: str | None = None
             unknown_outcome = row["state"] == "submission_unknown"
+            self._discard_uncommitted_terminal_receipt(request_id)
             if unknown_outcome:
                 if outcome_unknown_ack != OUTCOME_UNKNOWN_ACK:
                     raise AdvisorError(
@@ -2583,14 +2867,6 @@ class AdvisorLedger:
                 receipt = _abandoned_unknown_receipt_payload(row, reason=reason)
                 raw = (_canonical_json(receipt) + "\n").encode("utf-8")
                 receipt_sha = _sha256_bytes(raw)
-                receipt_path = self.receipts_root / f"{request_id}.json"
-                if self._receipt_exists(receipt_path):
-                    if self._existing_receipt_bytes(receipt_path) != raw:
-                        raise AdvisorConflict(
-                            "unknown-abandon receipt already exists with other bytes"
-                        )
-                else:
-                    self._atomic_write(receipt_path, raw)
             elif outcome_unknown_ack is not None or question_sha256 is not None:
                 raise AdvisorError(
                     "outcome-unknown acknowledgement is valid only for "
@@ -2609,7 +2885,7 @@ class AdvisorLedger:
                 },
             )
             connection.execute(
-                "UPDATE jobs SET state = ?, receipt_sha256 = ?, "
+                "UPDATE jobs SET state = ?, receipt_sha256 = ?, receipt_published = 0, "
                 "outcome_unknown_abandoned = ?, terminal_reason = ?, "
                 "updated_at_utc = ? "
                 "WHERE request_id = ?",
@@ -2630,6 +2906,7 @@ class AdvisorLedger:
         return self.status(request_id)
 
     def status(self, request_id: str) -> dict[str, Any]:
+        self._publish_pending_terminal_receipt(request_id)
         with self._connect() as connection:
             row = self._job(connection, request_id)
             self._attest_lineage(connection, row)
@@ -2688,6 +2965,15 @@ class AdvisorLedger:
         ]
 
     def verify_chain(self) -> dict[str, Any]:
+        with self._connect() as connection:
+            request_ids = [
+                str(row["request_id"])
+                for row in connection.execute(
+                    "SELECT request_id FROM jobs ORDER BY request_id"
+                ).fetchall()
+            ]
+        for request_id in request_ids:
+            self._publish_pending_terminal_receipt(request_id)
         with self._connect() as connection:
             rows = connection.execute(
                 "SELECT * FROM events ORDER BY sequence"

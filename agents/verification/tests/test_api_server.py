@@ -547,7 +547,30 @@ def test_context_budget_failure_happens_before_model(
     with pytest.raises(HTTPException) as exc_info:
         server.verify_blueprint("S", two_item_proof())
     assert exc_info.value.status_code == 422
-    assert "incomplete or truncated" in str(exc_info.value.detail)
+    assert "per-item context budget" in str(exc_info.value.detail)
+
+
+def test_single_large_item_reports_the_per_item_context_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    proof = (
+        "# theorem thm:main\n\n"
+        "<!-- rethlas-depends-on: -->\n"
+        "## statement\nS\n\n"
+        "## proof\n"
+        + ("x" * 260_000)
+    )
+    monkeypatch.setattr(
+        server,
+        "run_codex_item_verification",
+        lambda **kwargs: pytest.fail("model must not start"),
+    )
+    with pytest.raises(HTTPException) as exc_info:
+        server.verify_blueprint("S", proof)
+    assert exc_info.value.status_code == 422
+    detail = str(exc_info.value.detail)
+    assert "complete current proof-item record" in detail
+    assert "aggregate request cap" in detail
 
 
 def test_item_limit_failure_happens_before_model(

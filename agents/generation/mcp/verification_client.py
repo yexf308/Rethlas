@@ -9,6 +9,7 @@ import os
 import re
 import secrets
 import stat
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict
@@ -60,6 +61,36 @@ _ITEM_CONTEXT_ATTESTATION_FIELDS = {
     "context_digest",
     "verdict",
 }
+
+
+def _publication_lock_timeout_seconds() -> float:
+    raw = os.getenv("RETHLAS_PUBLICATION_LOCK_TIMEOUT_SECONDS", "10")
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise ValueError(
+            "RETHLAS_PUBLICATION_LOCK_TIMEOUT_SECONDS must be numeric"
+        ) from exc
+    if not 0 < value <= 300:
+        raise ValueError(
+            "RETHLAS_PUBLICATION_LOCK_TIMEOUT_SECONDS must be in (0, 300]"
+        )
+    return value
+
+
+def _acquire_publication_lock(handle: Any, *, display_path: Path) -> None:
+    deadline = time.monotonic() + _publication_lock_timeout_seconds()
+    while True:
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return
+        except BlockingIOError as exc:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(
+                    f"timed out waiting for publication lock: {display_path}"
+                ) from exc
+            time.sleep(min(0.05, remaining))
 _TARGETED_RECEIPT_FIELDS = {
     "schema_version",
     "ticket_id",
@@ -1038,7 +1069,7 @@ def verify_blueprint_file(
             lock_name,
             display_path=lock_path,
         ) as lock_handle:
-            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
+            _acquire_publication_lock(lock_handle, display_path=lock_path)
             try:
                 assert_blueprint_bindings()
                 current_proof = _read_regular_blueprint_at(

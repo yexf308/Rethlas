@@ -6,6 +6,7 @@ import threading
 import sys
 from copy import deepcopy
 from pathlib import Path
+import fcntl
 from typing import Any, Callable
 
 import pytest
@@ -28,6 +29,23 @@ class FakeResponse:
 
     def json(self) -> object:
         return self.payload
+
+
+def test_publication_lock_wait_is_bounded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "publication.lock"
+    path.touch(mode=0o600)
+    monkeypatch.setenv("RETHLAS_PUBLICATION_LOCK_TIMEOUT_SECONDS", "0.01")
+    with path.open("r+", encoding="utf-8") as owner, path.open(
+        "r+", encoding="utf-8"
+    ) as waiter:
+        fcntl.flock(owner.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        try:
+            with pytest.raises(TimeoutError, match="publication lock"):
+                client._acquire_publication_lock(waiter, display_path=path)
+        finally:
+            fcntl.flock(owner.fileno(), fcntl.LOCK_UN)
 
 
 def valid_payload(
