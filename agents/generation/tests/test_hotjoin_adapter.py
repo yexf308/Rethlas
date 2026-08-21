@@ -14589,6 +14589,131 @@ def test_guardian_bound_group_unavailable_membership_fails_closed() -> None:
     )
 
 
+def test_guardian_prepare_settles_transient_prior_terminal_visibility(
+    ledger: hotjoin.ConversationLedger,
+) -> None:
+    registered = _arm_initial_guardian(
+        ledger, wall_epoch=1_000.0, monotonic_epoch=2_000.0
+    )
+    ack = registered["registration_ack"]
+    empty_inspector = _GuardianInspector(
+        boot_identity="boot-test-1", identities=[]
+    )
+    report = {
+        "registration_id": ack["registration_id"],
+        "request_sha256": ack["request_sha256"],
+        "state": "completed",
+        "reason": "paid_group_empty",
+        "forced": False,
+        "direct_returncode": 0,
+        "stopped_pgids": [],
+        "killed_pgids": [],
+        "already_empty_pgids": [10_101],
+    }
+    ledger.finalize_guardian(
+        "run-1",
+        report=report,
+        report_sha256=hashlib.sha256(
+            hotjoin._canonical_json(report).encode("utf-8")
+        ).hexdigest(),
+        guardian_token="4" * 64,
+        inspector=empty_inspector,
+        wall_epoch=1_001.0,
+        monotonic_epoch=2_001.0,
+    )
+
+    class TransientTerminalInspector:
+        membership_calls = 0
+
+        @staticmethod
+        def boot_identity() -> str:
+            return "boot-test-1"
+
+        @staticmethod
+        def identity(_pid: int) -> None:
+            return None
+
+        def group_members(self, _pgid: int) -> tuple[object, ...]:
+            self.membership_calls += 1
+            if self.membership_calls == 1:
+                raise RuntimeError("Darwin group visibility is still settling")
+            return ()
+
+    inspector = TransientTerminalInspector()
+    sleeps: list[float] = []
+    assert ledger._settle_prior_guardian_terminal_clean(
+        run_id="run-1",
+        launch_intent_sha256="f" * 64,
+        inspector=inspector,
+        wall_deadline=1_006.0,
+        monotonic_deadline=2_006.0,
+        clock_sampler=lambda: (1_001.0, 2_001.0),
+        settle_sleep=sleeps.append,
+    )
+    assert sleeps == [hotjoin.GUARDIAN_PRIOR_TERMINAL_SETTLE_POLL_SECONDS]
+    assert inspector.membership_calls == 3
+
+
+def test_guardian_prior_terminal_settle_stops_at_earliest_clock_deadline(
+    ledger: hotjoin.ConversationLedger,
+) -> None:
+    registered = _arm_initial_guardian(
+        ledger, wall_epoch=1_000.0, monotonic_epoch=2_000.0
+    )
+    ack = registered["registration_ack"]
+    empty_inspector = _GuardianInspector(
+        boot_identity="boot-test-1", identities=[]
+    )
+    report = {
+        "registration_id": ack["registration_id"],
+        "request_sha256": ack["request_sha256"],
+        "state": "completed",
+        "reason": "paid_group_empty",
+        "forced": False,
+        "direct_returncode": 0,
+        "stopped_pgids": [],
+        "killed_pgids": [],
+        "already_empty_pgids": [10_101],
+    }
+    ledger.finalize_guardian(
+        "run-1",
+        report=report,
+        report_sha256=hashlib.sha256(
+            hotjoin._canonical_json(report).encode("utf-8")
+        ).hexdigest(),
+        guardian_token="4" * 64,
+        inspector=empty_inspector,
+        wall_epoch=1_001.0,
+        monotonic_epoch=2_001.0,
+    )
+
+    class UnsettledInspector:
+        @staticmethod
+        def boot_identity() -> str:
+            return "boot-test-1"
+
+        @staticmethod
+        def identity(_pid: int) -> None:
+            return None
+
+        @staticmethod
+        def group_members(_pgid: int) -> tuple[object, ...]:
+            raise RuntimeError("group visibility remains unavailable")
+
+    samples = iter(((1_001.0, 2_001.0), (1_001.1, 2_006.0)))
+    sleeps: list[float] = []
+    assert not ledger._settle_prior_guardian_terminal_clean(
+        run_id="run-1",
+        launch_intent_sha256="e" * 64,
+        inspector=UnsettledInspector(),
+        wall_deadline=1_006.0,
+        monotonic_deadline=2_006.0,
+        clock_sampler=lambda: next(samples),
+        settle_sleep=sleeps.append,
+    )
+    assert sleeps == [hotjoin.GUARDIAN_PRIOR_TERMINAL_SETTLE_POLL_SECONDS]
+
+
 def test_nonzero_worker_cleanup_terminal_is_durable_but_never_clean(
     ledger: hotjoin.ConversationLedger,
 ) -> None:
@@ -19709,7 +19834,7 @@ You may use local read-only shell/Python for the `q=7` arithmetic. Do not use th
     private_adapter.write_text(private_source, encoding="utf-8")
     private_adapter_sha256 = hashlib.sha256(private_adapter.read_bytes()).hexdigest()
     assert private_adapter_sha256 == (
-        "d43f7e598c9ee06e13b9b5331d15f72434a146610edd75eae43cd02e6fe75531"
+        "b5c8ad1602a15c8981ab6c2032d7243be514f8596d3e7077ccdbd3f812cd0e28"
     )
 
     monkeypatch.setattr(hotjoin, "__file__", str(private_adapter))

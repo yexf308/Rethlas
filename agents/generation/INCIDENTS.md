@@ -879,3 +879,44 @@ an incident.
   callback, reparenting between its two snapshots, exit during validation,
   transition to an exact same-UID leaderless group, and candidate PID reuse.
   The reuse case produces no paid-group row, poll receipt, or discovery event.
+
+## 2026-08-20: production reviewer succeeded before fresh-epoch admission raced cleanup
+
+- **Classification:** post-review Guardian handoff liveness race; fixed. The
+  official reviewer result is valid, but the wrapper run itself exited `70`
+  before starting the reviewed fresh epoch.
+- **Trigger:** production run
+  `arxivhard-am2606047-review-production-max-20260820-03` used the same
+  `am-2606-047` statement, `gpt-5.6-sol` at `max`, and the unmodified
+  T+30/T+60/T+87/T+90 cadence after the authenticated descendant fix.
+- **Reviewer evidence:** the first root Guardian completed naturally at the
+  T+30 boundary. The host confirmed exactly three descendants terminal,
+  froze route `route_switching_long_cycles`, and launched one fresh critic.
+  The critic returned zero before the deadline with five ordered JSONL events,
+  an empty stderr digest, and `tool_free=true`. Its report passed the strict
+  contract, published official `yellow`, and validated context handoff
+  `handoff_51ff673ac30de4571d78fed8313b2711a88f77dfeeec798bb2f39ca1cdc21595`
+  from epoch 1 to pending epoch 2.
+- **Observed effect:** the review Guardian committed its clean terminal report
+  at `22:44:20.453` EDT. The wrapper created the next guarded log less than one
+  second later and `guardian_prepare` rejected the same-cycle resume with
+  `guardian launch prepare lost its exact owner admission`. A later read-only
+  evaluation of the identical durable state returned
+  `prior_guardian_terminal_clean=true`; no paid fresh-epoch turn had started.
+- **Root cause:** the host correctly requires the prior Guardian daemon and
+  every bound process group to be provably retired, not merely terminal in
+  SQLite. Darwin can briefly retain ambiguous process-group visibility after
+  the terminal row commits. The wrapper immediately crossed that visibility
+  window, while previous tests always waited until the old process was fully
+  absent before preparing the next Guardian.
+- **Remediation:** before a released same-cycle or next-cycle prepare, the
+  adapter now performs at most five seconds of read-only terminal-empty
+  settling under the earlier wall and monotonic registration deadlines. It
+  returns early for an exact replay or a clean prior topology. The final
+  `BEGIN IMMEDIATE` transaction still rechecks the owner fence, cycle and clock
+  binding, registration window, and complete terminal proof, so the settling
+  loop grants no admission and cannot extend a deadline.
+- **Regression evidence:** focused tests reproduce one unavailable group
+  enumeration followed by an exact empty proof and require one bounded poll;
+  a separate test advances the monotonic clock first and requires immediate
+  refusal. The complete hot-join contract file passes 430 tests.

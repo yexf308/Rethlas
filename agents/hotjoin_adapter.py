@@ -141,6 +141,9 @@ MAX_REROUTE_FIELD_BYTES = 4096
 SUPPORTED_MODEL_REROUTE_REASONS = frozenset({"highRiskCyberActivity"})
 DEFAULT_POST_TERMINAL_SETTLE_SECONDS = 0.25
 MAX_POST_TERMINAL_SETTLE_SECONDS = 5.0
+GUARDIAN_PRIOR_TERMINAL_SETTLE_SECONDS = 5.0
+GUARDIAN_PRIOR_TERMINAL_SETTLE_POLL_SECONDS = 0.025
+GUARDIAN_PRIOR_TERMINAL_SETTLE_MAX_POLLS = 201
 DEFAULT_STATE_DB = (
     Path(__file__).resolve().parent / ".rethlas_hotjoin" / "messages.sqlite3"
 )
@@ -12120,6 +12123,69 @@ class ConversationLedger:
             )
         )
 
+    def _settle_prior_guardian_terminal_clean(
+        self,
+        *,
+        run_id: str,
+        launch_intent_sha256: str,
+        inspector: Any,
+        wall_deadline: float,
+        monotonic_deadline: float,
+        clock_sampler: Callable[[], tuple[float, float]],
+        settle_sleep: Callable[[float], None],
+    ) -> bool:
+        """Boundedly wait for a terminal Guardian's OS empty proof to settle.
+
+        A terminal report can commit just before Darwin stops enumerating the
+        exited daemon or its process group.  This read-only loop never grants
+        admission.  It only avoids turning that visibility window into a
+        wrapper failure; ``prepare_guardian_launch`` still rechecks the exact
+        owner fence, cycle, clock, and terminal proof in its write transaction.
+        """
+
+        for poll_ordinal in range(GUARDIAN_PRIOR_TERMINAL_SETTLE_MAX_POLLS):
+            with self._connect() as connection:
+                connection.execute("BEGIN")
+                existing = connection.execute(
+                    "SELECT 1 FROM guardian_launch_intents "
+                    "WHERE run_id = ? AND launch_intent_sha256 = ?",
+                    (run_id, launch_intent_sha256),
+                ).fetchone()
+                latest_cycle = connection.execute(
+                    "SELECT cycle_id FROM cadence_cycles WHERE run_id = ? "
+                    "ORDER BY generation DESC LIMIT 1",
+                    (run_id,),
+                ).fetchone()
+                clean = bool(
+                    latest_cycle is not None
+                    and self._guardian_terminal_clean_txn(
+                        connection,
+                        cycle_id=str(latest_cycle["cycle_id"]),
+                        inspector=inspector,
+                    )
+                )
+                connection.commit()
+            if existing is not None or clean:
+                return True
+            if latest_cycle is None:
+                return False
+            wall_now, monotonic_now = clock_sampler()
+            if (
+                float(wall_now) >= wall_deadline
+                or float(monotonic_now) >= monotonic_deadline
+                or poll_ordinal + 1 >= GUARDIAN_PRIOR_TERMINAL_SETTLE_MAX_POLLS
+            ):
+                return False
+            delay = min(
+                GUARDIAN_PRIOR_TERMINAL_SETTLE_POLL_SECONDS,
+                wall_deadline - float(wall_now),
+                monotonic_deadline - float(monotonic_now),
+            )
+            if delay <= 0:
+                return False
+            settle_sleep(delay)
+        return False
+
     def prepare_guardian_launch(
         self,
         run_id: str,
@@ -12130,6 +12196,7 @@ class ConversationLedger:
         wall_epoch: float,
         monotonic_epoch: float,
         clock_sampler: Callable[[], tuple[float, float]] | None = None,
+        settle_sleep: Callable[[float], None] = time.sleep,
         test_allow_unreleased_guardian: bool = False,
     ) -> dict[str, Any]:
         if (
@@ -12247,6 +12314,23 @@ class ConversationLedger:
             raise ValueError("guardian launch clocks must be finite numbers")
         payload_json = _canonical_json(dict(payload))
         launch_intent_sha256 = hashlib.sha256(payload_json.encode("utf-8")).hexdigest()
+        if released_enforcement and mode in {"next_new_cycle", "same_cycle_resume"}:
+            sampler = clock_sampler or (lambda: (time.time(), time.monotonic()))
+            self._settle_prior_guardian_terminal_clean(
+                run_id=run_id,
+                launch_intent_sha256=launch_intent_sha256,
+                inspector=inspector,
+                wall_deadline=min(
+                    float(wall_not_after),
+                    float(wall_epoch) + GUARDIAN_PRIOR_TERMINAL_SETTLE_SECONDS,
+                ),
+                monotonic_deadline=min(
+                    float(monotonic_not_after),
+                    float(monotonic_epoch) + GUARDIAN_PRIOR_TERMINAL_SETTLE_SECONDS,
+                ),
+                clock_sampler=sampler,
+                settle_sleep=settle_sleep,
+            )
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             run = self._run_row(connection, run_id)
