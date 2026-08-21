@@ -763,6 +763,19 @@ def test_fresh_reviewer_invocation_binds_model_effort_snapshot_and_no_capabiliti
     assert invocation.publication_authority is False
     assert invocation.verification_authority is False
     assert json.loads(invocation.input_json) == contracts.validate_review_snapshot(bound)
+    assert "status not_reduced or unclear: evidence_ids is exactly []" in (
+        invocation.system_prompt
+    )
+    assert "if snapshot.progress_records is empty" in invocation.system_prompt
+    uncertainty_schema = invocation.output_schema["properties"]["answers"][
+        "properties"
+    ]["uncertainty_change"]["properties"]
+    assert "if and only if status is reduced" in uncertainty_schema[
+        "evidence_ids"
+    ]["description"]
+    assert "If that array is empty" in uncertainty_schema[
+        "confirmed_progress"
+    ]["description"]
 
 
 def test_reviewer_treats_in_snapshot_directives_as_untrusted_data() -> None:

@@ -246,10 +246,27 @@ REPORT_JSON_SCHEMA: dict[str, Any] = {
                     "additionalProperties": False,
                     "required": ["status", "evidence_ids", "confirmed_progress"],
                     "properties": {
-                        "status": {"enum": ["reduced", "not_reduced", "unclear"]},
-                        "evidence_ids": {"type": "array", "items": {"type": "string"}},
+                        "status": {
+                            "enum": ["reduced", "not_reduced", "unclear"],
+                            "description": (
+                                "If reduced, evidence_ids must be non-empty. If "
+                                "not_reduced or unclear, evidence_ids must be empty."
+                            ),
+                        },
+                        "evidence_ids": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": (
+                                "Non-empty if and only if status is reduced; otherwise "
+                                "use exactly []."
+                            ),
+                        },
                         "confirmed_progress": {
                             "type": "array",
+                            "description": (
+                                "May cite only snapshot.progress_records. If that array "
+                                "is empty, use exactly []."
+                            ),
                             "items": {
                                 "type": "object",
                                 "additionalProperties": False,
@@ -350,6 +367,12 @@ kind exactly. A root-authored progress marker alone never counts. Confirm each
 new lemma, excluded counterexample, or uncertainty reduction independently;
 overall uncertainty may remain not_reduced even when a genuine new lemma or
 counterexample exclusion is confirmed.
+Enforce this separate uncertainty evidence matrix exactly:
+- status reduced: evidence_ids is non-empty and contains only bound frontier ids.
+- status not_reduced or unclear: evidence_ids is exactly [].
+- confirmed_progress may be non-empty only for independently confirmed entries
+  in snapshot.progress_records; if snapshot.progress_records is empty, it is
+  exactly []. Never copy a frontier-only id into confirmed_progress.
 
 Return green only with a concrete next milestone. Return yellow only for one
 fatal doubt and one test that is also the next milestone. Return red only when
