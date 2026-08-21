@@ -959,6 +959,18 @@ an incident.
   first drive and requires `review_drive_required` for ordinal 2. In the
   incident run, the second review then correctly failed closed for a separate
   policy reason: epoch 2 had published no post-review active-route checkpoint.
+- **Pre-boundary early-return follow-up:** run
+  `arxivhard-am2606047-guardian-high-review10-epoch2-20260821-08` showed the
+  remaining stale projection case. Epoch 2 returned cleanly before review 2
+  was due, while the cycle projection still retained review 1's boundary and
+  `disposition_ready` drive. Their ids matched each other, so the projection
+  incorrectly emitted `post_review_handoff_required` instead of requesting an
+  ordinary same-cycle continuation authorization. A drive now affects paid
+  admission only while it matches the currently due missing review, or while
+  its exact fresh-epoch rollover is still pending. An isolated copy of a
+  reviewed active epoch now requires `continuation_authorization_required`
+  before review 2, while the same regression still requires
+  `review_drive_required` once review 2 is due.
 
 ## 2026-08-21: second review rejected the first review's immutable cutoff
 

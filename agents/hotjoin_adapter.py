@@ -20291,12 +20291,6 @@ class ConversationLedger:
                 and boundary_projection.get("review_ordinal")
                 == (1 if missing_due_review["kind"] == "review_1" else 2)
             )
-            drive_matches_boundary = bool(
-                isinstance(drive_projection, dict)
-                and isinstance(boundary_projection, dict)
-                and drive_projection.get("boundary_id")
-                == boundary_projection.get("boundary_id")
-            )
             valid_rollover_recovery = (
                 run["active_turn_id"] is None
                 and guard is not None
@@ -20305,6 +20299,13 @@ class ConversationLedger:
                 and epoch["state"] == "pending"
                 and epoch["thread_id"] is None
                 and epoch["handoff_id"] is not None
+            )
+            drive_matches_boundary = bool(
+                (boundary_matches_missing_review or valid_rollover_recovery)
+                and isinstance(drive_projection, dict)
+                and isinstance(boundary_projection, dict)
+                and drive_projection.get("boundary_id")
+                == boundary_projection.get("boundary_id")
             )
             if (
                 isinstance(drive_projection, dict)

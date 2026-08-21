@@ -6206,6 +6206,39 @@ def test_owner_review_drive_real_isolated_subprocess_is_terminal_bound_and_idemp
     binding = hotjoin._context_handoff_binding(ledger, dict(rebound))
     assert binding is not None and binding["thread_epoch"] == "2"
 
+    # If the reviewed epoch returns cleanly before review 2 is due, the first
+    # review's retained boundary/drive must not hide ordinary same-cycle
+    # continuation admission. Exercise that state on an isolated ledger copy
+    # so the authoritative fixture can still advance to the second boundary.
+    early_path = tmp_path / "epoch-2-early-terminal.sqlite3"
+    _sqlite_backup_database(ledger.path, early_path)
+    early_ledger = hotjoin.ConversationLedger(early_path)
+    early_terminal = _turn("turn-2", "completed")
+    early_ledger.stage_turn_terminal(
+        "run-1", thread_id="thread-2", turn=early_terminal, lease=adapter._lease()
+    )
+    early_ledger.finalize_turn(
+        "run-1",
+        turn_id="turn-2",
+        status="completed",
+        assistant_message="reviewed epoch returned before review 2",
+        error=None,
+        terminal_audit=early_terminal,
+        lease=adapter._lease(),
+    )
+    early_ledger.release_lease("run-1", adapter._lease())
+    with early_ledger._connect() as connection:
+        early_cycle = connection.execute(
+            "SELECT * FROM cadence_cycles WHERE cycle_id = ?", (old_cycle["cycle_id"],)
+        ).fetchone()
+    assert early_cycle is not None
+    before_second_due = float(hotjoin.REVIEW_CADENCE_POLICY["review_2_due_seconds"]) - 1
+    early_projection = early_ledger.cadence_control_state(
+        "run-1",
+        now_epoch=float(early_cycle["started_at_epoch"]) + before_second_due,
+    )
+    assert early_projection["disposition"] == "continuation_authorization_required"
+
     second_due = ledger.cadence_tick(
         "run-1",
         now_epoch=float(old_cycle["started_at_epoch"])
