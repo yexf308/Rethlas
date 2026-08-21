@@ -971,6 +971,16 @@ an incident.
   reviewed active epoch now requires `continuation_authorization_required`
   before review 2, while the same regression still requires
   `review_drive_required` once review 2 is due.
+- **Reviewed-epoch continuation follow-up:** run
+  `arxivhard-am2606047-guardian-high-review10-epoch2-20260821-11` advanced the
+  same early-return path through host continuation admission, then the wrapper
+  rejected the active epoch because it still carried its consumed review
+  handoff id and digest. Active thread epochs intentionally retain that
+  provenance. The wrapper now accepts either no handoff for epoch 1 or one
+  exact content-addressed handoff whose predecessor is the immediately prior
+  epoch. A mock end-to-end review, epoch-2 early terminal, owner continuation,
+  and second same-epoch root proves that the thread remains epoch 2 and retains
+  its handoff rather than being rejected or incremented.
 
 ## 2026-08-21: second review rejected the first review's immutable cutoff
 

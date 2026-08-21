@@ -2135,6 +2135,9 @@ if starting_disposition == "continue_reviewed_cycle_fresh_epoch":
     assert reviewed_epoch["thread_id"] is None
     prompt = arguments[arguments.index("--prompt") + 1]
     assert prompt.startswith("[TRUSTED HOST REHYDRATION REQUIRED]")
+    state["allowed_action"] = os.environ.get(
+        "MOCK_REVIEWED_ALLOWED_ACTION", "continue_to_next_milestone"
+    )
     state["reviewed_handoff_consumed_count"] = int(
         state.get("reviewed_handoff_consumed_count", 0)
     ) + 1
@@ -2383,7 +2386,8 @@ handoff_sha256 = (
 prior_epoch = state.get("thread_epoch")
 active_epoch_number = (
     prior_epoch["thread_epoch"]
-    if isinstance(prior_epoch, dict) and prior_epoch.get("state") == "pending"
+    if isinstance(prior_epoch, dict)
+    and prior_epoch.get("state") in {"pending", "active"}
     else max(run_count, 1)
 )
 pending_handoff = (
@@ -2416,8 +2420,16 @@ state.update({
         if pending_handoff
         else {
             "active_turn_id": None,
-            "handoff_id": None,
-            "handoff_sha256": None,
+            "handoff_id": (
+                prior_epoch.get("handoff_id")
+                if isinstance(prior_epoch, dict)
+                else None
+            ),
+            "handoff_sha256": (
+                prior_epoch.get("handoff_sha256")
+                if isinstance(prior_epoch, dict)
+                else None
+            ),
             "predecessor_epoch": (
                 active_epoch_number - 1 if active_epoch_number > 1 else None
             ),
@@ -3712,6 +3724,57 @@ def test_due_review_uses_guarded_runner_then_starts_fresh_epoch(
     assert state["disposition"] == "hard_stopped"
     _assert_guarded_review_drive_is_fd_only(calls_path, state_path)
     assert "same-cycle fresh epoch is ready" in completed.stderr
+
+
+def test_reviewed_epoch_early_terminal_gets_same_epoch_continuation(
+    tmp_path: Path,
+) -> None:
+    runner, fake_bin = _make_runner_tree(tmp_path)
+    adapter, state_path, calls_path = _install_mock_cadence_adapter(tmp_path)
+    environment = _cadence_environment(
+        runner,
+        fake_bin,
+        state_path,
+        calls_path,
+        dispositions=[
+            "continuation_authorization_required",
+            "continuation_authorization_required",
+            "hard_stopped",
+        ],
+        max_iterations=1,
+        extra_environment={
+            "MOCK_REVIEWED_ALLOWED_ACTION": "one_bounded_cycle_on_fatal_doubt"
+        },
+    )
+    _seed_mock_cadence_projection(
+        adapter,
+        state_path,
+        environment,
+        disposition="review_drive_required",
+    )
+
+    completed = subprocess.run(
+        [str(runner)],
+        cwd=runner.parent.parent,
+        env=environment,
+        text=True,
+        capture_output=True,
+        timeout=30,
+        check=False,
+    )
+
+    assert completed.returncode == 1, completed.stdout + completed.stderr
+    assert len(_cadence_calls(calls_path, "guarded-review-drive")) == 1
+    assert len(_cadence_calls(calls_path, "run-generator")) == 2
+    admits = _cadence_calls(calls_path, "cadence-admit")
+    assert [call["control_envelope"]["payload"]["operation"] for call in admits] == [
+        "continue_active_cycle"
+    ]
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    assert state["reviewed_handoff_consumed_count"] == 1
+    assert state["thread_epoch"]["thread_epoch"] == 2
+    assert state["thread_epoch"]["handoff_id"].startswith("handoff_")
+    assert state["disposition"] == "hard_stopped"
 
 
 def test_due_review_red_freezes_route_without_owner_yield_or_paid_root(

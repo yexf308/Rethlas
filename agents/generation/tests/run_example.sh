@@ -4757,12 +4757,24 @@ elif disposition == "continue_active_cycle":
         "thread_epoch",
         "thread_id",
     }
+    active_handoff_valid = (
+        epoch.get("handoff_id") is None
+        and epoch.get("handoff_sha256") is None
+    ) if isinstance(epoch, dict) else False
+    if isinstance(epoch, dict) and isinstance(epoch.get("handoff_sha256"), str):
+        active_handoff_valid = (
+            re.fullmatch(r"[0-9a-f]{64}", epoch["handoff_sha256"]) is not None
+            and epoch.get("handoff_id") == f"handoff_{epoch['handoff_sha256']}"
+            and isinstance(epoch.get("predecessor_epoch"), int)
+            and not isinstance(epoch["predecessor_epoch"], bool)
+            and isinstance(epoch.get("thread_epoch"), int)
+            and epoch["predecessor_epoch"] == epoch["thread_epoch"] - 1
+        )
     continue_epoch_valid = (
         isinstance(epoch, dict)
         and set(epoch) == epoch_fields
         and epoch["active_turn_id"] is None
-        and epoch["handoff_id"] is None
-        and epoch["handoff_sha256"] is None
+        and active_handoff_valid
         and epoch["state"] == "active"
         and isinstance(epoch["thread_id"], str)
         and bool(epoch["thread_id"])
