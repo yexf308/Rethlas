@@ -20289,6 +20289,12 @@ class ConversationLedger:
                 and boundary_projection.get("review_ordinal")
                 == (1 if missing_due_review["kind"] == "review_1" else 2)
             )
+            drive_matches_boundary = bool(
+                isinstance(drive_projection, dict)
+                and isinstance(boundary_projection, dict)
+                and drive_projection.get("boundary_id")
+                == boundary_projection.get("boundary_id")
+            )
             valid_rollover_recovery = (
                 run["active_turn_id"] is None
                 and guard is not None
@@ -20301,12 +20307,14 @@ class ConversationLedger:
             if (
                 isinstance(drive_projection, dict)
                 and drive_projection.get("state") == "disposition_ready"
+                and drive_matches_boundary
                 and cycle["allowed_action"] == "freeze_route"
             ):
                 disposition = "route_frozen"
             elif (
                 isinstance(drive_projection, dict)
                 and drive_projection.get("state") == "disposition_ready"
+                and drive_matches_boundary
                 and valid_rollover_recovery
             ):
                 disposition = "continue_reviewed_cycle_fresh_epoch"
@@ -20315,6 +20323,7 @@ class ConversationLedger:
             elif (
                 isinstance(drive_projection, dict)
                 and drive_projection.get("state") == "disposition_ready"
+                and drive_matches_boundary
             ):
                 disposition = "post_review_handoff_required"
             elif (

@@ -6202,6 +6202,28 @@ def test_owner_review_drive_real_isolated_subprocess_is_terminal_bound_and_idemp
     binding = hotjoin._context_handoff_binding(ledger, dict(rebound))
     assert binding is not None and binding["thread_epoch"] == "2"
 
+    second_due = ledger.cadence_tick(
+        "run-1",
+        now_epoch=float(old_cycle["started_at_epoch"])
+        + float(hotjoin.REVIEW_CADENCE_POLICY["review_2_due_seconds"]),
+        thread_id="thread-2",
+        turn_id="turn-2",
+        lease=adapter._lease(),
+    )
+    assert [action.kind for action in second_due] == ["review_2"]
+    _terminalize_due_review_action(
+        ledger,
+        lease=adapter._lease(),
+        action=second_due[0],
+    )
+    second_projection = ledger.cadence_control_state(
+        "run-1", now_epoch=float(second_due[0].due_at)
+    )
+    assert second_projection["disposition"] == "review_drive_required"
+    assert second_projection["review_cadence"]["review_boundary"][
+        "review_ordinal"
+    ] == 2
+
 
 def test_unreleased_guardian_rejects_direct_review_drive_before_any_paid_helper(
     ledger: hotjoin.ConversationLedger,
@@ -19840,7 +19862,7 @@ You may use local read-only shell/Python for the `q=7` arithmetic. Do not use th
     private_adapter.write_text(private_source, encoding="utf-8")
     private_adapter_sha256 = hashlib.sha256(private_adapter.read_bytes()).hexdigest()
     assert private_adapter_sha256 == (
-        "131e09dc2fc0f34c25425d76b80aaf75df2efe4ddd112e556fffa56968ee6e36"
+        "050089ce32aa91cfb97193d4e4f61b0a6cf428514df3f01ccb2e8b991f617d91"
     )
 
     monkeypatch.setattr(hotjoin, "__file__", str(private_adapter))

@@ -950,3 +950,12 @@ an incident.
   consumes the handoff, binds epoch 2, asserts the restored green action, and
   checks the string epoch projection. The review client content-addressed GET
   test and private manifest pin also pass.
+- **Second-boundary follow-up:** the live high-effort epoch 2 reached its T+20
+  boundary, but cadence initially projected the first review's stale
+  `disposition_ready` drive as `post_review_handoff_required` and hid the new
+  descendants-terminal boundary. Review-drive projections now affect
+  admission only when their `boundary_id` equals the current boundary. The
+  regression advances the same reviewed epoch to review 2 while retaining the
+  first drive and requires `review_drive_required` for ordinal 2. In the
+  incident run, the second review then correctly failed closed for a separate
+  policy reason: epoch 2 had published no post-review active-route checkpoint.
