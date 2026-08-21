@@ -14571,6 +14571,24 @@ def test_guardian_bound_group_reuse_requires_exact_new_leader_or_old_empty() -> 
     )
 
 
+def test_guardian_bound_group_unavailable_membership_fails_closed() -> None:
+    class UnavailableGroupInspector:
+        @staticmethod
+        def identity(_pid: int) -> None:
+            return None
+
+        @staticmethod
+        def group_members(_pgid: int) -> tuple[()]:
+            raise RuntimeError("transient native enumeration failure")
+
+    assert not hotjoin._guardian_bound_group_retired(
+        pid=10_101,
+        pgid=10_101,
+        start_marker="original-root",
+        inspector=UnavailableGroupInspector(),
+    )
+
+
 def test_nonzero_worker_cleanup_terminal_is_durable_but_never_clean(
     ledger: hotjoin.ConversationLedger,
 ) -> None:
@@ -19691,7 +19709,7 @@ You may use local read-only shell/Python for the `q=7` arithmetic. Do not use th
     private_adapter.write_text(private_source, encoding="utf-8")
     private_adapter_sha256 = hashlib.sha256(private_adapter.read_bytes()).hexdigest()
     assert private_adapter_sha256 == (
-        "17b230f3e07cac287841b08bebed8fdff5a0cd7f273d05cb80f8a223e4d39cf5"
+        "d43f7e598c9ee06e13b9b5331d15f72434a146610edd75eae43cd02e6fe75531"
     )
 
     monkeypatch.setattr(hotjoin, "__file__", str(private_adapter))

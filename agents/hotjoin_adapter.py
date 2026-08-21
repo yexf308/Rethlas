@@ -3441,7 +3441,7 @@ def _guardian_bound_group_retired(
     def old_group_empty() -> bool:
         try:
             return not inspector.group_members(pgid)
-        except IdentityViolation:
+        except Exception:
             # An inaccessible or transiently unenumerable group is not an
             # empty proof. Keep the durable old identity until a later poll.
             return False
