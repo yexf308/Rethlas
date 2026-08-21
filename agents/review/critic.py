@@ -440,6 +440,80 @@ def _canonicalize_yellow_milestone(value: Any) -> Any:
     return normalized
 
 
+def _canonicalize_reviewer_evidence(
+    value: Any, snapshot: Mapping[str, Any]
+) -> Any:
+    """Project reviewer-supplied evidence references onto the bound snapshot.
+
+    JSON Schema cannot express membership in the request's record arrays.  At
+    this one wire boundary the host removes out-of-snapshot references and
+    downgrades an unsupported ``reduced`` claim to ``unclear``.  It never adds
+    evidence or confirmed progress; the public report validator stays strict.
+    """
+
+    if not isinstance(value, dict) or not isinstance(value.get("answers"), dict):
+        return value
+    normalized = deepcopy(value)
+    answers = normalized["answers"]
+    frontier_ids = {
+        record.get("record_id")
+        for record in snapshot.get("frontier_records", [])
+        if isinstance(record, Mapping) and isinstance(record.get("record_id"), str)
+    }
+    progress_by_id = {
+        record.get("record_id"): record.get("kind")
+        for record in snapshot.get("progress_records", [])
+        if isinstance(record, Mapping)
+        and isinstance(record.get("record_id"), str)
+        and isinstance(record.get("kind"), str)
+    }
+
+    obstruction = answers.get("obstruction_risk")
+    if isinstance(obstruction, dict) and isinstance(
+        obstruction.get("evidence_ids"), list
+    ) and all(isinstance(item, str) for item in obstruction["evidence_ids"]):
+        obstruction["evidence_ids"] = list(
+            dict.fromkeys(
+                item for item in obstruction["evidence_ids"] if item in frontier_ids
+            )
+        )
+
+    uncertainty = answers.get("uncertainty_change")
+    if isinstance(uncertainty, dict):
+        evidence = uncertainty.get("evidence_ids")
+        if isinstance(evidence, list) and all(isinstance(item, str) for item in evidence):
+            projected = list(
+                dict.fromkeys(item for item in evidence if item in frontier_ids)
+            )
+            if uncertainty.get("status") == "reduced":
+                uncertainty["evidence_ids"] = projected
+                if not projected:
+                    uncertainty["status"] = "unclear"
+            elif uncertainty.get("status") in {"not_reduced", "unclear"}:
+                uncertainty["evidence_ids"] = []
+        confirmed = uncertainty.get("confirmed_progress")
+        if (
+            isinstance(confirmed, list)
+            and all(
+                isinstance(item, dict)
+                and set(item) == {"record_id", "kind"}
+                and isinstance(item["record_id"], str)
+                and isinstance(item["kind"], str)
+                for item in confirmed
+            )
+        ):
+            seen: set[str] = set()
+            projected_confirmed: list[dict[str, str]] = []
+            for item in confirmed:
+                record_id = item["record_id"]
+                if record_id in seen or progress_by_id.get(record_id) != item["kind"]:
+                    continue
+                seen.add(record_id)
+                projected_confirmed.append(item)
+            uncertainty["confirmed_progress"] = projected_confirmed
+    return normalized
+
+
 def _execution_envelope(
     request: Mapping[str, Any],
     *,
@@ -527,8 +601,11 @@ def launch_once(
         )
     try:
         parsed = strict_json_loads(observation.output, label="reviewer output")
+        parsed = _canonicalize_reviewer_evidence(
+            _canonicalize_yellow_milestone(parsed), normalized["snapshot"]
+        )
         report = validate_review_report(
-            _canonicalize_yellow_milestone(parsed),
+            parsed,
             review_id=normalized["review_id"],
             snapshot=normalized["snapshot"],
         )

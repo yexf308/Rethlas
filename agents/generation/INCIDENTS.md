@@ -1045,3 +1045,14 @@ an incident.
   objects. A one-shot critic execution with two different objects now completes
   with an exact canonical report whose milestone equals the fatal doubt; all
   31 review-contract tests pass in both the main and isolated checkouts.
+- **Evidence-reference follow-up:** the second critic in run
+  `arxivhard-am2606047-guardian-high-review10-epoch2-20260821-09` was rejected
+  because `obstruction_risk.evidence_ids` cited an id outside its bound
+  snapshot. JSON Schema can constrain an array to strings but cannot express
+  request-local membership. The same reviewer-wire boundary now projects
+  obstruction and uncertainty evidence onto bound frontier ids and confirmed
+  progress onto exact progress id/kind pairs. It never adds a reference; an
+  unsupported `reduced` claim is downgraded to `unclear`. Direct public report
+  validation remains fail-closed for every out-of-snapshot id. The expanded
+  32-test contract suite covers filtering, deduplication, conservative
+  downgrade, and invalid confirmed-progress removal in both checkouts.
