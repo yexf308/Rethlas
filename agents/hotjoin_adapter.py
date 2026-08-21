@@ -141,9 +141,9 @@ MAX_REROUTE_FIELD_BYTES = 4096
 SUPPORTED_MODEL_REROUTE_REASONS = frozenset({"highRiskCyberActivity"})
 DEFAULT_POST_TERMINAL_SETTLE_SECONDS = 0.25
 MAX_POST_TERMINAL_SETTLE_SECONDS = 5.0
-GUARDIAN_PRIOR_TERMINAL_SETTLE_SECONDS = 20.0
+GUARDIAN_PRIOR_TERMINAL_SETTLE_SECONDS = 5.0
 GUARDIAN_PRIOR_TERMINAL_SETTLE_POLL_SECONDS = 0.025
-GUARDIAN_PRIOR_TERMINAL_SETTLE_MAX_POLLS = 801
+GUARDIAN_PRIOR_TERMINAL_SETTLE_MAX_POLLS = 201
 DEFAULT_STATE_DB = (
     Path(__file__).resolve().parent / ".rethlas_hotjoin" / "messages.sqlite3"
 )
@@ -188,7 +188,7 @@ APPROVED_GUARDIAN_LAUNCHER_SHA256 = (
     "abf7b49c8989d746fe796a59b516357224615d56e28bccb7026180be03883b1c"
 )
 APPROVED_GUARDIAN_RUNNER_SHA256 = (
-    "3b73c43d408d696c1c921480e10afa069ebf3a97307a0bc2b342d8fe1e23e289"
+    "260a0394ca4b79bab152cddfd021aaedc9b57f9726cd830ccc88d810e20cee2c"
 )
 APPROVED_GUARDIAN_SHA256 = (
     "aa2f1c798fd8415bf850973f4ba0b100a8c142327e578a26bfd6416e09584266"
@@ -32504,7 +32504,7 @@ def _launch_route_reviewer(
             report = _json_loads_strict(report_bytes.decode("utf-8"))
             validated = _invoke_review_contract_helper(
                 capability,
-                "validate-report",
+                "normalize-and-validate-report",
                 {"request": request, "report": report},
             )
             if not isinstance(validated, dict):

@@ -543,6 +543,25 @@ def _canonicalize_reviewer_evidence(
     return normalized
 
 
+def normalize_reviewer_report(
+    value: Any, request: Mapping[str, Any]
+) -> Any:
+    """Normalize only the fresh-reviewer wire redundancies before validation.
+
+    The public report validator remains strict. This helper is for the one
+    capability-free reviewer boundary, where immutable bindings come from the
+    request, yellow's ``fatal_doubt`` is the sole continuation-authoritative
+    action, and evidence references can only be removed to match the snapshot.
+    """
+
+    normalized_request = validate_review_request(request)
+    normalized = _canonicalize_reviewer_bindings(value, normalized_request)
+    normalized = _canonicalize_yellow_milestone(normalized)
+    return _canonicalize_reviewer_evidence(
+        normalized, normalized_request["snapshot"]
+    )
+
+
 def _execution_envelope(
     request: Mapping[str, Any],
     *,
@@ -630,10 +649,7 @@ def launch_once(
         )
     try:
         parsed = strict_json_loads(observation.output, label="reviewer output")
-        parsed = _canonicalize_reviewer_bindings(parsed, normalized)
-        parsed = _canonicalize_reviewer_evidence(
-            _canonicalize_yellow_milestone(parsed), normalized["snapshot"]
-        )
+        parsed = normalize_reviewer_report(parsed, normalized)
         report = validate_review_report(
             parsed,
             review_id=normalized["review_id"],

@@ -22,6 +22,7 @@ COMMANDS = frozenset(
     {
         "build-request",
         "build-invocation",
+        "normalize-and-validate-report",
         "validate-request",
         "validate-report",
         "reduce-verdict",
@@ -70,6 +71,7 @@ from review.contracts import (  # noqa: E402
 from review.critic import (  # noqa: E402
     build_invocation,
     build_review_request,
+    normalize_reviewer_report,
     validate_review_request,
 )
 
@@ -117,12 +119,24 @@ def _handle(command: str, payload: Any) -> Mapping[str, Any]:
             "output_schema": invocation.output_schema,
             "reviewer_contract": request["reviewer_contract"],
         }
-    if command in {"validate-report", "reduce-verdict", "build-targeted-ticket"}:
+    if command in {
+        "normalize-and-validate-report",
+        "validate-report",
+        "reduce-verdict",
+        "build-targeted-ticket",
+    }:
         keys = {"request", "report"}
         if command == "reduce-verdict":
             keys.add("previous_decision")
         raw = _exact_object(payload, keys, label=f"{command} input")
         request = validate_review_request(raw["request"])
+        if command == "normalize-and-validate-report":
+            normalized_report = normalize_reviewer_report(raw["report"], request)
+            return validate_review_report(
+                normalized_report,
+                review_id=request["review_id"],
+                snapshot=request["snapshot"],
+            )
         if command == "validate-report":
             return validate_review_report(
                 raw["report"],

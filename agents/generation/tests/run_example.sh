@@ -4691,7 +4691,12 @@ if result["state"] == "disposition_ready":
 elif projection["paid_turn_allowed"] is not False:
     raise SystemExit("failed review drive exposed a paid turn")
 PY
-  printf '%s\n' "$post_projection"
+  # This function must run in the caller's shell. In addition to returning the
+  # durable projection, it refreshes CONTROL_CAPABILITY_REVISION before the
+  # guarded reviewer starts. Keeping both values in caller-visible globals
+  # prevents the next fresh-epoch Guardian from using the stale pre-review
+  # revision after a command-substitution subshell exits.
+  REVIEW_DRIVE_PROJECTION="$post_projection"
 }
 
 cadence_start_disposition() {
@@ -4957,7 +4962,11 @@ if [[ "$REVIEW_CADENCE_POLICY" == rethlas_route_review_90m_v1 ]]; then
   esac
 
   if [[ "$initial_pre_disposition" == review_drive_required ]]; then
-    initial_projection="$(review_drive_due "$initial_projection")" || exit 70
+    REVIEW_DRIVE_PROJECTION=""
+    if ! review_drive_due "$initial_projection"; then
+      exit 70
+    fi
+    initial_projection="$REVIEW_DRIVE_PROJECTION"
     initial_pre_disposition="$(
       cadence_projection_disposition "$initial_projection"
     )" || exit 70
@@ -5452,9 +5461,11 @@ while true; do
             exit 70
             ;;
           review_drive_required)
-            cadence_after_projection="$(
-              review_drive_due "$cadence_after_projection"
-            )" || exit 70
+            REVIEW_DRIVE_PROJECTION=""
+            if ! review_drive_due "$cadence_after_projection"; then
+              exit 70
+            fi
+            cadence_after_projection="$REVIEW_DRIVE_PROJECTION"
             cadence_after_turn="$(
               cadence_projection_disposition "$cadence_after_projection"
             )" || exit 70

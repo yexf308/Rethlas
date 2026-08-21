@@ -407,6 +407,10 @@ def main() -> int:
         assert re.fullmatch(r"[0-9a-f]{64}", args.expected_clock_sha256 or "")
     else:
         assert args.expected_clock_sha256 is None
+    if os.environ.get("MOCK_GUARDIAN_ENFORCE_CURRENT_CAPABILITY_REVISION"):
+        state_path = pathlib.Path(os.environ["MOCK_CADENCE_STATE_FILE"])
+        current_state = json.loads(state_path.read_text(encoding="utf-8"))
+        assert args.capability_revision == current_state["capability_revision"]
 
     for source in (
         args.adapter_path,
@@ -3674,6 +3678,9 @@ def test_due_review_uses_guarded_runner_then_starts_fresh_epoch(
         calls_path,
         dispositions=["hard_stopped"],
         max_iterations=1,
+        extra_environment={
+            "MOCK_GUARDIAN_ENFORCE_CURRENT_CAPABILITY_REVISION": "1"
+        },
     )
     _seed_mock_cadence_projection(
         adapter,
@@ -4048,6 +4055,9 @@ def test_review_boundary_recovery_reaps_only_existing_root_and_descendants(
         calls_path,
         dispositions=["hard_stopped"],
         max_iterations=1,
+        extra_environment={
+            "MOCK_GUARDIAN_ENFORCE_CURRENT_CAPABILITY_REVISION": "1"
+        },
     )
     _seed_mock_cadence_projection(
         adapter,

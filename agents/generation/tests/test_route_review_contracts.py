@@ -886,6 +886,64 @@ def test_contract_cli_executes_by_exact_path_under_python_isolated_mode(
     assert not list(tmp_path.rglob("__pycache__"))
 
 
+def test_contract_cli_normalizes_only_the_fresh_reviewer_wire(
+    tmp_path: Path,
+) -> None:
+    bound = snapshot()
+    request = critic.build_review_request(
+        review_id=REVIEW_ID,
+        snapshot=bound,
+        expected_model="gpt-5.6-sol",
+        reasoning_effort="high",
+        policy_sha256=POLICY_SHA,
+    )
+    wire_report = report(bound, verdict="yellow")
+    wire_report["answers"]["next_milestone"] = {
+        "description": "A non-authoritative paraphrase.",
+        "test": "A different test that cannot gain continuation authority.",
+    }
+    with pytest.raises(
+        contracts.ReviewContractError,
+        match="yellow next milestone must be exactly the fatal-doubt test",
+    ):
+        contracts.validate_review_report(
+            wire_report,
+            review_id=REVIEW_ID,
+            snapshot=bound,
+        )
+
+    cli_path = Path(critic.__file__).with_name("contract_cli.py").resolve()
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-I",
+            "-B",
+            os.fspath(cli_path),
+            "normalize-and-validate-report",
+        ],
+        input=contracts.canonical_json_bytes(
+            {"request": request, "report": wire_report}
+        ),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        cwd=tmp_path,
+        env={
+            "LC_ALL": "C.UTF-8",
+            "LANG": "C.UTF-8",
+            "PYTHONDONTWRITEBYTECODE": "1",
+        },
+        check=False,
+        timeout=10,
+    )
+    assert completed.returncode == 0, completed.stderr.decode(errors="replace")
+    normalized = json.loads(completed.stdout)
+    assert normalized["answers"]["next_milestone"] == normalized["fatal_doubt"]
+    assert normalized["answers"]["next_milestone"] != wire_report["answers"][
+        "next_milestone"
+    ]
+    assert not list(tmp_path.rglob("__pycache__"))
+
+
 def test_malformed_reviewer_output_is_operational_not_red() -> None:
     request = critic.build_review_request(
         review_id=REVIEW_ID,

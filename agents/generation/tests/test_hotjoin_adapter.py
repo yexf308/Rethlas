@@ -1843,6 +1843,7 @@ def _write_fake_route_reviewer(
     forbidden_item: bool = False,
     oversized_stderr: bool = False,
     cross_cycle_yellow: bool = False,
+    paraphrase_yellow_milestone: bool = False,
     load_bearing_claim: bool = False,
 ) -> None:
     item_type = "command_execution" if forbidden_item else "reasoning"
@@ -1903,7 +1904,11 @@ report = {{
             ),
         }},
         "obstruction_risk": {{"status": "none", "detail": "", "evidence_ids": []}},
-        "next_milestone": {{"description": "prove the estimate", "test": "derive a uniform bound"}}
+        "next_milestone": (
+            {{"description": "paraphrased milestone", "test": "paraphrased test"}}
+            if verdict == "yellow" and {paraphrase_yellow_milestone!r}
+            else {{"description": "prove the estimate", "test": "derive a uniform bound"}}
+        )
     }},
     "verdict": verdict,
     "fatal_doubt": (
@@ -2066,6 +2071,7 @@ def _prepare_control_review_runtime(
     forbidden_item: bool = False,
     oversized_stderr: bool = False,
     cross_cycle_yellow: bool = False,
+    paraphrase_yellow_milestone: bool = False,
     load_bearing_claim: bool = False,
     existing_cycle: dict[str, Any] | None = None,
     existing_lease: hotjoin.LeaseToken | None = None,
@@ -2142,6 +2148,7 @@ def _prepare_control_review_runtime(
         forbidden_item=forbidden_item,
         oversized_stderr=oversized_stderr,
         cross_cycle_yellow=cross_cycle_yellow,
+        paraphrase_yellow_milestone=paraphrase_yellow_milestone,
         load_bearing_claim=load_bearing_claim,
     )
     token = "9" * 64
@@ -3955,6 +3962,7 @@ def test_t87_cycle_close_becomes_continue_next_cycle_only_after_t90_terminal(
         existing_cycle=cycle,
         existing_lease=lease,
         cross_cycle_yellow=True,
+        paraphrase_yellow_milestone=True,
     )
     first_published = _publish_control_review(ledger, first_request, environment)
     lease = _resume_test_root_after_review(
@@ -4003,6 +4011,10 @@ def test_t87_cycle_close_becomes_continue_next_cycle_only_after_t90_terminal(
     second_published = _publish_control_review(ledger, second_request, environment)
     assert second_published["decision"]["effective_verdict"] == "yellow"
     assert second_published["decision"]["yellow_streak"] == 1
+    assert (
+        second_published["execution"]["report"]["answers"]["next_milestone"]
+        == second_published["execution"]["report"]["fatal_doubt"]
+    )
     lease = _resume_test_root_after_review(
         ledger,
         lease=lease,
@@ -14779,71 +14791,6 @@ def test_guardian_prepare_settles_transient_prior_terminal_visibility(
     assert inspector.membership_calls == 3
 
 
-def test_guardian_prepare_settles_beyond_legacy_five_second_window(
-    ledger: hotjoin.ConversationLedger,
-) -> None:
-    registered = _arm_initial_guardian(
-        ledger, wall_epoch=1_000.0, monotonic_epoch=2_000.0
-    )
-    ack = registered["registration_ack"]
-    empty_inspector = _GuardianInspector(
-        boot_identity="boot-test-1", identities=[]
-    )
-    report = {
-        "registration_id": ack["registration_id"],
-        "request_sha256": ack["request_sha256"],
-        "state": "completed",
-        "reason": "paid_group_empty",
-        "forced": False,
-        "direct_returncode": 0,
-        "stopped_pgids": [],
-        "killed_pgids": [],
-        "already_empty_pgids": [10_101],
-    }
-    ledger.finalize_guardian(
-        "run-1",
-        report=report,
-        report_sha256=hashlib.sha256(
-            hotjoin._canonical_json(report).encode("utf-8")
-        ).hexdigest(),
-        guardian_token="4" * 64,
-        inspector=empty_inspector,
-        wall_epoch=1_001.0,
-        monotonic_epoch=2_001.0,
-    )
-
-    class SlowlySettlingInspector:
-        membership_calls = 0
-
-        @staticmethod
-        def boot_identity() -> str:
-            return "boot-test-1"
-
-        @staticmethod
-        def identity(_pid: int) -> None:
-            return None
-
-        def group_members(self, _pgid: int) -> tuple[object, ...]:
-            self.membership_calls += 1
-            if self.membership_calls <= 205:
-                raise RuntimeError("Darwin group visibility is still settling")
-            return ()
-
-    inspector = SlowlySettlingInspector()
-    sleeps: list[float] = []
-    assert ledger._settle_prior_guardian_terminal_clean(
-        run_id="run-1",
-        launch_intent_sha256="d" * 64,
-        inspector=inspector,
-        wall_deadline=1_021.0,
-        monotonic_deadline=2_021.0,
-        clock_sampler=lambda: (1_001.0, 2_001.0),
-        settle_sleep=sleeps.append,
-    )
-    assert len(sleeps) > 201
-    assert inspector.membership_calls > 205
-
-
 def test_guardian_prior_terminal_settle_stops_at_earliest_clock_deadline(
     ledger: hotjoin.ConversationLedger,
 ) -> None:
@@ -19876,14 +19823,14 @@ def test_private_opaque_real_codex_binary_stream_attestation_is_zero_model() -> 
     if not codex.is_file():
         pytest.skip("desktop Codex binary is not installed")
     expected_sha256 = (
-        "7645c3caf5607e4528eb3a15b12496c2"
-        "84c2a918939aed34e863c760c1b421e7"
+        "10afbeddd6f951635d8fcfbb337034d3"
+        "7934bb3495c16d053b3560d75747619b"
     )
 
     attestation = hotjoin._attest_readonly_executable(codex, expected_sha256)
 
     assert attestation["sha256"] == expected_sha256
-    assert attestation["size"] == 212_613_840
+    assert attestation["size"] == 220_603_584
     assert attestation["path"] == str(codex)
 
 
@@ -19895,8 +19842,8 @@ def test_private_opaque_manifest_allows_only_frozen_paid_probe_command(
     if not codex.is_file():
         pytest.skip("desktop Codex binary is not installed")
     codex_sha256 = (
-        "7645c3caf5607e4528eb3a15b12496c2"
-        "84c2a918939aed34e863c760c1b421e7"
+        "10afbeddd6f951635d8fcfbb337034d3"
+        "7934bb3495c16d053b3560d75747619b"
     )
     prompt = """This is a paid Guardian transport staging probe, not a request to solve or claim progress on the full open Chowla problem.
 
@@ -20024,7 +19971,7 @@ You may use local read-only shell/Python for the `q=7` arithmetic. Do not use th
     private_adapter.write_text(private_source, encoding="utf-8")
     private_adapter_sha256 = hashlib.sha256(private_adapter.read_bytes()).hexdigest()
     assert private_adapter_sha256 == (
-        "8847561dd4232a15a88feb1b818fa3d3f2984d27d097821f8bdf6b48e22addbe"
+        "014f1fc38246384c4b923b9e4470290f9d0991b721b4a0a8e5540e2ae255e518"
     )
 
     monkeypatch.setattr(hotjoin, "__file__", str(private_adapter))
