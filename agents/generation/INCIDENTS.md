@@ -920,3 +920,33 @@ an incident.
   enumeration followed by an exact empty proof and require one bounded poll;
   a separate test advances the monotonic clock first and requires immediate
   refusal. The complete hot-join contract file passes 430 tests.
+
+## 2026-08-20: reviewed epoch started but retained the handoff gate
+
+- **Classification:** post-review rehydration contract mismatch; fixed. The
+  fresh epoch and paid turn started under their exact Guardian, but the model
+  correctly stopped without mathematical work when the host envelope still
+  advertised a paid-disabled action.
+- **Trigger:** the isolated high-effort T+10 smoke resumed its validated first
+  review handoff into epoch 2. Capability revision 3, the same-cycle Guardian,
+  a new app-server thread, the new turn, and `context_rehydrate_turn_bound`
+  all committed successfully.
+- **Observed effect:** the rehydrated turn returned after 42 seconds. Its
+  optional `context_handoff_get` failed because the adapter returned numeric
+  `binding.thread_epoch` while the MCP client and environment contract require
+  a string. Independently, `cadence_cycles.allowed_action` remained
+  `post_review_handoff_required` after the turn binding instead of restoring
+  the official yellow decision's `one_bounded_cycle_on_fatal_doubt`. The
+  wrapper therefore exited `70` before a second root or second reviewer.
+- **Remediation:** the host now derives the hidden post-review action from the
+  latest exact official decision and route transition. The pending envelope
+  advertises that derived action, and the fresh-turn binding restores it in
+  the same transaction that binds thread, turn, handoff, cadence actions, and
+  context guard. Green and yellow must match their fixed actions; red requires
+  the exact published fallback route. Handoff binding projections now encode
+  `thread_epoch` as the string required by the MCP protocol, including the
+  adapter-side active-binding comparison.
+- **Regression evidence:** the existing isolated review-drive test now
+  consumes the handoff, binds epoch 2, asserts the restored green action, and
+  checks the string epoch projection. The review client content-addressed GET
+  test and private manifest pin also pass.

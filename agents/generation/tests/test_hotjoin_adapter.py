@@ -6069,6 +6069,7 @@ def test_owner_review_drive_real_isolated_subprocess_is_terminal_bound_and_idemp
     # boundary.
     rollover = ledger.pending_context_rollover("run-1")
     assert rollover is not None
+    assert rollover["host_allowed_action"] == "continue_to_next_milestone"
     expected_content_json = hotjoin._canonical_json(rollover["content"])
     old_cycle = post["review_cadence"]
     rpc = _RpcStub()
@@ -6178,6 +6179,9 @@ def test_owner_review_drive_real_isolated_subprocess_is_terminal_bound_and_idemp
     after = ledger.cadence_control_state("run-1")
     assert after["review_cadence"]["cycle_id"] == old_cycle["cycle_id"]
     assert after["review_cadence"]["started_at_epoch"] == old_cycle["started_at_epoch"]
+    assert after["review_cadence"]["allowed_action"] == (
+        "continue_to_next_milestone"
+    )
     with ledger._connect() as connection:
         epochs = connection.execute(
             "SELECT thread_epoch, thread_id, state FROM thread_epochs "
@@ -6195,6 +6199,8 @@ def test_owner_review_drive_real_isolated_subprocess_is_terminal_bound_and_idemp
         (2, "thread-2", "active"),
     ]
     assert rebound is not None and rebound["rehydrate_turn_id"] == "turn-2"
+    binding = hotjoin._context_handoff_binding(ledger, dict(rebound))
+    assert binding is not None and binding["thread_epoch"] == "2"
 
 
 def test_unreleased_guardian_rejects_direct_review_drive_before_any_paid_helper(
@@ -19834,7 +19840,7 @@ You may use local read-only shell/Python for the `q=7` arithmetic. Do not use th
     private_adapter.write_text(private_source, encoding="utf-8")
     private_adapter_sha256 = hashlib.sha256(private_adapter.read_bytes()).hexdigest()
     assert private_adapter_sha256 == (
-        "b5c8ad1602a15c8981ab6c2032d7243be514f8596d3e7077ccdbd3f812cd0e28"
+        "131e09dc2fc0f34c25425d76b80aaf75df2efe4ddd112e556fffa56968ee6e36"
     )
 
     monkeypatch.setattr(hotjoin, "__file__", str(private_adapter))

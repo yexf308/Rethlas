@@ -19001,6 +19001,53 @@ class ConversationLedger:
             "turn_id": guard["expected_turn_id"],
         }
 
+    @staticmethod
+    def _post_review_resume_action_txn(
+        connection: sqlite3.Connection,
+        *,
+        cycle_id: str,
+        active_route_id: str,
+    ) -> str:
+        """Recover the action hidden only while the fresh-epoch gate is open."""
+
+        review = connection.execute(
+            "SELECT * FROM route_reviews WHERE cycle_id = ? AND official = 1 "
+            "AND closed = 1 ORDER BY review_ordinal DESC LIMIT 1",
+            (cycle_id,),
+        ).fetchone()
+        if review is None or review["decision_json"] is None:
+            raise HotJoinError("post-review handoff lacks its official decision")
+        decision = _json_loads_strict(str(review["decision_json"]))
+        if (
+            not isinstance(decision, dict)
+            or decision.get("effective_verdict") != review["effective_verdict"]
+            or decision.get("route_id") != review["route_id"]
+        ):
+            raise HotJoinError("post-review handoff decision is not exact")
+        if decision["effective_verdict"] in {"green", "yellow"}:
+            action = decision.get("allowed_action")
+            expected = {
+                "green": "continue_to_next_milestone",
+                "yellow": "one_bounded_cycle_on_fatal_doubt",
+            }[str(decision["effective_verdict"])]
+            if action != expected or active_route_id != decision["route_id"]:
+                raise HotJoinError("post-review handoff action conflicts with verdict")
+            return expected
+        transition = _json_loads_strict(str(review["route_transition_json"]))
+        next_route_id = (
+            transition.get("next_route_id")
+            if isinstance(transition, dict)
+            else None
+        )
+        if (
+            decision.get("effective_verdict") != "red"
+            or not isinstance(next_route_id, str)
+            or not next_route_id
+            or active_route_id != next_route_id
+        ):
+            raise HotJoinError("post-review red handoff lacks its exact fallback")
+        return "activate_fallback_route:" + next_route_id
+
     def pending_context_rollover(self, run_id: str) -> dict[str, Any] | None:
         with self._connect() as connection:
             run = self._run_row(connection, run_id)
@@ -19034,6 +19081,18 @@ class ConversationLedger:
                 if handoff is not None and handoff["cycle_id"] is not None
                 else None
             )
+            resume_action = (
+                self._post_review_resume_action_txn(
+                    connection,
+                    cycle_id=str(handoff["cycle_id"]),
+                    active_route_id=str(cycle["active_route_id"]),
+                )
+                if handoff is not None
+                and handoff["purpose"] == "context_guard"
+                and cycle is not None
+                and cycle["allowed_action"] == "post_review_handoff_required"
+                else None
+            )
         if guard is None or guard["state"] != "rollover_ready":
             return None
         if (
@@ -19064,7 +19123,9 @@ class ConversationLedger:
                 cycle["active_route_id"] if cycle is not None else None
             ),
             "host_allowed_action": (
-                cycle["allowed_action"] if cycle is not None else None
+                resume_action
+                if resume_action is not None
+                else (cycle["allowed_action"] if cycle is not None else None)
             ),
             "host_consumed": pending["state"] == "active",
             "purpose": handoff["purpose"],
@@ -19805,6 +19866,17 @@ class ConversationLedger:
                     )
             else:
                 cycle = old_cycle
+            reviewed_resume_action = None
+            if (
+                handoff["purpose"] == "context_guard"
+                and cycle is not None
+                and cycle["allowed_action"] == "post_review_handoff_required"
+            ):
+                reviewed_resume_action = self._post_review_resume_action_txn(
+                    connection,
+                    cycle_id=str(cycle["cycle_id"]),
+                    active_route_id=str(cycle["active_route_id"]),
+                )
             if cycle is not None:
                 ambiguous = connection.execute(
                     """
@@ -19839,6 +19911,7 @@ class ConversationLedger:
                     "thread_epoch": epoch["thread_epoch"],
                     "thread_id": new_thread_id,
                     "turn_id": new_turn_id,
+                    "restored_allowed_action": reviewed_resume_action,
                 },
             )
             connection.execute(
@@ -19860,8 +19933,15 @@ class ConversationLedger:
             if cycle is not None:
                 connection.execute(
                     "UPDATE cadence_cycles SET expected_thread_id = ?, "
-                    "expected_turn_id = ?, updated_sequence = ? WHERE cycle_id = ?",
-                    (new_thread_id, new_turn_id, sequence, cycle["cycle_id"]),
+                    "expected_turn_id = ?, allowed_action = COALESCE(?, allowed_action), "
+                    "updated_sequence = ? WHERE cycle_id = ?",
+                    (
+                        new_thread_id,
+                        new_turn_id,
+                        reviewed_resume_action,
+                        sequence,
+                        cycle["cycle_id"],
+                    ),
                 )
                 connection.execute(
                     """
@@ -27021,7 +27101,7 @@ def _context_handoff_binding(
     return {
         "run_id": row["run_id"],
         "cycle_id": row["cycle_id"],
-        "thread_epoch": int(row["to_epoch"]),
+        "thread_epoch": str(int(row["to_epoch"])),
         "root_thread_id": row["rehydrate_thread_id"],
         "root_turn_id": row["rehydrate_turn_id"],
         "rehydration_state": (
@@ -33011,7 +33091,7 @@ def _bound_handoff_control(
         raise ValueError("context handoff preflight operation is invalid")
     if expected_keys != base_keys:
         expected_binding = {
-            "thread_epoch": int(row["to_epoch"]),
+            "thread_epoch": str(int(row["to_epoch"])),
             "root_thread_id": row["rehydrate_thread_id"],
             "root_turn_id": row["rehydrate_turn_id"],
         }
