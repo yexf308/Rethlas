@@ -88,9 +88,9 @@ def test_safe_three_route_policy_is_machine_readable_and_bounded() -> None:
     policy, text = _policy()
     assert policy == {
         "policy_id": "rethlas_safe_three_route_v1",
-        "default_initial_deep_work_minutes": 30,
+        "default_initial_deep_work_minutes": 60,
         "minimum_initial_deep_work_minutes": 10,
-        "maximum_initial_deep_work_minutes": 90,
+        "maximum_initial_deep_work_minutes": 120,
         "deep_work_minimum_is_soft": True,
         "initial_external_retrieval_calls": 0,
         "collaboration_spawns_before_route_checkpoint": 0,

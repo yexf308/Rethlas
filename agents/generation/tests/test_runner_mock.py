@@ -1009,7 +1009,7 @@ import tomllib
 
 
 REVIEW = {
-    "policy_id": "rethlas_route_review_90m_v1",
+    "policy_id": "rethlas_route_review_150m_v2",
     "clock": "earliest_durable_wall_and_same_boot_monotonic",
     "approved_guardian_launcher_sha256": "__APPROVED_GUARDIAN_LAUNCHER_SHA256__",
     "approved_guardian_sha256": "__APPROVED_GUARDIAN_SHA256__",
@@ -1018,13 +1018,17 @@ REVIEW = {
     "guardian_launch_manifest_schema_sha256": (
         "__GUARDIAN_LAUNCH_MANIFEST_SCHEMA_SHA256__"
     ),
-    "cycle_seconds": 5400,
-    "review_1_due_seconds": 1800,
-    "review_1_deadline_seconds": 2100,
-    "review_2_due_seconds": 3600,
-    "review_2_deadline_seconds": 3900,
-    "close_notice_due_seconds": 5220,
-    "hard_stop_due_seconds": 5400,
+    "cycle_seconds": 9000,
+    "review_1_due_seconds": 3600,
+    "review_1_deadline_seconds": 4200,
+    "review_2_due_seconds": 7200,
+    "review_2_deadline_seconds": 7800,
+    "review_boundary_mode": "cooperative_drain_then_deadline_interrupt",
+    "review_drain_grace_seconds": 300,
+    "review_execution_grace_seconds": 300,
+    "review_partial_report_max_bytes": 16384,
+    "close_notice_due_seconds": 8820,
+    "hard_stop_due_seconds": 9000,
     "review_verdicts": ["green", "yellow", "red"],
     "two_yellow_without_progress_is_red": True,
     "review_is_independent": True,
@@ -1942,7 +1946,7 @@ if command == "context-handoff-prepare":
         "last_review", "yellow_streak", "route_frozen",
     }
     content = {
-        "schema_version": "rethlas_context_handoff_v2",
+        "schema_version": "rethlas_context_handoff_v3",
         "purpose": "owner_yield",
         "run_id": assertions["run_id"],
         "problem_id": assertions["problem_id"],
@@ -1950,12 +1954,12 @@ if command == "context-handoff-prepare":
         "statement_sha256": assertions["statement_sha256"],
         "blueprint_sha256": assertions["blueprint_sha256"],
         "cadence": {
-            "phase": "work_0_30",
+            "phase": "work_0_60",
             "cycle_started_at_utc": "2026-08-11T00:00:00+00:00",
-            "minute30_at_utc": "2026-08-11T00:30:00+00:00",
             "minute60_at_utc": "2026-08-11T01:00:00+00:00",
-            "close_at_utc": "2026-08-11T01:27:00+00:00",
-            "hard_stop_at_utc": "2026-08-11T01:30:00+00:00",
+            "minute120_at_utc": "2026-08-11T02:00:00+00:00",
+            "close_at_utc": "2026-08-11T02:27:00+00:00",
+            "hard_stop_at_utc": "2026-08-11T02:30:00+00:00",
         },
         "active_route": proposal["active_route"],
         "last_review": assertions["last_review"],
@@ -2767,7 +2771,7 @@ def test_cadence_policy_without_hotjoin_starts_zero_codex_processes(
         mode="forged",
         extra_environment={
             "MOCK_CODEX_CALLS_FILE": str(codex_calls),
-            "RETHLAS_REVIEW_CADENCE_POLICY": "rethlas_route_review_90m_v1",
+            "RETHLAS_REVIEW_CADENCE_POLICY": "rethlas_route_review_150m_v2",
             "RETHLAS_CONTEXT_GUARD_POLICY": "rethlas_context_guard_v1",
         },
     )
@@ -3249,7 +3253,7 @@ def test_guardian_release_policy_digest_tamper_starts_zero_control_or_paid_work(
     assert not codex_calls.exists()
 
 
-def test_cadence_rejects_ninety_minute_prompt_clock_before_codex(
+def test_cadence_rejects_non_sixty_minute_prompt_clock_before_codex(
     tmp_path: Path,
 ) -> None:
     runner, fake_bin = _make_runner_tree(tmp_path)
@@ -3276,7 +3280,7 @@ def test_cadence_rejects_ninety_minute_prompt_clock_before_codex(
     )
 
     assert completed.returncode == 1
-    assert "must be 30 under rethlas_route_review_90m_v1" in completed.stderr
+    assert "must be 60 under rethlas_route_review_150m_v2" in completed.stderr
     assert not codex_calls.exists()
 
 
@@ -3438,7 +3442,7 @@ def test_clean_early_terminal_gets_one_same_cycle_authorization_without_reset(
     second_prompt = second_arguments[second_arguments.index("--prompt") + 1]
     assert "existing app-server thread epoch" in second_prompt
     assert "original absolute cycle T0" in second_prompt
-    assert "T+30m/T+60m review deadlines" in second_prompt
+    assert "T+60m/T+120m cooperative review drains" in second_prompt
     assert "not a new cycle or a clock reset" in second_prompt
     assert "brand-new app-server thread epoch" not in second_prompt
     _assert_cadence_capabilities_are_fd_only(calls_path, state_path)
@@ -3504,7 +3508,7 @@ def test_same_cycle_short_turns_are_not_truncated_by_max_iterations(
     assert completed.returncode == 1, completed.stdout + completed.stderr
     assert len(_cadence_calls(calls_path, "run-generator")) == 12
     assert len(_cadence_calls(calls_path, "cadence-admit")) == 11
-    assert "finalized T+90m hard stop" in completed.stdout
+    assert "finalized T+150m hard stop" in completed.stdout
     assert "Owner cycle budget" not in completed.stderr
 
 
@@ -4476,7 +4480,7 @@ def test_continue_next_cycle_is_the_only_new_paid_cycle_disposition(
     assert "own durable pre-dispatch T0" in second_prompt
     assert "new absolute review/close/hard-stop deadlines" in second_prompt
     assert "never resets or extends the already closed prior cycle" in second_prompt
-    assert "unchanged T+90m hard stop" not in second_prompt
+    assert "unchanged T+150m hard stop" not in second_prompt
     assert "disposition=hard_stopped_unfinalized" in completed.stderr
     assert "RETHLAS_REVIEW_CONTROL_TOKEN" not in calls_path.read_text(encoding="utf-8")
     for run_call in run_calls:
@@ -4527,7 +4531,7 @@ def test_continue_next_cycle_requires_authenticated_pending_fresh_epoch(
     ("first_disposition", "expected_calls", "expected_text"),
     [
         ("continue_next_cycle", 2, "brand-new app-server thread epoch"),
-        ("hard_stopped", 1, "finalized T+90m hard stop"),
+        ("hard_stopped", 1, "finalized T+150m hard stop"),
     ],
 )
 def test_t90_continues_only_with_t87_validated_handoff(
@@ -4758,7 +4762,7 @@ def test_finalized_hard_stop_is_normal_unsolved_terminal_not_operational_error(
 
     assert completed.returncode == 1, completed.stdout + completed.stderr
     assert len(_cadence_calls(calls_path, "run-generator")) == 1
-    assert "finalized T+90m hard stop" in completed.stdout
+    assert "finalized T+150m hard stop" in completed.stdout
     assert "no additional paid cycle is authorized" in completed.stdout
     assert "state=hard_stopped" in completed.stderr
     assert "operational" not in (completed.stdout + completed.stderr).lower()
@@ -4774,7 +4778,7 @@ def test_finalized_hard_stop_is_normal_unsolved_terminal_not_operational_error(
     )
     assert restarted.returncode == 1, restarted.stdout + restarted.stderr
     assert len(_cadence_calls(calls_path, "run-generator")) == 1
-    assert "already at its finalized T+90m hard stop" in restarted.stderr
+    assert "already at its finalized T+150m hard stop" in restarted.stderr
     assert "No recovery or additional paid cycle is authorized" in restarted.stderr
 
 
@@ -5168,7 +5172,7 @@ def test_runner_ordinary_unfinished_turn_still_advances_to_iteration_limit(
     assert "Reached MAX_ITERATIONS=2" in completed.stderr
 
 
-@pytest.mark.parametrize("invalid_minutes", ("0", "9", "91", "thirty"))
+@pytest.mark.parametrize("invalid_minutes", ("0", "9", "121", "sixty"))
 def test_runner_rejects_invalid_deep_work_window_before_codex(
     tmp_path: Path,
     invalid_minutes: str,

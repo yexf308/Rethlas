@@ -91,12 +91,12 @@ def projection(
     return DeadlineProjection(
         cycle_started_wall_epoch=start,
         cycle_started_monotonic=projected_monotonic - (projected_wall - start),
-        internal_interrupt_wall_epoch=start + 5_395.0,
+        internal_interrupt_wall_epoch=start + 8_995.0,
         internal_interrupt_monotonic=(
-            projected_monotonic - (projected_wall - start) + 5_395.0
+            projected_monotonic - (projected_wall - start) + 8_995.0
         ),
-        hard_stop_wall_epoch=start + 5_400.0,
-        hard_stop_monotonic=(projected_monotonic - (projected_wall - start) + 5_400.0),
+        hard_stop_wall_epoch=start + 9_000.0,
+        hard_stop_monotonic=(projected_monotonic - (projected_wall - start) + 9_000.0),
         projected_wall_epoch=projected_wall,
         projected_monotonic=projected_monotonic,
         boot_identity=boot,
@@ -111,8 +111,8 @@ def imminent_projection(
     hard_wall = now_wall + seconds
     hard_monotonic = now_monotonic + seconds
     return DeadlineProjection(
-        cycle_started_wall_epoch=hard_wall - 5_400.0,
-        cycle_started_monotonic=hard_monotonic - 5_400.0,
+        cycle_started_wall_epoch=hard_wall - 9_000.0,
+        cycle_started_monotonic=hard_monotonic - 9_000.0,
         internal_interrupt_wall_epoch=hard_wall - 5.0,
         internal_interrupt_monotonic=hard_monotonic - 5.0,
         hard_stop_wall_epoch=hard_wall,
@@ -153,20 +153,20 @@ def test_absolute_deadline_maps_to_same_boot_monotonic_without_reset() -> None:
         monotonic_clock=monotonic,
     )
 
-    assert clock.hard_stop_monotonic == 4_550.0
+    assert clock.hard_stop_monotonic == 8_150.0
     assert not clock.interrupt_due()
-    wall.value = 5_495.0
-    monotonic.value = 4_545.0
+    wall.value = 9_095.0
+    monotonic.value = 8_145.0
     assert clock.interrupt_due()
     assert not clock.hard_stop_due()
-    wall.value = 5_500.0
-    monotonic.value = 4_550.0
+    wall.value = 9_100.0
+    monotonic.value = 8_150.0
     assert clock.hard_stop_due()
 
 
 def test_deadline_rejects_missing_t0_shape_and_boot_change() -> None:
-    with pytest.raises(ClockViolation, match="T0 plus 5400"):
-        replace(projection(), hard_stop_wall_epoch=5_499.0)
+    with pytest.raises(ClockViolation, match="T0 plus 9000"):
+        replace(projection(), hard_stop_wall_epoch=9_099.0)
     with pytest.raises(ClockViolation, match="boot identity"):
         GuardianClock(projection(), boot_identity="rebooted")
 
@@ -177,22 +177,22 @@ def test_host_persisted_monotonic_due_cannot_be_rederived_or_extended() -> None:
     with pytest.raises(ClockViolation, match="monotonic hard stop"):
         replace(
             projection(),
-            hard_stop_monotonic=4_551.0,
-            internal_interrupt_monotonic=4_546.0,
+            hard_stop_monotonic=8_151.0,
+            internal_interrupt_monotonic=8_146.0,
         )
 
 
 def test_boundary_wait_is_capped_by_host_deadline_not_poll_interval() -> None:
-    wall = MutableClock(5_394.999)
+    wall = MutableClock(8_994.999)
     monotonic = MutableClock(100.999)
     projected = DeadlineProjection(
         cycle_started_wall_epoch=0.0,
-        cycle_started_monotonic=-5_294.0,
-        internal_interrupt_wall_epoch=5_395.0,
+        cycle_started_monotonic=-8_894.0,
+        internal_interrupt_wall_epoch=8_995.0,
         internal_interrupt_monotonic=101.0,
-        hard_stop_wall_epoch=5_400.0,
+        hard_stop_wall_epoch=9_000.0,
         hard_stop_monotonic=106.0,
-        projected_wall_epoch=5_394.0,
+        projected_wall_epoch=8_994.0,
         projected_monotonic=100.0,
         boot_identity="boot-1",
     )
@@ -276,7 +276,7 @@ def test_forward_wall_correction_is_safe_and_shortens_deadline() -> None:
     monotonic.value += 0.5
 
     assert clock.sample() == (1_056.0, 50.5)
-    assert clock.seconds_until_hard_stop() == pytest.approx(4_444.0)
+    assert clock.seconds_until_hard_stop() == pytest.approx(8_044.0)
 
 
 def test_reused_pid_is_rejected_before_any_signal() -> None:
@@ -1333,7 +1333,7 @@ def test_ordinary_setsid_escape_is_detected_stopped_and_killed(tmp_path: Path) -
 
 
 @pytest.mark.skipif(os.name != "posix", reason="requires POSIX process groups")
-def test_hung_host_poll_cannot_hide_a_new_setsid_escape_past_t90(
+def test_hung_host_poll_cannot_hide_a_new_setsid_escape_past_t150(
     tmp_path: Path,
 ) -> None:
     inspector = SystemProcessInspector()
@@ -1382,21 +1382,21 @@ def test_hung_host_poll_cannot_hide_a_new_setsid_escape_past_t90(
 
 
 @pytest.mark.skipif(os.name != "posix", reason="requires POSIX process groups")
-@pytest.mark.parametrize("clock_event", ["wall_crosses_t90", "wall_rolls_back"])
+@pytest.mark.parametrize("clock_event", ["wall_crosses_t150", "wall_rolls_back"])
 def test_hung_callback_is_preempted_by_authoritative_clock_change(
     clock_event: str,
 ) -> None:
     inspector = SystemProcessInspector()
-    wall = MutableClock(5_394.0)
+    wall = MutableClock(8_994.0)
     monotonic = MutableClock(100.0)
     projected = DeadlineProjection(
         0.0,
-        -5_294.0,
-        5_395.0,
+        -8_894.0,
+        8_995.0,
         101.0,
-        5_400.0,
+        9_000.0,
         106.0,
-        5_394.0,
+        8_994.0,
         100.0,
         inspector.boot_identity(),
     )
@@ -1404,7 +1404,7 @@ def test_hung_callback_is_preempted_by_authoritative_clock_change(
 
     class ClockChangingCallbacks(RecordingCallbacks):
         def poll(self, registration_id: str) -> PollSnapshot:
-            if clock_event == "wall_crosses_t90":
+            if clock_event == "wall_crosses_t150":
                 wall.value = projected.hard_stop_wall_epoch
             else:
                 wall.value = (
@@ -1431,7 +1431,7 @@ def test_hung_callback_is_preempted_by_authoritative_clock_change(
             **guardian_kwargs(read_fd),
         )
         assert time.monotonic() - started < 1.0
-        if clock_event == "wall_crosses_t90":
+        if clock_event == "wall_crosses_t150":
             assert report.state == "watchdog_forced"
             assert report.reason == "absolute_hard_stop"
         else:
@@ -1445,7 +1445,7 @@ def test_hung_callback_is_preempted_by_authoritative_clock_change(
 
 
 @pytest.mark.skipif(os.name != "posix", reason="requires POSIX process groups")
-def test_ambiguous_escape_at_t90_can_never_be_reported_watchdog_complete() -> None:
+def test_ambiguous_escape_at_t150_can_never_be_reported_watchdog_complete() -> None:
     delegate = SystemProcessInspector()
     phantom = ProcessIdentity(999_998, os.getuid(), 999_997, "phantom")
 
@@ -1467,28 +1467,28 @@ def test_ambiguous_escape_at_t90_can_never_be_reported_watchdog_complete() -> No
             return (*delegate.descendants(pid), phantom)
 
     inspector = AmbiguousEscapeInspector()
-    wall = MutableClock(5_394.0)
+    wall = MutableClock(8_994.0)
     monotonic = MutableClock(100.0)
     projected = DeadlineProjection(
         0.0,
-        -5_294.0,
-        5_395.0,
+        -8_894.0,
+        8_995.0,
         101.0,
-        5_400.0,
+        9_000.0,
         106.0,
-        5_394.0,
+        8_994.0,
         100.0,
         inspector.boot_identity(),
     )
     release_poll = threading.Event()
 
-    class T90DuringPoll(RecordingCallbacks):
+    class T150DuringPoll(RecordingCallbacks):
         def poll(self, registration_id: str) -> PollSnapshot:
             wall.value = projected.hard_stop_wall_epoch
             release_poll.wait(10)
             return super().poll(registration_id)
 
-    callbacks = T90DuringPoll(projected)
+    callbacks = T150DuringPoll(projected)
     read_fd, write_fd = os.pipe()
     try:
         report = Guardian(
@@ -1682,7 +1682,7 @@ def test_elapsed_hard_stop_before_release_reaps_without_exec(tmp_path: Path) -> 
     now_monotonic = time.monotonic()
     callbacks = RecordingCallbacks(
         projection(
-            start=now_wall - 5_400.0,
+            start=now_wall - 9_000.0,
             projected_wall=now_wall,
             projected_monotonic=now_monotonic,
             boot=inspector.boot_identity(),
@@ -2036,7 +2036,7 @@ def test_durable_worker_return_waits_for_post_poll_candidate_attestation(
     assert callbacks.finalized == [report]
 
 
-def test_worker_rc_cleanup_crossing_t90_is_watchdog_and_not_resignalled(
+def test_worker_rc_cleanup_crossing_t150_is_watchdog_and_not_resignalled(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     uid = os.getuid()
@@ -2943,19 +2943,19 @@ def test_candidate_created_during_poll_can_be_attested_on_next_poll(
 
 
 @pytest.mark.skipif(os.name != "posix", reason="requires POSIX process groups")
-def test_t_minus_five_interrupt_then_t90_stop_kill_without_grace() -> None:
+def test_t_minus_five_interrupt_then_t150_stop_kill_without_grace() -> None:
     inspector = SystemProcessInspector()
     boot = inspector.boot_identity()
-    wall = MutableClock(5_394.0)
+    wall = MutableClock(8_994.0)
     monotonic = MutableClock(100.0)
     projected = DeadlineProjection(
         cycle_started_wall_epoch=0.0,
-        cycle_started_monotonic=-5_294.0,
-        internal_interrupt_wall_epoch=5_395.0,
+        cycle_started_monotonic=-8_894.0,
+        internal_interrupt_wall_epoch=8_995.0,
         internal_interrupt_monotonic=101.0,
-        hard_stop_wall_epoch=5_400.0,
+        hard_stop_wall_epoch=9_000.0,
         hard_stop_monotonic=106.0,
-        projected_wall_epoch=5_394.0,
+        projected_wall_epoch=8_994.0,
         projected_monotonic=100.0,
         boot_identity=boot,
     )
@@ -2984,7 +2984,7 @@ def test_t_minus_five_interrupt_then_t90_stop_kill_without_grace() -> None:
 
 
 @pytest.mark.skipif(os.name != "posix", reason="requires POSIX process groups")
-def test_t90_stops_kills_reaps_and_proves_root_reviewer_verifier_empty() -> None:
+def test_t150_stops_kills_reaps_and_proves_root_reviewer_verifier_empty() -> None:
     inspector = SystemProcessInspector()
     auxiliaries = [
         BlockedProcessGroup.spawn(
@@ -3005,16 +3005,16 @@ def test_t90_stops_kills_reaps_and_proves_root_reviewer_verifier_empty() -> None
         PaidGroup("reviewer", reviewer_identity),
         PaidGroup("verifier", verifier_identity),
     )
-    wall = MutableClock(5_394.0)
+    wall = MutableClock(8_994.0)
     monotonic = MutableClock(100.0)
     projected = DeadlineProjection(
         0.0,
-        -5_294.0,
-        5_395.0,
+        -8_894.0,
+        8_995.0,
         101.0,
-        5_400.0,
+        9_000.0,
         106.0,
-        5_394.0,
+        8_994.0,
         100.0,
         inspector.boot_identity(),
     )
@@ -3054,7 +3054,7 @@ def test_t90_stops_kills_reaps_and_proves_root_reviewer_verifier_empty() -> None
 
 
 @pytest.mark.skipif(os.name != "posix", reason="requires POSIX process groups")
-def test_t90_aux_exit_race_is_proven_empty_while_root_is_still_killed() -> None:
+def test_t150_aux_exit_race_is_proven_empty_while_root_is_still_killed() -> None:
     inspector = SystemProcessInspector()
     auxiliary = BlockedProcessGroup.spawn(
         [sys.executable, "-c", "import time; time.sleep(30)"], inspector=inspector
@@ -3063,16 +3063,16 @@ def test_t90_aux_exit_race_is_proven_empty_while_root_is_still_killed() -> None:
     auxiliary_identity = inspector.identity(auxiliary.leader_pid)
     assert auxiliary_identity is not None
     auxiliary_group = PaidGroup("reviewer", auxiliary_identity)
-    wall = MutableClock(5_394.0)
+    wall = MutableClock(8_994.0)
     monotonic = MutableClock(100.0)
     projected = DeadlineProjection(
         0.0,
-        -5_294.0,
-        5_395.0,
+        -8_894.0,
+        8_995.0,
         101.0,
-        5_400.0,
+        9_000.0,
         106.0,
-        5_394.0,
+        8_994.0,
         100.0,
         inspector.boot_identity(),
     )
@@ -3115,19 +3115,19 @@ def test_t90_aux_exit_race_is_proven_empty_while_root_is_still_killed() -> None:
 
 
 @pytest.mark.skipif(os.name != "posix", reason="requires POSIX process groups")
-def test_post_release_lifeline_eof_is_reported_then_original_t90_is_enforced() -> None:
+def test_post_release_lifeline_eof_is_reported_then_original_t150_is_enforced() -> None:
     inspector = SystemProcessInspector()
-    wall = MutableClock(5_394.0)
+    wall = MutableClock(8_994.0)
     monotonic = MutableClock(100.0)
     callbacks = RecordingCallbacks(
         DeadlineProjection(
             cycle_started_wall_epoch=0.0,
-            cycle_started_monotonic=-5_294.0,
-            internal_interrupt_wall_epoch=5_395.0,
+            cycle_started_monotonic=-8_894.0,
+            internal_interrupt_wall_epoch=8_995.0,
             internal_interrupt_monotonic=101.0,
-            hard_stop_wall_epoch=5_400.0,
+            hard_stop_wall_epoch=9_000.0,
             hard_stop_monotonic=106.0,
-            projected_wall_epoch=5_394.0,
+            projected_wall_epoch=8_994.0,
             projected_monotonic=100.0,
             boot_identity=inspector.boot_identity(),
         ),
@@ -3158,7 +3158,7 @@ def test_post_release_lifeline_eof_is_reported_then_original_t90_is_enforced() -
 
 
 @pytest.mark.skipif(os.name != "posix", reason="requires POSIX process groups")
-def test_detached_guardian_survives_wrapper_sigkill_and_enforces_original_t90(
+def test_detached_guardian_survives_wrapper_sigkill_and_enforces_original_t150(
     tmp_path: Path,
 ) -> None:
     ready_read, ready_write = os.pipe()
@@ -3301,7 +3301,7 @@ def test_host_poll_failure_or_duplicate_equivocation_fails_closed(mode: str) -> 
 
 @pytest.mark.skipif(os.name != "posix", reason="requires POSIX process groups")
 @pytest.mark.parametrize("hung_operation", ["poll", "internal_interrupt"])
-def test_hung_host_callback_cannot_cross_original_t90(hung_operation: str) -> None:
+def test_hung_host_callback_cannot_cross_original_t150(hung_operation: str) -> None:
     inspector = SystemProcessInspector()
     release_hung_callback = threading.Event()
 

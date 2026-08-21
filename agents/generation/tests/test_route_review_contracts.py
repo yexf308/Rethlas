@@ -69,7 +69,7 @@ def fallback_route(*, timestamp: str = "2026-08-10T22:41:00+00:00") -> dict[str,
 
 def snapshot(
     *,
-    cycle: str = "minute30",
+    cycle: str = "minute60",
     route_id: str = "route-singer",
     with_progress: bool = True,
 ) -> dict[str, Any]:
@@ -111,12 +111,12 @@ def snapshot(
             }
         )
     prior = None
-    if cycle == "minute60":
+    if cycle == "minute120":
         prior = {
             "record_id": "mem_prior_review",
             "review_id": "review_" + "0" * 32,
             "cycle_id": "cycle-1",
-            "cycle": "minute30",
+            "cycle": "minute60",
             "review_ordinal": 1,
             "snapshot_sha256": "e" * 64,
             "timestamp_utc": "2026-08-10T23:00:00+00:00",
@@ -174,7 +174,7 @@ def snapshot(
         "problem_id": "frontier/example",
         "cycle_id": "cycle-1",
         "cycle": cycle,
-        "review_ordinal": 1 if cycle == "minute30" else 2,
+        "review_ordinal": 1 if cycle == "minute60" else 2,
         "due_at_utc": "2026-08-10T23:30:00+00:00",
         "root_thread_id": "thread-1",
         "root_turn_id": "turn-1",
@@ -265,12 +265,12 @@ def handoff() -> dict[str, Any]:
         "statement_sha256": STATEMENT_SHA,
         "blueprint_sha256": BLUEPRINT_SHA,
         "cadence": {
-            "phase": "work_60_90",
+            "phase": "work_120_150",
             "cycle_started_at_utc": "2026-08-10T22:29:48+00:00",
-            "minute30_at_utc": "2026-08-10T22:59:48+00:00",
             "minute60_at_utc": "2026-08-10T23:29:48+00:00",
-            "close_at_utc": "2026-08-10T23:56:48+00:00",
-            "hard_stop_at_utc": "2026-08-10T23:59:48+00:00",
+            "minute120_at_utc": "2026-08-11T00:29:48+00:00",
+            "close_at_utc": "2026-08-11T00:56:48+00:00",
+            "hard_stop_at_utc": "2026-08-11T00:59:48+00:00",
         },
         "active_route": {
             "route_id": "route-singer",
@@ -305,7 +305,7 @@ def test_handoff_cadence_uses_one_cycle_start_across_turn_rollovers() -> None:
     first = handoff()
     second = deepcopy(first)
     second["from_thread_epoch"] = "epoch-3"
-    second["cadence"]["phase"] = "work_60_90"
+    second["cadence"]["phase"] = "work_120_150"
 
     normalized_first = contracts.validate_context_handoff(first)
     normalized_second = contracts.validate_context_handoff(second)
@@ -391,7 +391,7 @@ def test_snapshot_binds_active_route_strategy_and_single_fallback_commitment() -
 
 
 def test_snapshot_binds_cycle_and_canonical_progress_body() -> None:
-    wrong_cycle = snapshot(cycle="minute60")
+    wrong_cycle = snapshot(cycle="minute120")
     wrong_cycle["review_ordinal"] = 1
     with pytest.raises(contracts.ReviewContractError, match="ordinal"):
         contracts.validate_review_snapshot(wrong_cycle)
@@ -415,13 +415,13 @@ def test_snapshot_binds_cycle_and_canonical_progress_body() -> None:
     with pytest.raises(contracts.ReviewContractError, match="qualifying progress"):
         contracts.validate_review_snapshot(wrong_kind)
 
-    replayed = snapshot(cycle="minute60")
+    replayed = snapshot(cycle="minute120")
     for records in (replayed["frontier_records"], replayed["progress_records"]):
         records[-1]["timestamp_utc"] = "2026-08-10T22:59:59+00:00"
     with pytest.raises(contracts.ReviewContractError, match="durably newer"):
         contracts.validate_review_snapshot(replayed)
 
-    prior_tamper = snapshot(cycle="minute60")
+    prior_tamper = snapshot(cycle="minute120")
     prior_tamper["prior_official_review"]["report"]["fatal_doubt"]["test"] = (
         "tampered test"
     )
@@ -447,8 +447,8 @@ def test_snapshot_rejects_work_created_after_exact_review_boundary() -> None:
         contracts.validate_review_snapshot(noncanonical)
 
 
-def test_minute60_accepts_current_blueprint_evolution() -> None:
-    evolved = snapshot(cycle="minute60")
+def test_minute120_accepts_current_blueprint_evolution() -> None:
+    evolved = snapshot(cycle="minute120")
     evolved_text = (
         "# lemma lem:singer-floor\n\n## statement\nExact bridge.\n\n"
         "## proof\nStrengthened candidate proof after the first review.\n"
@@ -560,11 +560,11 @@ def test_second_same_route_yellow_without_confirmed_progress_auto_red() -> None:
 
 
 def test_same_route_yellow_streak_survives_cycle_boundary() -> None:
-    prior = deepcopy(snapshot(cycle="minute60")["prior_official_review"])
+    prior = deepcopy(snapshot(cycle="minute120")["prior_official_review"])
     prior.update(
         {
             "cycle_id": "cycle-previous",
-            "cycle": "minute60",
+            "cycle": "minute120",
             "review_ordinal": 2,
             "timestamp_utc": "2026-08-10T22:30:00+00:00",
         }
@@ -574,7 +574,7 @@ def test_same_route_yellow_streak_survives_cycle_boundary() -> None:
         contracts.canonical_json_bytes(prior)
     ).hexdigest()
 
-    bound = snapshot(cycle="minute30", with_progress=False)
+    bound = snapshot(cycle="minute60", with_progress=False)
     bound["cycle_id"] = "cycle-current"
     bound["prior_official_review"] = deepcopy(prior)
     normalized = contracts.validate_review_snapshot(bound)
@@ -591,7 +591,7 @@ def test_same_route_yellow_streak_survives_cycle_boundary() -> None:
     assert no_progress["effective_verdict"] == "red"
     assert no_progress["auto_red"] is True
 
-    progressed = snapshot(cycle="minute30", with_progress=True)
+    progressed = snapshot(cycle="minute60", with_progress=True)
     progressed["cycle_id"] = "cycle-current"
     progressed["prior_official_review"] = deepcopy(prior)
     progressed = contracts.validate_review_snapshot(progressed)
@@ -1120,7 +1120,7 @@ def test_context_handoff_is_content_addressed_and_forbids_transcript() -> None:
 
     wrong_clock = deepcopy(content)
     wrong_clock["cadence"]["hard_stop_at_utc"] = "2026-08-11T00:29:48+00:00"
-    with pytest.raises(contracts.ReviewContractError, match="30/60/90"):
+    with pytest.raises(contracts.ReviewContractError, match="60/120/150"):
         contracts.validate_context_handoff(wrong_clock)
 
     generic = deepcopy(content)

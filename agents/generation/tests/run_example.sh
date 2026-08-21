@@ -6,7 +6,7 @@ PROBLEM_FILE="${PROBLEM_FILE:-data/example.md}"
 MODEL="${MODEL:-gpt-5.6-sol}"
 REASONING_EFFORT="${REASONING_EFFORT:-max}"
 MAX_ITERATIONS="${MAX_ITERATIONS:-10}"
-DEEP_WORK_MINUTES="${RETHLAS_DEEP_WORK_MINUTES:-30}"
+DEEP_WORK_MINUTES="${RETHLAS_DEEP_WORK_MINUTES:-60}"
 TIMER_INTERVAL_SECONDS="${TIMER_INTERVAL_SECONDS:-30}"
 RETHLAS_HOTJOIN_RUN_ID="${RETHLAS_HOTJOIN_RUN_ID:-}"
 HOTJOIN_ADAPTER="$(cd "$ROOT_DIR/.." && pwd -P)/hotjoin_adapter.py"
@@ -80,7 +80,7 @@ fi
 # deliberately no free-form timing override: the reviewed offsets and context
 # thresholds are committed by the adapter's immutable policy contract.
 if [[ -n "$RETHLAS_HOTJOIN_RUN_ID" ]]; then
-  REVIEW_CADENCE_POLICY="${REVIEW_CADENCE_POLICY:-rethlas_route_review_90m_v1}"
+  REVIEW_CADENCE_POLICY="${REVIEW_CADENCE_POLICY:-rethlas_route_review_150m_v2}"
   CONTEXT_GUARD_POLICY="${CONTEXT_GUARD_POLICY:-rethlas_context_guard_v1}"
 else
   REVIEW_CADENCE_POLICY="${REVIEW_CADENCE_POLICY:-disabled}"
@@ -88,7 +88,7 @@ else
 fi
 
 case "$REVIEW_CADENCE_POLICY" in
-  disabled|rethlas_route_review_90m_v1) ;;
+  disabled|rethlas_route_review_150m_v2) ;;
   *)
     echo "Unsupported RETHLAS_REVIEW_CADENCE_POLICY: $REVIEW_CADENCE_POLICY" >&2
     exit 1
@@ -106,7 +106,7 @@ if [[ "$REVIEW_CADENCE_POLICY" != disabled || "$CONTEXT_GUARD_POLICY" != disable
     echo "Durable review cadence/context guard require RETHLAS_HOTJOIN_RUN_ID; refusing to start Codex." >&2
     exit 1
   fi
-  if [[ "$REVIEW_CADENCE_POLICY" != rethlas_route_review_90m_v1 \
+  if [[ "$REVIEW_CADENCE_POLICY" != rethlas_route_review_150m_v2 \
      || "$CONTEXT_GUARD_POLICY" != rethlas_context_guard_v1 ]]; then
     echo "Durable review cadence and context guard must be enabled as the fixed policy pair." >&2
     exit 1
@@ -872,23 +872,27 @@ if value["schema_version"] != "rethlas-policy-contract-v1":
     fail("schema mismatch")
 review = value["review_cadence_policy"]
 context = value["context_guard_policy"]
-if not isinstance(review, dict) or review.get("policy_id") != "rethlas_route_review_90m_v1":
+if not isinstance(review, dict) or review.get("policy_id") != "rethlas_route_review_150m_v2":
     fail("review policy identity mismatch")
 if not isinstance(context, dict) or context.get("policy_id") != "rethlas_context_guard_v1":
     fail("context policy identity mismatch")
 if type(review.get("guardian_enforcement_ready")) is not bool:
     fail("guardian_enforcement_ready must be an immutable boolean")
 fixed_review = {
-    "review_1_due_seconds": 1800,
-    "review_1_deadline_seconds": 2100,
-    "review_2_due_seconds": 3600,
-    "review_2_deadline_seconds": 3900,
-    "close_notice_due_seconds": 5220,
-    "hard_stop_due_seconds": 5400,
-    "cycle_seconds": 5400,
+    "review_1_due_seconds": 3600,
+    "review_1_deadline_seconds": 4200,
+    "review_2_due_seconds": 7200,
+    "review_2_deadline_seconds": 7800,
+    "close_notice_due_seconds": 8820,
+    "hard_stop_due_seconds": 9000,
+    "cycle_seconds": 9000,
+    "review_drain_grace_seconds": 300,
+    "review_execution_grace_seconds": 300,
 }
 if any(review.get(name) != expected for name, expected in fixed_review.items()):
-    fail("fixed 30/60/87/90-minute offsets mismatch")
+    fail("fixed 60/120/147/150-minute offsets mismatch")
+if review.get("review_boundary_mode") != "cooperative_drain_then_deadline_interrupt":
+    fail("review boundary mode mismatch")
 if review.get("hard_stop_interrupt_is_expected") is not True:
     fail("hard-stop semantics mismatch")
 for label, policy in (("review", review), ("context", context)):
@@ -1952,13 +1956,13 @@ fi
 
 if ! [[ "$DEEP_WORK_MINUTES" =~ ^[0-9]+$ ]] \
    || [[ "$DEEP_WORK_MINUTES" -lt 10 ]] \
-   || [[ "$DEEP_WORK_MINUTES" -gt 90 ]]; then
-  echo "RETHLAS_DEEP_WORK_MINUTES must be an integer from 10 through 90: $DEEP_WORK_MINUTES" >&2
+   || [[ "$DEEP_WORK_MINUTES" -gt 120 ]]; then
+  echo "RETHLAS_DEEP_WORK_MINUTES must be an integer from 10 through 120: $DEEP_WORK_MINUTES" >&2
   exit 1
 fi
-if [[ "$REVIEW_CADENCE_POLICY" == rethlas_route_review_90m_v1 \
-   && "$DEEP_WORK_MINUTES" -ne 30 ]]; then
-  echo "RETHLAS_DEEP_WORK_MINUTES must be 30 under rethlas_route_review_90m_v1; the durable scheduler owns the fixed 30/60/90-minute cycle." >&2
+if [[ "$REVIEW_CADENCE_POLICY" == rethlas_route_review_150m_v2 \
+   && "$DEEP_WORK_MINUTES" -ne 60 ]]; then
+  echo "RETHLAS_DEEP_WORK_MINUTES must be 60 under rethlas_route_review_150m_v2; the durable scheduler owns the fixed 60/120/150-minute cycle." >&2
   exit 1
 fi
 
@@ -1979,7 +1983,7 @@ unset RETHLAS_GUARDIAN_CYCLE_TOKEN
 unset RETHLAS_RUNNER_CYCLE_TOKEN
 unset RETHLAS_STALE_RECOVERY_TOKEN
 RETHLAS_REVIEW_CONTROL_TOKEN=""
-if [[ "$REVIEW_CADENCE_POLICY" == rethlas_route_review_90m_v1 ]]; then
+if [[ "$REVIEW_CADENCE_POLICY" == rethlas_route_review_150m_v2 ]]; then
   # Keep this raw capability out of argv, policy JSON, the model shell, and the
   # runner's globally exported environment. Only the owner-side adapter,
   # guardian, and review driver receive it on their process invocation. The
@@ -2062,7 +2066,7 @@ mkdir -p "$LOG_DIR"
 # ``*_iter_0.md``.  The protected log root sits outside the model-writable
 # generation workspace beside the durable ledger.
 if [[ -n "$RETHLAS_HOTJOIN_RUN_ID" \
-   && "$REVIEW_CADENCE_POLICY" == rethlas_route_review_90m_v1 ]]; then
+   && "$REVIEW_CADENCE_POLICY" == rethlas_route_review_150m_v2 ]]; then
   ACTIVE_LOG_DIR="$(dirname "$HOTJOIN_DB")/logs/$RETHLAS_HOTJOIN_RUN_ID/invocation_$RETHLAS_GENERATION_CONTROL_TOKEN"
   if ! "$TRUSTED_PYTHON_BIN" -I -B - "$ACTIVE_LOG_DIR" <<'PY'
 import os
@@ -2653,7 +2657,7 @@ TRUSTED_MCP_LOADER_ARGS=(
   mcp.server "$MCP_SERVER_PATH" "$MCP_SERVER_SHA256"
 )
 export RETHLAS_GENERATION_ROOT="$ROOT_DIR"
-if [[ "$REVIEW_CADENCE_POLICY" == rethlas_route_review_90m_v1 ]]; then
+if [[ "$REVIEW_CADENCE_POLICY" == rethlas_route_review_150m_v2 ]]; then
   export RETHLAS_REVIEW_CONTRACT_CLI_PATH="$REVIEW_CONTRACT_CLI_PATH"
   export RETHLAS_REVIEW_CONTRACT_CLI_SHA256="$REVIEW_CONTRACT_CLI_SHA256"
 else
@@ -2685,7 +2689,7 @@ generation_control_resume() {
 
 owner_memory_batch_publication_snapshot() {
   local envelope response canonical
-  if [[ "$REVIEW_CADENCE_POLICY" != rethlas_route_review_90m_v1 ]]; then
+  if [[ "$REVIEW_CADENCE_POLICY" != rethlas_route_review_150m_v2 ]]; then
     echo "Owner memory publication snapshots require the released cadence." >&2
     return 70
   fi
@@ -2760,7 +2764,7 @@ PY
 
 generation_control_receipt() {
   local receipt owner_manifest_snapshot
-  if [[ "$REVIEW_CADENCE_POLICY" == rethlas_route_review_90m_v1 ]]; then
+  if [[ "$REVIEW_CADENCE_POLICY" == rethlas_route_review_150m_v2 ]]; then
     owner_manifest_snapshot="$(
       owner_memory_batch_publication_snapshot
     )" || return 70
@@ -3201,7 +3205,7 @@ PY
   fi
   export RETHLAS_ADVISOR_RECEIPTS_ROOT="$ADVISOR_RECEIPTS_ROOT"
   export RETHLAS_EXPECTED_HOTJOIN_RUN_ID="$RETHLAS_HOTJOIN_RUN_ID"
-  if [[ "$REVIEW_CADENCE_POLICY" == rethlas_route_review_90m_v1 ]]; then
+  if [[ "$REVIEW_CADENCE_POLICY" == rethlas_route_review_150m_v2 ]]; then
     export RETHLAS_REVIEW_ADAPTER_PATH="$HOTJOIN_ADAPTER"
     export RETHLAS_REVIEW_ADAPTER_SHA256="$HOTJOIN_ADAPTER_SHA256"
     export RETHLAS_REVIEW_DB="$HOTJOIN_DB"
@@ -3252,18 +3256,24 @@ if not isinstance(context, dict) or context.get("policy_id") != sys.argv[2]:
 # The runner verifies the safety-critical constants independently. The full
 # object is then content-addressed, so additional descriptive fields cannot
 # drift silently between wrapper and adapter.
-if review.get("review_1_due_seconds") != 1800:
-    fail("first review must be due at exactly T+30m")
-if review.get("review_1_deadline_seconds") != 2100:
-    fail("first review deadline must be exactly T+35m")
-if review.get("review_2_due_seconds") != 3600:
-    fail("second review must be due at exactly T+60m")
-if review.get("review_2_deadline_seconds") != 3900:
-    fail("second review deadline must be exactly T+65m")
-if review.get("close_notice_due_seconds") != 5220:
-    fail("close offset must be exactly T+87m")
-if review.get("hard_stop_due_seconds") != 5400 or review.get("cycle_seconds") != 5400:
-    fail("hard stop must be exactly T+90m")
+if review.get("review_1_due_seconds") != 3600:
+    fail("first review must be due at exactly T+60m")
+if review.get("review_1_deadline_seconds") != 4200:
+    fail("first reviewer deadline must be exactly T+70m")
+if review.get("review_2_due_seconds") != 7200:
+    fail("second review must be due at exactly T+120m")
+if review.get("review_2_deadline_seconds") != 7800:
+    fail("second reviewer deadline must be exactly T+130m")
+if review.get("close_notice_due_seconds") != 8820:
+    fail("close offset must be exactly T+147m")
+if review.get("hard_stop_due_seconds") != 9000 or review.get("cycle_seconds") != 9000:
+    fail("hard stop must be exactly T+150m")
+if review.get("review_boundary_mode") != "cooperative_drain_then_deadline_interrupt":
+    fail("review boundaries must use cooperative drain before forced interruption")
+if review.get("review_drain_grace_seconds") != 300:
+    fail("review drain grace must be exactly five minutes")
+if review.get("review_execution_grace_seconds") != 300:
+    fail("review execution grace must be exactly five minutes")
 if review.get("two_yellow_without_progress_is_red") is not True:
     fail("two-yellow no-progress rule is not enabled")
 if review.get("hard_stop_interrupt_is_expected") is not True:
@@ -3554,8 +3564,8 @@ echo " Problem ID: $problem_rel"
 echo " References: $ref_dir"
 echo " Math Python: $trusted_python_command"
 echo " Max iters:  $MAX_ITERATIONS"
-if [[ "$REVIEW_CADENCE_POLICY" == rethlas_route_review_90m_v1 ]]; then
-  echo " Construction: $DEEP_WORK_MINUTES minutes (durable T0-T+30m interval)"
+if [[ "$REVIEW_CADENCE_POLICY" == rethlas_route_review_150m_v2 ]]; then
+  echo " Construction: $DEEP_WORK_MINUTES minutes (durable T0-T+60m interval)"
 else
   echo " Deep work:  $DEEP_WORK_MINUTES minutes (soft target)"
 fi
@@ -4870,14 +4880,14 @@ START_EPOCH=$(date +%s)
 # rotate into a blocked run. The adapter's persisted cycle T0 and disposition
 # are the only cadence clock/permission authority.
 initial_cadence_disposition=""
-if [[ "$REVIEW_CADENCE_POLICY" == rethlas_route_review_90m_v1 ]]; then
+if [[ "$REVIEW_CADENCE_POLICY" == rethlas_route_review_150m_v2 ]]; then
   initial_projection="$(cadence_control_projection)" || exit 70
   initial_pre_disposition="$(
     cadence_projection_disposition "$initial_projection"
   )" || exit 70
   case "$initial_pre_disposition" in
     hard_stopped)
-      echo "The theorem remains unsolved; durable cadence is already at its finalized T+90m hard stop (state=hard_stopped)." >&2
+      echo "The theorem remains unsolved; durable cadence is already at its finalized T+150m hard stop (state=hard_stopped)." >&2
       echo "No recovery or additional paid cycle is authorized." >&2
       exit 1
       ;;
@@ -5047,7 +5057,7 @@ cadence_guard_cycle_id=""
 cadence_root_invocations_in_cycle=0
 iter=0
 while true; do
-  if [[ "$REVIEW_CADENCE_POLICY" != rethlas_route_review_90m_v1 \
+  if [[ "$REVIEW_CADENCE_POLICY" != rethlas_route_review_150m_v2 \
      && "$iter" -ge "$MAX_ITERATIONS" ]]; then
     break
   fi
@@ -5092,7 +5102,7 @@ while true; do
   cadence_paid_root_invocation=0
   cadence_new_cycle_invocation=0
   cadence_start_cycle_id=""
-  if [[ "$REVIEW_CADENCE_POLICY" == rethlas_route_review_90m_v1 ]]; then
+  if [[ "$REVIEW_CADENCE_POLICY" == rethlas_route_review_150m_v2 ]]; then
     if [[ "$iter" -eq 0 ]]; then
       cadence_stage="initial"
     else
@@ -5110,7 +5120,7 @@ while true; do
     fi
     if [[ "$cadence_start_state" == hard_stopped ]]; then
       cadence_terminal_state="$cadence_start_state"
-      echo "Cadence is already at its finalized T+90m hard stop before iter=$iter; no recovery or additional paid cycle is authorized."
+      echo "Cadence is already at its finalized T+150m hard stop before iter=$iter; no recovery or additional paid cycle is authorized."
       break
     fi
     if [[ "$cadence_start_state" == route_frozen ]]; then
@@ -5180,10 +5190,10 @@ while true; do
   fi
 
   if [[ "$cadence_recovery" -eq 1 ]]; then
-    prompt="Recover only the already-authorized durable scheduler operation for problem_id=${problem_rel} with disposition=${cadence_start_state}. Do not start a new paid turn or a new route cycle. Preserve the existing absolute cycle T0 and T+90m hard stop, finalize the observed terminal state when applicable, and obey review_cadence_policy=${REVIEW_CADENCE_POLICY} plus context_guard_policy=${CONTEXT_GUARD_POLICY}."
+    prompt="Recover only the already-authorized durable scheduler operation for problem_id=${problem_rel} with disposition=${cadence_start_state}. Do not start a new paid turn or a new route cycle. Preserve the existing absolute cycle T0 and T+150m hard stop, finalize the observed terminal state when applicable, and obey review_cadence_policy=${REVIEW_CADENCE_POLICY} plus context_guard_policy=${CONTEXT_GUARD_POLICY}."
     web_mode="disabled"
   elif [[ "$cadence_active_continuation" -eq 1 ]]; then
-    prompt="Continue only the scheduler-authorized active 90-minute route cycle for problem_id=${problem_rel} in its existing app-server thread epoch. Preserve the original absolute cycle T0 and all T+30m/T+60m review deadlines, the T+87m close boundary, and the T+90m hard stop; this clean prior turn terminal created one paid-turn authorization, not a new cycle or a clock reset. Obey the durable allowed action and context guard. If context rollover is required, stop same-thread work and use the authenticated handoff path."
+    prompt="Continue only the scheduler-authorized active 150-minute route cycle for problem_id=${problem_rel} in its existing app-server thread epoch. Preserve the original absolute cycle T0 and the T+60m/T+120m cooperative review drains, the T+147m close boundary, and the T+150m hard stop; this clean prior turn terminal created one paid-turn authorization, not a new cycle or a clock reset. Obey the durable allowed action and context guard. If context rollover is required, stop same-thread work and use the authenticated handoff path."
     web_mode="disabled"
   elif [[ "$cadence_reviewed_epoch_continuation" -eq 1 ]]; then
     # The adapter must replace this marker with its host-generated canonical
@@ -5203,8 +5213,8 @@ while true; do
     fi
   elif [[ "$iter" -eq 0 ]]; then
     prompt="Use AGENTS.md exactly with reasoning_contract=rethlas_safe_three_route_v1 to solve the math problem in ${PROBLEM_FILE}. Use problem_id=${problem_rel}. ${ref_prompt} A trusted math-research runtime is available as both python and python3, with NumPy, SciPy, SymPy, mpmath, and gmpy2 importable. This is iteration 0 in a fresh session. Begin with the protected root route-design phase, with ${DEEP_WORK_MINUTES} minutes as a soft target that must not delay a ready fanout: after reading the authoritative problem and local references, do not initialize or write memory, retrieve externally, update branches, or spawn collaborators until either a complete candidate exists or exactly three materially different, scope-disjoint routes have been screened for duplication, obvious contradiction, and basic viability. If no candidate exists, flush one pre-fanout checkpoint containing the exact three plan ids, mechanisms, scopes, discriminating tests, and exactly one provisional active rethlas_active_route_commitment_v1 for scheduled review. Then spawn exactly three context-free route solvers in one fanout. Children cannot spawn agents or write shared memory, and the root must not pursue a fourth proof route. Necessary local exact, symbolic, or numerical computation is allowed. Any complete candidate preempts the fanout or remaining waits and enters the candidate fast lane for verifier publication. Ignore any pre-existing blueprint_verified.md: only verify_blueprint_service and its trusted receipt can finish this run."
-    if [[ "$REVIEW_CADENCE_POLICY" == rethlas_route_review_90m_v1 ]]; then
-      prompt="${prompt} The trusted owner-side scheduler has started the absolute 90-minute route cycle under review_cadence_policy=${REVIEW_CADENCE_POLICY} and context_guard_policy=${CONTEXT_GUARD_POLICY}; it, not this prompt or your estimate, enforces T+30m/T+60m reviews, T+87m close, context handoff, and the T+90m hard stop."
+    if [[ "$REVIEW_CADENCE_POLICY" == rethlas_route_review_150m_v2 ]]; then
+      prompt="${prompt} The trusted owner-side scheduler has started the absolute 150-minute route cycle under review_cadence_policy=${REVIEW_CADENCE_POLICY} and context_guard_policy=${CONTEXT_GUARD_POLICY}; it, not this prompt or your estimate, enforces T+60m/T+120m cooperative review drains, T+147m close, context handoff, and the T+150m hard stop."
     fi
     web_mode="disabled"
   elif ((iter % 2 == 1)); then
@@ -5234,7 +5244,7 @@ while true; do
   guardian_expected_generation=""
   guardian_expected_clock_sha256=""
   guardian_watchdog_id=""
-  if [[ "$REVIEW_CADENCE_POLICY" == rethlas_route_review_90m_v1 ]]; then
+  if [[ "$REVIEW_CADENCE_POLICY" == rethlas_route_review_150m_v2 ]]; then
     if ! guardian_plan="$(
       guardian_launch_plan "$cadence_start_projection" "$cadence_start_state"
     )"; then
@@ -5308,7 +5318,7 @@ while true; do
     exit 70
   fi
 
-  if [[ "$REVIEW_CADENCE_POLICY" == rethlas_route_review_90m_v1 ]]; then
+  if [[ "$REVIEW_CADENCE_POLICY" == rethlas_route_review_150m_v2 ]]; then
     guardian_command=(
       --db "$HOTJOIN_DB"
       --adapter-path "$HOTJOIN_ADAPTER"
@@ -5408,7 +5418,7 @@ while true; do
   cadence_after_projection=""
   cadence_after_turn=""
   cadence_after_cycle_id=""
-  if [[ "$REVIEW_CADENCE_POLICY" == rethlas_route_review_90m_v1 ]]; then
+  if [[ "$REVIEW_CADENCE_POLICY" == rethlas_route_review_150m_v2 ]]; then
     cadence_after_projection="$(cadence_control_projection)" || exit 70
     cadence_after_cycle_id="$(
       cadence_projection_cycle_id "$cadence_after_projection"
@@ -5444,7 +5454,7 @@ while true; do
     break
   fi
 
-  if [[ "$REVIEW_CADENCE_POLICY" == rethlas_route_review_90m_v1 ]]; then
+  if [[ "$REVIEW_CADENCE_POLICY" == rethlas_route_review_150m_v2 ]]; then
     case "$current_generation_state" in
       running)
         case "$cadence_after_turn" in
@@ -5504,7 +5514,7 @@ while true; do
 
   case "$current_generation_state" in
     running)
-      if [[ "$REVIEW_CADENCE_POLICY" == rethlas_route_review_90m_v1 ]]; then
+      if [[ "$REVIEW_CADENCE_POLICY" == rethlas_route_review_150m_v2 ]]; then
         case "$cadence_after_turn" in
           continue_active_cycle|continue_next_cycle|continue_reviewed_cycle_fresh_epoch)
             ;;
@@ -5516,7 +5526,7 @@ while true; do
             ;;
           hard_stopped)
             cadence_terminal_state="$cadence_after_turn"
-            echo "Cadence reached its finalized T+90m hard stop after iter=$iter; no additional paid cycle is authorized."
+            echo "Cadence reached its finalized T+150m hard stop after iter=$iter; no additional paid cycle is authorized."
             break
             ;;
           route_frozen)
@@ -5554,7 +5564,7 @@ TOTAL=$((END_EPOCH - START_EPOCH))
 printf "\n"
 
 print_total_time() {
-  if [[ "$REVIEW_CADENCE_POLICY" == rethlas_route_review_90m_v1 ]]; then
+  if [[ "$REVIEW_CADENCE_POLICY" == rethlas_route_review_150m_v2 ]]; then
     printf "Wrapper elapsed (display only): %s\n" "$(format_duration "$TOTAL")"
   else
     printf "Total time: %s\n" "$(format_duration "$TOTAL")"

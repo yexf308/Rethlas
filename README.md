@@ -49,9 +49,9 @@ the candidate directly.
   2.x server-class locations.
 - Phase checkpoints use an exact `CallToolResult` envelope and content-addressed
   replay across separate primary and recovery MCP processes.
-- Optional hot-join mode provides an absolute 30/60/90-minute route cycle,
-  independent scheduled reviews, context handoffs, and Guardian process-tree
-  cleanup.
+- Optional hot-join mode provides an absolute 60/120/150-minute route cycle,
+  cooperative review drains, independent scheduled reviews, partial-route
+  preservation, context handoffs, and Guardian process-tree cleanup.
 - Verification uses fresh isolated sessions, adaptive lazy proof context, strict
   schema validation, and atomic publication of `blueprint_verified.md` plus an
   external receipt.
@@ -294,18 +294,18 @@ This script uses the machine-readable `rethlas_safe_three_route_v1` contract:
 
 For a legacy non-hot-join run, the deep-work duration is an instruction-level
 target, not a claim that the runner can measure private model reasoning time.
-Set it from 10 through 90 minutes when a problem calls for a different
+Set it from 10 through 120 minutes when a problem calls for a different
 uninterrupted window:
 
 ```bash
 RETHLAS_DEEP_WORK_MINUTES=45 ./tests/run_example.sh
 ```
 
-Hot-join runs default to the durable `rethlas_route_review_90m_v1` policy. In
-that mode the first construction interval is fixed at 30 minutes and
-`RETHLAS_DEEP_WORK_MINUTES` must remain 30; setting it to 90 does not create a
-reliable 90-minute turn and is rejected before Codex starts. The trusted
-owner-side scheduler enforces the complete 30/60/90-minute cycle described
+Hot-join runs default to the durable `rethlas_route_review_150m_v2` policy. In
+that mode the first construction interval is fixed at 60 minutes and
+`RETHLAS_DEEP_WORK_MINUTES` must remain 60; setting it to 90 does not change
+the committed clock and is rejected before Codex starts. The trusted
+owner-side scheduler enforces the complete 60/120/150-minute cycle described
 below.
 
 The script also:
@@ -341,7 +341,7 @@ The script also:
   policy JSON, log, model shell, or stable generator fingerprint. Instead the
   adapter derives a distinct least-privilege token for each root thread epoch,
   injects only that epoch token into the matching trusted MCP configuration,
-  and revokes it at T+30m/T+60m handoff. The separate capability record may
+  and revokes it at T+60m/T+120m handoff. The separate capability record may
   rotate its master token, temporary helper path, and generation-control
   instance only at a fail-closed wrapper boundary with no live lease,
   unresolved external-effect intent, or pending owner-yield close; its
@@ -357,7 +357,7 @@ The script also:
 - treats checkpoint data and marker files as prepared immutable candidates,
   not as proof of timely publication. The authenticated host records one exact
   accepted-or-rejected publication receipt under the same SQLite writer fence
-  as T+30m/T+60m cadence transitions. Released memory and review projections
+  as T+60m/T+120m cadence transitions. Released memory and review projections
   accept only v3 candidates whose hashes match that registry; unregistered v3
   markers, runtime-created legacy v2 files, and legacy JSONL remain invisible;
   the old `memory_append` and `branch_update` write paths are offline-only and
@@ -373,7 +373,7 @@ The script also:
 Set an explicit run id to replace the generator's `codex exec` transport with
 the durable Codex app-server scheduler. The mathematical skills, reasoning MCP,
 memory files, verifier API, and publication checks are unchanged. Hot-join
-selects `rethlas_route_review_90m_v1` and `rethlas_context_guard_v1` by default:
+selects `rethlas_route_review_150m_v2` and `rethlas_context_guard_v1` by default:
 
 ```bash
 cd agents/generation
@@ -387,24 +387,33 @@ unknown policy preflight starts zero Codex processes. Legacy `codex exec` runs
 remain available only with cadence disabled; they do not claim durable review
 or context scheduling.
 
-#### Durable 90-minute route cycle
+#### Durable 150-minute route cycle
 
 The adapter owns one absolute cycle clock. Prompt wording, model self-timing,
 wrapper restart, review latency, a context handoff, verifier work, or an early
 model return never resets or extends it:
 
-- `T0–T+30m`: free construction on one active route.
-- `T+30m`: a fresh, independent, read-only, tool-free critic receives an
-  immutable bounded snapshot for a three-to-five-minute review. Official close
-  produces a bounded handoff; the next root work segment rehydrates it in a
-  fresh thread epoch while retaining the same cycle `T0`.
-- `T+30m–T+60m`: continue after green, or spend the period only on yellow's one
-  fatal doubt.
-- `T+60m`: a second fresh critic reviews a new snapshot, then hands the final
-  work segment to another fresh root thread epoch without resetting `T0`.
-- `T+60m–T+87m`: final route work; at `T+87m` the scheduler closes and persists
-  the frontier and any required handoff.
-- `T+90m`: unconditional hard stop. It is never extended.
+- `T0–T+60m`: free construction on one active route.
+- `T+60m`: the host sends one cooperative drain to the root. Direct app-server
+  input to multi-agent-v2 children is forbidden, so the root uses native
+  collaboration to ask every already-running proof child in the frozen set to
+  return a bounded complete or explicitly partial report. The root reconciles
+  them and returns cleanly. The critic starts only after the root and
+  descendants are terminal.
+- `T+60m–T+120m`: continue after green, or spend the period only on yellow's
+  one fatal doubt.
+- `T+120m`: the same cooperative drain precedes the second fresh critic.
+- `T+120m–T+147m`: final route work; at `T+147m` the scheduler closes and
+  persists the frontier and any required handoff.
+- `T+150m`: unconditional hard stop. It is never extended.
+
+Each cooperative drain has a five-minute safety deadline. Normal review does
+not interrupt agents. Only a still-live straggler is force-interrupted at the
+deadline. Any emitted child message is content-addressed as a complete or
+`interrupted_partial` report and rehydrated as untrusted scratch, never as
+proof evidence or route authority. The independent critic has its own following
+five-minute deadline, so the first drain/reviewer deadlines are T+65/T+70 and
+the second are T+125/T+130.
 
 Each review answers five questions: the core bridge; premise/target fit;
 material uncertainty reduction in the preceding period; obstruction or
@@ -423,7 +432,7 @@ that review window must leave exactly one active `branch_states` commitment usin
 schema `rethlas_active_route_commitment_v1`, with identical stable `branch_id` and
 `route_id`, the load-bearing `core_bridge`, and a nonempty bounded list of
 concrete obligations. Its registry acceptance time, not a model-supplied file
-timestamp, must precede the boundary. The first commitment is due before T+30m; after an
+timestamp, must precede the boundary. The first commitment is due before T+60m; after an
 official review and fresh-epoch handoff, the continued or host-switched route
 must be committed again before the next review. At most one separately
 evidenced fallback may be precommitted. Before the boundary, exactly three
@@ -431,9 +440,10 @@ host-admitted proof children may explore the three predeclared scope-disjoint
 mechanisms. One route is the provisional active review commitment; the other
 two are exploration roles, not simultaneous active routes. The root may update
 the commitment once by host CAS before the due instant using already returned
-evidence. At the boundary the host locks the last pre-due commitment,
-interrupts root and children, obtains terminal receipts, and only then builds
-the critic snapshot. Post-due route designation is rejected. The scheduled
+evidence. At the boundary the host freezes the proof-lane set and requests
+cooperative terminal reports. It force-interrupts only deadline stragglers,
+seals partial reports, and builds the critic snapshot only after the closure is
+terminal. Post-due route designation is rejected. The scheduled
 critic reviews only that active route. A fallback selected after effective red
 becomes the single active route in the next work segment. Boundary APIs do not
 accept a route id from the model. The
@@ -476,13 +486,13 @@ stop or restart the clock. When durable generation control still says
 authorization for another turn in the same app-server thread epoch. It keeps
 the original `T0`, expires at the next scheduler boundary, and is revalidated
 immediately before dispatch. This same-cycle continuation is not counted as a
-new 90-minute cycle and is not truncated by the wrapper's owner-configured
+new 150-minute cycle and is not truncated by the wrapper's owner-configured
 cycle count. A separate defense-in-depth guard allows at most 128 paid root
 invocations per authenticated durable cycle. It resets only after an initial
 start or `continue_next_cycle` has actually established a different valid
 `cycle_id`; review/context rollovers and clean-turn continuations in the same
 cycle keep accumulating against it. A same-cycle authorization cannot cross an
-official T+30m/T+60m review: after each review close, the next root work segment
+official T+60m/T+120m review: after each review close, the next root work segment
 consumes the review handoff in a fresh thread epoch. Every
 `continue_next_cycle` likewise uses its validated handoff and a fresh thread
 epoch.

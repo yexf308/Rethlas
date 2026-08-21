@@ -33,7 +33,7 @@ from pathlib import Path
 from typing import Protocol
 
 
-REVIEW_CYCLE_SECONDS = 5_400.0
+REVIEW_CYCLE_SECONDS = 9_000.0
 INTERNAL_INTERRUPT_LEAD_SECONDS = 5.0
 MAX_PROJECTION_SKEW_SECONDS = 1.0
 _RELEASE_TOKEN = b"RETHLAS_GUARDIAN_RELEASE_V1\x00"
@@ -286,14 +286,14 @@ class DeadlineProjection:
         if not isinstance(self.boot_identity, str) or not self.boot_identity:
             raise ClockViolation("boot_identity is required")
         if abs((stop - start) - REVIEW_CYCLE_SECONDS) > 1e-6:
-            raise ClockViolation("hard stop is not the original T0 plus 5400 seconds")
+            raise ClockViolation("hard stop is not the original T0 plus 9000 seconds")
         if abs((monotonic_stop - monotonic_start) - REVIEW_CYCLE_SECONDS) > 1e-6:
             raise ClockViolation(
-                "monotonic hard stop is not the original T0 plus 5400 seconds"
+                "monotonic hard stop is not the original T0 plus 9000 seconds"
             )
         if abs(interrupt_wall - (stop - INTERNAL_INTERRUPT_LEAD_SECONDS)) > 1e-6:
             raise ClockViolation(
-                "internal interrupt is not the persisted T89:55 wall deadline"
+                "internal interrupt is not the persisted T149:55 wall deadline"
             )
         if (
             abs(
@@ -302,7 +302,7 @@ class DeadlineProjection:
             > 1e-6
         ):
             raise ClockViolation(
-                "internal interrupt is not the persisted T89:55 monotonic deadline"
+                "internal interrupt is not the persisted T149:55 monotonic deadline"
             )
         wall_remaining = stop - projected_wall
         monotonic_remaining = monotonic_stop - projected_monotonic
@@ -2290,7 +2290,7 @@ class Guardian:
                 child.close_without_release()
                 if child.reap(timeout=1.0) is None:
                     raise IdentityViolation(
-                        "blocked leader did not exit at an elapsed T90"
+                        "blocked leader did not exit at an elapsed T150"
                     )
                 terminal_report = FinalizeReport(
                     registration_id,
@@ -2338,7 +2338,7 @@ class Guardian:
                 if not lifeline_reported and _lifeline_eof(lifeline_fd):
                     # Wrapper death must not kill the detached guardian or
                     # replace the original clock.  Persist the degradation and
-                    # continue independently to the same T90 boundary.
+                    # continue independently to the same T150 boundary.
                     self._call_with_one_exact_replay(
                         lambda: self.callbacks.lifeline_lost(
                             registration_id, request_sha256

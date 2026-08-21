@@ -1,6 +1,6 @@
 ---
 name: route-review
-description: Respond to an official host-scheduled minute-30 or minute-60 route-review notice by freezing a bounded immutable snapshot, waiting for one fresh independent critic, and obeying the host-derived green/yellow/red disposition. Never invoke from self-estimated time.
+description: Respond to an official host-scheduled minute-60 or minute-120 route-review notice by freezing a bounded immutable snapshot, waiting for one fresh independent critic, and obeying the host-derived green/yellow/red disposition. Never invoke from self-estimated time.
 ---
 
 # Independent Route Review
@@ -11,16 +11,19 @@ may execute it only after the durable scheduler has terminalized the exact due
 root turn and derived the review id, cycle, ordinal, route, model, reasoning
 effort, policy digest, and absolute deadline. The model must never estimate
 elapsed time, create an unofficial review id, drive the official publication
-sequence, or treat completion of a yellow cycle as the 90-minute hard stop.
+sequence, or treat completion of a yellow cycle as the 150-minute hard stop.
 
 <!-- rethlas-route-review-policy
 {
-  "policy_id": "rethlas_route_review_90m_v1",
+  "policy_id": "rethlas_route_review_150m_v2",
   "official_cycles": [
-    {"cycle": "minute30", "ordinal": 1, "due_seconds": 1800, "review_deadline_seconds": 2100},
-    {"cycle": "minute60", "ordinal": 2, "due_seconds": 3600, "review_deadline_seconds": 3900}
+    {"cycle": "minute60", "ordinal": 1, "due_seconds": 3600, "review_deadline_seconds": 4200},
+    {"cycle": "minute120", "ordinal": 2, "due_seconds": 7200, "review_deadline_seconds": 7800}
   ],
-  "hard_stop_seconds": 5400,
+  "review_boundary_mode": "cooperative_drain_then_deadline_interrupt",
+  "review_drain_grace_seconds": 300,
+  "review_execution_grace_seconds": 300,
+  "hard_stop_seconds": 9000,
   "reviewer": {
     "independent": true,
     "fresh_session": true,
@@ -43,7 +46,7 @@ sequence, or treat completion of a yellow cycle as the 90-minute hard stop.
   "targeted_verification_can_publish": false,
   "scheduler_is_authoritative_clock": true,
   "execution_unknown_may_auto_retry": false,
-  "continuation_request_at_seconds": 5220
+  "continuation_request_at_seconds": 8820
 }
 -->
 
@@ -62,12 +65,33 @@ bind:
 
 If any binding is missing or disagrees with the current run, do not improvise a
 review. Report the operational mismatch and continue only as the scheduler
-directs. An early self-spawned critic cannot satisfy minute 30 or minute 60.
+directs. An early self-spawned critic cannot satisfy minute 60 or minute 120.
+
+## Cooperative drain before review
+
+At T+60 and T+120 the trusted host does not normally interrupt the root or its
+proof children. It sends one exact `rethlas_review_drain_v1` steer to the root.
+Direct app-server input to multi-agent-v2 children is forbidden, so the root
+must use native collaboration to ask every already-running child in the
+host-frozen proof-lane set to summarize and return. Start no new proof route,
+sub-agent, retrieval, or long computation. Each child immediately returns a
+bounded report containing its assigned plan id, proved claims, failed paths,
+explicitly partial work, and best next test. Partial is a valid terminal report;
+do not conceal it or inflate it into a proof. The root drains those reports,
+persists one post-boundary drain checkpoint for later rehydration, and returns
+cleanly. Its post-due records cannot enter the current official snapshot.
+
+The review deadline five minutes later is only a straggler safety fallback. The
+host force-interrupts a still-live turn at that deadline, seals any emitted
+assistant text as `interrupted_partial`, and keeps it outside proof evidence.
+Fresh-epoch rehydration may receive a content-addressed partial-report bundle as
+untrusted scratch. It does not grant route authority and every claim must be
+checked before promotion.
 
 ## Snapshot contract
 
 At the due notice, stop adding mathematical work long enough to freeze one
-bounded `rethlas_route_review_snapshot_v2` object. The trusted MCP server—not
+bounded `rethlas_route_review_snapshot_v3` object. The trusted MCP server—not
 the model—constructs it from authoritative files and active durable record ids.
 It includes:
 
@@ -80,17 +104,17 @@ It includes:
 - after the exact prior official review cutoff, only records whose durable
   qualifying kind is
   `new_lemma`, `counterexample_excluded`, or `uncertainty_reduction`.
-- at minute 60, the digest-bound same-cycle minute-30 official report and
+- at minute 120, the digest-bound same-cycle minute-60 official report and
   effective decision; at the first review of a later cycle on the same route,
-  the prior cycle's official minute-60 report and decision. Both include exact
+  the prior cycle's official minute-120 report and decision. Both include exact
   cycle/ordinal provenance, fatal doubt/test, milestone, and confirmed progress
   ids.
 
 Every progress record must also appear with the same canonical body in the
 frontier. Every frontier timestamp must be at or before `due_at_utc`; work
-durably created after T30/T60 belongs to the next phase and cannot reset a
+durably created after T60/T120 belongs to the next phase and cannot reset a
 yellow streak. The statement stays fixed, but the current blueprint may
-legitimately evolve between T30 and T60; each review binds its own exact bytes.
+legitimately evolve between T60 and T120; each review binds its own exact bytes.
 Do not include scratch, hidden reasoning, a transcript, tool logs,
 encouragement, or an advisor answer. The snapshot's canonical bytes determine
 its SHA-256; a digest change is a different request.
@@ -99,7 +123,7 @@ The owner-only driver calls `review_frontier_status` in the restricted helper. T
 returns every eligible active non-control reasoning record at or before the
 boundary in one deterministic order, plus the qualifying progress ids and a
 manifest digest; more than 64 frontier or 32 progress records is operationally
-blocked, never silently truncated. Before the first T30 boundary, construction
+blocked, never silently truncated. Before the first T60 boundary, construction
 must have durably written exactly one active
 `rethlas_active_route_commitment_v1` in `branch_states`; it binds the route id,
 active status, bounded core bridge, and obligations. Construction may also
@@ -184,7 +208,7 @@ verdict and allowed action:
   the scheduler's route policy.
 
 Two consecutive official yellow reviews on the same route become effective
-red even across a T90 cycle boundary unless the second critic confirms, by
+red even across a T150 cycle boundary unless the second critic confirms, by
 bound record id, a new lemma,
 counterexample exclusion, or material uncertainty reduction. A route switch or
 confirmed progress resets the streak. The root cannot self-declare progress,
@@ -221,9 +245,9 @@ must exactly match the parsed item committed by the reviewed blueprint. Call
 `verify_review_claim` only for that official ticket. Trusted code durably marks
 the single attempt before dispatch; an ambiguous response is terminal and is
 never paid for twice. The verifier request and receipt bind the host's canonical
-absolute T90 deadline; the verifier service rejects an expired request before
+absolute T150 deadline; the verifier service rejects an expired request before
 model dispatch and caps/kills its child at the earlier of its own limit and
-T90. Its non-publishing receipt is also published with pending and official
+T150. Its non-publishing receipt is also published with pending and official
 acknowledgements before cadence changes. A correct result resumes the original
 effective action; a wrong result freezes the route; an operational or ambiguous
 result remains blocked. The ticket permits targeted,
@@ -237,10 +261,10 @@ When a fresh thread, owner yield, or next cycle is needed, call
 `context_handoff_prepare` with the exact purpose `context_guard`, `owner_yield`,
 or `cycle_close` plus only the bounded route summary, active durable record ids,
 obligations, and next action/test. The authenticated adapter derives the current epoch,
-absolute cycle `cycle_started_at_utc` T0 and T30/T60/T87/T90 cadence,
+absolute cycle `cycle_started_at_utc` T0 and T60/T120/T147/T150 cadence,
 statement/blueprint bindings, official
 review/yellow/frozen state, and real pending verifier/advisor ids. The resulting
-purpose-bound `rethlas_context_handoff_v2` is at most 32 KiB and must not contain a transcript,
+purpose-bound `rethlas_context_handoff_v3` is at most 32 KiB and must not contain a transcript,
 hidden reasoning, message history, or raw tool log.
 
 Before `generation_yield` writes a waiting control record, authenticated host
@@ -251,9 +275,9 @@ The runner's final cadence-close replay binds the same handoff and canonical
 generation-control receipt. A `cycle_close` handoff cannot be reused for owner
 yield, and an `owner_yield` handoff cannot continue a cycle.
 
-For a next cycle, call `route_cycle_close` only in the host-authorized T87–T90
+For a next cycle, call `route_cycle_close` only in the host-authorized T147–T150
 window with the exact handoff id/digest, disposition `continue_next_cycle`, and
-one bounded testable milestone. T90 remains an external hard stop; without a
+one bounded testable milestone. T150 remains an external hard stop; without a
 valid close request the cycle becomes `hard_stopped`.
 
 The host creates an empty fresh thread, retrieves and consumes the exact
@@ -261,7 +285,7 @@ handoff itself, and injects its canonical body into the first turn before that
 turn starts. `context_handoff_get` is optional audit access, not a model-owned
 first-tool gate; `context_handoff_status` is metadata-only. Rollover never
 resets absolute deadlines, yellow streak, route freeze, pending obligations,
-or the 90-minute hard stop. Same-thread compaction is not a substitute for this
+or the 150-minute hard stop. Same-thread compaction is not a substitute for this
 durable handoff.
 
 Rollover also requires a trusted no-live-children attestation. After the epoch

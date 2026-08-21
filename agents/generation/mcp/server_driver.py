@@ -168,10 +168,10 @@ def _prepare(payload: Mapping[str, Any]) -> Mapping[str, Any]:
         raise DriveError("review prepare drive binding is invalid")
     cycle_id = _safe_id(raw["cycle_id"], label="cycle_id")
     cycle = raw["cycle"]
-    if cycle not in {"minute30", "minute60"}:
+    if cycle not in {"minute60", "minute120"}:
         raise DriveError("review cycle is invalid")
     ordinal = raw["review_ordinal"]
-    if type(ordinal) is not int or ordinal != {"minute30": 1, "minute60": 2}[cycle]:
+    if type(ordinal) is not int or ordinal != {"minute60": 1, "minute120": 2}[cycle]:
         raise DriveError("review ordinal is invalid")
     frontier = server.review_frontier_status(
         cycle_id=cycle_id,

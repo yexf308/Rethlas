@@ -675,7 +675,7 @@ def test_offline_terminal_receipt_must_match_durable_registration() -> None:
 
 def _policy_contract() -> tuple[dict[str, object], str, str]:
     review_material = {
-        "policy_id": "rethlas_route_review_90m_v1",
+        "policy_id": "rethlas_route_review_150m_v2",
         "clock": "earliest_durable_wall_and_same_boot_monotonic",
         "guardian_enforcement_ready": True,
         "approved_guardian_launcher_sha256": hashlib.sha256(
@@ -903,10 +903,10 @@ elif command == "guardian-register":
     projection = {
         "cycle_started_wall_epoch": now_wall,
         "cycle_started_monotonic": now_mono,
-        "internal_interrupt_wall_epoch": now_wall + 5395.0,
-        "internal_interrupt_monotonic": now_mono + 5395.0,
-        "hard_stop_wall_epoch": now_wall + 5400.0,
-        "hard_stop_monotonic": now_mono + 5400.0,
+        "internal_interrupt_wall_epoch": now_wall + 8995.0,
+        "internal_interrupt_monotonic": now_mono + 8995.0,
+        "hard_stop_wall_epoch": now_wall + 9000.0,
+        "hard_stop_monotonic": now_mono + 9000.0,
         "projected_wall_epoch": now_wall,
         "projected_monotonic": now_mono,
         "boot_identity": request["boot_identity"],

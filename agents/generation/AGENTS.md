@@ -155,9 +155,9 @@ through the problem-specific paths described above.
 <!-- rethlas-safe-three-route-policy
 {
   "policy_id": "rethlas_safe_three_route_v1",
-  "default_initial_deep_work_minutes": 30,
+  "default_initial_deep_work_minutes": 60,
   "minimum_initial_deep_work_minutes": 10,
-  "maximum_initial_deep_work_minutes": 90,
+  "maximum_initial_deep_work_minutes": 120,
   "deep_work_minimum_is_soft": true,
   "initial_external_retrieval_calls": 0,
   "collaboration_spawns_before_route_checkpoint": 0,
@@ -216,7 +216,7 @@ sentence, tool result, or abandoned micro-idea into a memory record.
 
 Before every scheduled review boundary, the latest pre-due checkpoint for that
 review window must leave one and only one active route commitment in
-`branch_states`. The first such commitment is persisted before T+30m; after an
+`branch_states`. The first such commitment is persisted before T+60m; after an
 official review and fresh-epoch handoff, persist the continued or host-switched
 route commitment before the next boundary. Its outer record is
 exactly
@@ -235,13 +235,21 @@ must bind every child to one plan id at spawn, keep one provisional active
 review commitment, and record the other two as exploration roles rather than
 simultaneous active routes. It may update the active/fallback commitment once
 by host CAS before the due instant using already returned evidence. At the
-boundary the host locks the final pre-due commitment, interrupts the root and
-children, obtains their terminal receipts, and only then constructs the critic
-snapshot. Any post-due attempt to designate or switch the reviewed route is
-rejected. The scheduled critic reviews only the active route, never two
-simultaneous official routes. If effective red causes the host to select the
-exact fallback, it becomes the single active route for the following work
-segment and later official review.
+boundary the host freezes the proof-lane set and sends one cooperative drain to
+the root. Direct app-server input to multi-agent-v2 children is forbidden, so
+the root uses native collaboration to ask every already-running child in that
+frozen set to return a bounded complete or explicitly partial report. The root
+reconciles them, persists a post-boundary drain
+checkpoint for later rehydration, and returns cleanly. Records created after
+the due instant cannot enter the current official review snapshot. The host force-interrupts only a straggler that
+remains live at the five-minute review deadline. Emitted partial text is sealed
+as untrusted scratch and rehydrated later without becoming proof evidence. Only
+after root and descendants are terminal does the host lock the snapshot and
+construct the critic request. Any post-due attempt to designate or switch the
+reviewed route is rejected. The scheduled critic reviews only the active route,
+never two simultaneous official routes. If effective red causes the host to
+select the exact fallback, it becomes the single active route for the following
+work segment and later official review.
 Review-boundary APIs do not accept a model-supplied route id: the
 trusted host selects this durable active commitment and binds its route,
 bridge, obligations, record/batch/timestamp, and canonical commitment digest
@@ -271,13 +279,16 @@ verifier defect that requires mathematical repair.
 
 <!-- rethlas-durable-route-review-policy
 {
-  "review_policy_id": "rethlas_route_review_90m_v1",
+  "review_policy_id": "rethlas_route_review_150m_v2",
   "context_policy_id": "rethlas_context_guard_v1",
   "requires_hotjoin_scheduler": true,
-  "review_due_seconds": [1800, 3600],
-  "review_deadline_seconds": [2100, 3900],
-  "close_notice_due_seconds": 5220,
-  "hard_stop_due_seconds": 5400,
+  "review_due_seconds": [3600, 7200],
+  "review_deadline_seconds": [4200, 7800],
+  "review_boundary_mode": "cooperative_drain_then_deadline_interrupt",
+  "review_drain_grace_seconds": 300,
+  "review_execution_grace_seconds": 300,
+  "close_notice_due_seconds": 8820,
+  "hard_stop_due_seconds": 9000,
   "hard_stop_never_extends": true,
   "critic_is_independent": true,
   "review_is_not_fact_check": true,
@@ -289,7 +300,7 @@ verifier defect that requires mathematical repair.
 }
 -->
 
-When the runner selects `rethlas_route_review_90m_v1`, the owner-side hot-join
+When the runner selects `rethlas_route_review_150m_v2`, the owner-side hot-join
 scheduler, not this prompt and not the model's estimate of elapsed time, owns
 the cycle clock. The cycle has one durable absolute `T0`; wrapper restarts,
 model turns, reviews, context handoffs, retries, and an early model return do
@@ -324,19 +335,19 @@ ledger or rotate a new token into the abandoned active capability.
 
 The fixed boundaries are:
 
-- `T0` through `T+30m`: free construction on the active route.
-- At `T+30m`: a fresh independent critic receives an immutable bounded
-  snapshot and performs a three-to-five-minute route review. After the
+- `T0` through `T+60m`: free construction on the active route.
+- At `T+60m`: the host cooperatively drains root and children, then a fresh
+  independent critic receives the immutable bounded snapshot. After the
   official review closes, rehydrate its bounded handoff in a fresh root thread
   epoch; the cycle `T0` does not change.
-- `T+30m` through `T+60m`: continue after green, or work only on the one fatal
+- `T+60m` through `T+120m`: continue after green, or work only on the one fatal
   doubt named by yellow.
-- At `T+60m`: a second fresh independent critic reviews a new immutable
-  snapshot. Its official close likewise hands the final work segment to a
+- At `T+120m`: the host repeats cooperative drain and a second fresh critic
+  reviews a new immutable snapshot. Its official close likewise hands the final work segment to a
   fresh root thread epoch without resetting the cycle clock.
-- At `T+87m`: close the phase, persist frontier-changing work, and prepare the
+- At `T+147m`: close the phase, persist frontier-changing work, and prepare the
   bounded handoff needed for any later cycle.
-- At `T+90m`: hard stop. Review latency, context maintenance, model claims,
+- At `T+150m`: hard stop. Review latency, context maintenance, model claims,
   verifier work, adapter recovery, and wrapper restart never move this
   deadline.
 
@@ -384,9 +395,9 @@ handoff. Obey the allowed action in that disposition. If an ordinary model
 turn ends cleanly before a boundary, the host may authorize exactly one more
 turn in the same active cycle and same thread epoch; that authorization keeps
 the original absolute `T0` and cannot cross a review or hard-stop deadline.
-Once an official T+30m/T+60m review boundary is crossed, however, further root
+Once an official T+60m/T+120m review boundary is crossed, however, further root
 work requires the review's authenticated handoff and a fresh thread epoch. A
-closed 90-minute cycle can start another paid cycle only after the host has
+closed 150-minute cycle can start another paid cycle only after the host has
 recorded `continue_next_cycle`, authenticated a handoff, and bound a strictly
 newer app-server thread epoch. That next cycle has its own durable
 pre-dispatch `T0` and absolute actions; it neither resets nor extends the

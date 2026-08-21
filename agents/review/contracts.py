@@ -16,8 +16,8 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Mapping
 
 
-REVIEW_SNAPSHOT_SCHEMA = "rethlas_route_review_snapshot_v2"
-CONTEXT_HANDOFF_SCHEMA = "rethlas_context_handoff_v2"
+REVIEW_SNAPSHOT_SCHEMA = "rethlas_route_review_snapshot_v3"
+CONTEXT_HANDOFF_SCHEMA = "rethlas_context_handoff_v3"
 TARGETED_CLAIM_TICKET_SCHEMA = "rethlas_targeted_claim_ticket_v2"
 
 MAX_REVIEW_SNAPSHOT_BYTES = 131_072
@@ -49,8 +49,8 @@ PROBLEM_ID_RE = re.compile(
 RECORD_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
 BATCH_ID_RE = re.compile(r"^batch_[0-9a-f]{64}$")
 
-REVIEW_CYCLES = frozenset({"minute30", "minute60"})
-REVIEW_ORDINAL = {"minute30": 1, "minute60": 2}
+REVIEW_CYCLES = frozenset({"minute60", "minute120"})
+REVIEW_ORDINAL = {"minute60": 1, "minute120": 2}
 REVIEW_VERDICTS = frozenset({"green", "yellow", "red"})
 PROGRESS_KINDS = frozenset(
     {"new_lemma", "counterexample_excluded", "uncertainty_reduction"}
@@ -638,7 +638,7 @@ def validate_review_snapshot(snapshot: Mapping[str, Any]) -> dict[str, Any]:
     cycle_id = _safe_id(raw["cycle_id"], label="review snapshot cycle_id")
     cycle = raw["cycle"]
     if cycle not in REVIEW_CYCLES:
-        raise ReviewContractError("review snapshot cycle must be minute30 or minute60")
+        raise ReviewContractError("review snapshot cycle must be minute60 or minute120")
     ordinal = raw["review_ordinal"]
     if type(ordinal) is not int or ordinal != REVIEW_ORDINAL[cycle]:
         raise ReviewContractError("review ordinal does not match its cadence cycle")
@@ -739,9 +739,9 @@ def validate_review_snapshot(snapshot: Mapping[str, Any]) -> dict[str, Any]:
     prior_raw = raw["prior_official_review"]
     prior_official_review: dict[str, Any] | None
     if prior_raw is None:
-        if cycle == "minute60":
+        if cycle == "minute120":
             raise ReviewContractError(
-                "minute60 requires its same-cycle official minute30 review"
+                "minute120 requires its same-cycle official minute60 review"
             )
         prior_official_review = None
     else:
@@ -853,22 +853,22 @@ def validate_review_snapshot(snapshot: Mapping[str, Any]) -> dict[str, Any]:
             raise ReviewContractError(
                 "prior official review cycle/ordinal binding is invalid"
             )
-        if cycle == "minute60":
+        if cycle == "minute120":
             if (
                 prior_official_review["cycle_id"] != cycle_id
-                or prior_official_review["cycle"] != "minute30"
+                or prior_official_review["cycle"] != "minute60"
                 or prior_official_review["review_ordinal"] != 1
             ):
                 raise ReviewContractError(
-                    "minute60 requires its same-cycle official minute30 review"
+                    "minute120 requires its same-cycle official minute60 review"
                 )
         elif (
             prior_official_review["cycle_id"] == cycle_id
-            or prior_official_review["cycle"] != "minute60"
+            or prior_official_review["cycle"] != "minute120"
             or prior_official_review["review_ordinal"] != 2
         ):
             raise ReviewContractError(
-                "minute30 prior review must be a prior-cycle official minute60 review"
+                "minute60 prior review must be a prior-cycle official minute120 review"
             )
         if prior_route != route_id:
             raise ReviewContractError(
@@ -891,7 +891,7 @@ def validate_review_snapshot(snapshot: Mapping[str, Any]) -> dict[str, Any]:
             for record in progress_records
         ):
             raise ReviewContractError(
-                "minute60 progress must be durably newer than the prior official review"
+                "minute120 progress must be durably newer than the prior official review"
             )
     normalized = {
         "schema_version": REVIEW_SNAPSHOT_SCHEMA,
@@ -1423,15 +1423,22 @@ def validate_context_handoff(handoff: Mapping[str, Any]) -> dict[str, Any]:
         {
             "phase",
             "cycle_started_at_utc",
-            "minute30_at_utc",
             "minute60_at_utc",
+            "minute120_at_utc",
             "close_at_utc",
             "hard_stop_at_utc",
         },
         label="handoff cadence",
     )
     phase = cadence["phase"]
-    if phase not in {"work_0_30", "review_30", "work_30_60", "review_60", "work_60_90", "hard_stop"}:
+    if phase not in {
+        "work_0_60",
+        "review_60",
+        "work_60_120",
+        "review_120",
+        "work_120_150",
+        "hard_stop",
+    }:
         raise ReviewContractError("handoff cadence.phase is invalid")
     normalized_cadence = {
         "phase": phase,
@@ -1439,8 +1446,8 @@ def validate_context_handoff(handoff: Mapping[str, Any]) -> dict[str, Any]:
             key: _bounded_text(cadence[key], label=f"handoff cadence.{key}", max_bytes=64)
             for key in (
                 "cycle_started_at_utc",
-                "minute30_at_utc",
                 "minute60_at_utc",
+                "minute120_at_utc",
                 "close_at_utc",
                 "hard_stop_at_utc",
             )
@@ -1449,8 +1456,8 @@ def validate_context_handoff(handoff: Mapping[str, Any]) -> dict[str, Any]:
     parsed_deadlines: list[datetime] = []
     for key in (
         "cycle_started_at_utc",
-        "minute30_at_utc",
         "minute60_at_utc",
+        "minute120_at_utc",
         "close_at_utc",
         "hard_stop_at_utc",
     ):
@@ -1461,14 +1468,14 @@ def validate_context_handoff(handoff: Mapping[str, Any]) -> dict[str, Any]:
         if parsed.tzinfo is None or parsed.utcoffset() is None:
             raise ReviewContractError(f"handoff cadence.{key} must be timezone-aware")
         parsed_deadlines.append(parsed)
-    started, minute30, minute60, close_at, hard_stop = parsed_deadlines
+    started, minute60, minute120, close_at, hard_stop = parsed_deadlines
     if (
-        (minute30 - started).total_seconds() != 1800
-        or (minute60 - started).total_seconds() != 3600
-        or (close_at - started).total_seconds() != 5220
-        or (hard_stop - started).total_seconds() != 5400
+        (minute60 - started).total_seconds() != 3600
+        or (minute120 - started).total_seconds() != 7200
+        or (close_at - started).total_seconds() != 8820
+        or (hard_stop - started).total_seconds() != 9000
     ):
-        raise ReviewContractError("handoff cadence deadlines do not encode 30/60/90")
+        raise ReviewContractError("handoff cadence deadlines do not encode 60/120/150")
     normalized["cadence"] = normalized_cadence
     active_route = _exact_object(
         raw["active_route"], {"route_id", "core_bridge"}, label="handoff active_route"

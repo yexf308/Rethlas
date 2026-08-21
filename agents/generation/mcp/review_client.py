@@ -1052,9 +1052,9 @@ def review_due_status(
 ) -> dict[str, Any]:
     """Resolve one exact review boundary from authenticated host state."""
 
-    if cycle not in {"minute30", "minute60"} or review_ordinal != {
-        "minute30": 1,
-        "minute60": 2,
+    if cycle not in {"minute60", "minute120"} or review_ordinal != {
+        "minute60": 1,
+        "minute120": 2,
     }[cycle]:
         raise ReviewAdapterError("review due status cadence binding is invalid")
     assertions = {"cycle_id": cycle_id}

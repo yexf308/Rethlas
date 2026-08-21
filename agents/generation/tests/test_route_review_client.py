@@ -102,7 +102,7 @@ def snapshot() -> dict[str, Any]:
         "run_id": "run-1",
         "problem_id": "frontier/example",
         "cycle_id": "cycle-1",
-        "cycle": "minute30",
+        "cycle": "minute60",
         "review_ordinal": 1,
         "due_at_utc": "2026-08-10T23:00:00+00:00",
         "root_thread_id": "thread-1",
@@ -141,12 +141,12 @@ def handoff() -> dict[str, Any]:
         "statement_sha256": "a" * 64,
         "blueprint_sha256": "b" * 64,
         "cadence": {
-            "phase": "work_30_60",
+            "phase": "work_0_60",
             "cycle_started_at_utc": "2026-08-10T22:29:48+00:00",
-            "minute30_at_utc": "2026-08-10T22:59:48+00:00",
             "minute60_at_utc": "2026-08-10T23:29:48+00:00",
-            "close_at_utc": "2026-08-10T23:56:48+00:00",
-            "hard_stop_at_utc": "2026-08-10T23:59:48+00:00",
+            "minute120_at_utc": "2026-08-11T00:29:48+00:00",
+            "close_at_utc": "2026-08-11T00:56:48+00:00",
+            "hard_stop_at_utc": "2026-08-11T00:59:48+00:00",
         },
         "active_route": {"route_id": "route-a", "core_bridge": "Bridge A"},
         "last_review": None,
@@ -371,7 +371,7 @@ def test_owner_host_drive_prepare_derives_manifest_without_model_inputs(
         "schema_version": "rethlas_review_frontier_status_v1",
         "review_id": REVIEW_ID,
         "cycle_id": "cycle-1",
-        "cycle": "minute30",
+        "cycle": "minute60",
         "review_ordinal": 1,
         "due_at_utc": "2026-08-10T23:00:00+00:00",
         "root_thread_id": "thread-1",
@@ -405,7 +405,7 @@ def test_owner_host_drive_prepare_derives_manifest_without_model_inputs(
             "schema_version": server_driver.INPUT_SCHEMA,
             "operation": "prepare",
             "cycle_id": "cycle-1",
-            "cycle": "minute30",
+            "cycle": "minute60",
             "review_ordinal": 1,
         }
     )
@@ -414,7 +414,7 @@ def test_owner_host_drive_prepare_derives_manifest_without_model_inputs(
         {
             "review_id": REVIEW_ID,
             "cycle_id": "cycle-1",
-            "cycle": "minute30",
+            "cycle": "minute60",
             "review_ordinal": 1,
             "frontier_manifest_sha256": "8" * 64,
             "frontier_record_ids": ["mem_1"],
@@ -796,7 +796,7 @@ def test_review_due_status_is_exact_and_host_binds_active_route(
             "operation": "review_due_status",
             "review_id": REVIEW_ID,
             "cycle_id": "cycle-1",
-            "cycle": "minute60",
+            "cycle": "minute120",
             "review_ordinal": 2,
             "due_at_utc": "2026-08-10T23:30:00+00:00",
             "state": "completed",
@@ -809,7 +809,7 @@ def test_review_due_status_is_exact_and_host_binds_active_route(
     monkeypatch.setattr(review_client, "_invoke_adapter", fake_invoke)
     result = review_client.review_due_status(
         cycle_id="cycle-1",
-        cycle="minute60",
+        cycle="minute120",
         review_ordinal=2,
     )
     assert result["due_at_utc"] == "2026-08-10T23:30:00+00:00"
@@ -823,7 +823,7 @@ def test_review_due_status_is_exact_and_host_binds_active_route(
                 "payload": {
                     "operation": "review_due_status",
                     "cycle_id": "cycle-1",
-                    "cycle": "minute60",
+                    "cycle": "minute120",
                     "review_ordinal": 2,
                 },
             },
@@ -837,7 +837,7 @@ def test_review_due_status_is_exact_and_host_binds_active_route(
     with pytest.raises(review_client.ReviewAdapterError, match="canonical UTC"):
         review_client.review_due_status(
             cycle_id="cycle-1",
-            cycle="minute60",
+            cycle="minute120",
             review_ordinal=2,
         )
 
@@ -1795,7 +1795,7 @@ def test_red_fallback_projection_is_durable_and_becomes_next_review_active_route
     monkeypatch.setenv("RETHLAS_EXPECTED_PROBLEM_ID", problem_id)
     replay_frontier, replay_progress = server._trusted_review_frontier_ids(
         cycle_id="cycle-1",
-        cycle="minute30",
+        cycle="minute60",
         due_at_utc="2026-08-10T23:00:00+00:00",
         route_id="route-a",
         current_review_id=REVIEW_ID,
@@ -2262,12 +2262,12 @@ def test_late_targeted_receipt_is_rejected_before_official_review_mutation(
 
     def reject_late(**kwargs: Any) -> dict[str, Any]:
         assert kwargs["publication_receipt"]["publication_state"] == "pending"
-        raise ValueError("T90 already hard-stopped")
+        raise ValueError("T150 already hard-stopped")
 
     monkeypatch.setattr(server, "verify_targeted_claim_service", completed)
     monkeypatch.setattr(server, "_adapter_targeted_verification_commit", reject_late)
 
-    with pytest.raises(ValueError, match="T90"):
+    with pytest.raises(ValueError, match="T150"):
         server.verify_review_claim(
             review_id=REVIEW_ID,
             request_sha256="1" * 64,
@@ -2276,7 +2276,7 @@ def test_late_targeted_receipt_is_rejected_before_official_review_mutation(
     assert calls == 1
     assert state["body"]["targeted_verification"]["state"] == "dispatching"
 
-    with pytest.raises(ValueError, match="T90"):
+    with pytest.raises(ValueError, match="T150"):
         server.verify_review_claim(
             review_id=REVIEW_ID,
             request_sha256="1" * 64,
@@ -2458,7 +2458,7 @@ def test_restricted_review_frontier_is_deterministic_and_pre_boundary(
     records = {
         "mem_old": record(
             "mem_old",
-            "2026-08-10T22:29:59+00:00",
+            "2026-08-10T21:59:59+00:00",
             kind="new_lemma",
         ),
         "mem_new": record(
@@ -2518,7 +2518,7 @@ def test_restricted_review_frontier_is_deterministic_and_pre_boundary(
     )
     status = server.review_frontier_status(
         cycle_id="cycle-1",
-        cycle="minute30",
+        cycle="minute60",
         review_ordinal=1,
     )
     assert status["frontier_record_ids"] == ["mem_new", "mem_plain"]
@@ -2549,7 +2549,7 @@ def test_restricted_review_frontier_is_deterministic_and_pre_boundary(
     )
     first_binding = server.review_frontier_status(
         cycle_id="cycle-1",
-        cycle="minute30",
+        cycle="minute60",
         review_ordinal=1,
     )
     assert first_binding["manifest_sha256"] == digest
@@ -2558,7 +2558,7 @@ def test_restricted_review_frontier_is_deterministic_and_pre_boundary(
         server.route_review_prepare(
             review_id=REVIEW_ID,
             cycle_id="cycle-1",
-            cycle="minute30",
+            cycle="minute60",
             review_ordinal=1,
             frontier_manifest_sha256=digest,
             frontier_record_ids=list(reversed(status["frontier_record_ids"])),
@@ -2581,7 +2581,7 @@ def test_restricted_review_frontier_is_deterministic_and_pre_boundary(
         server.route_review_prepare(
             review_id=REVIEW_ID,
             cycle_id="cycle-1",
-            cycle="minute60",
+            cycle="minute120",
             review_ordinal=2,
             frontier_manifest_sha256="1" * 64,
             frontier_record_ids=[],
@@ -2639,7 +2639,7 @@ def test_frontier_ignores_unbounded_history_but_fails_on_unbounded_current_work(
     )
     frontier, progress = server._trusted_review_frontier_ids(
         cycle_id="cycle-1",
-        cycle="minute30",
+        cycle="minute60",
         due_at_utc="2026-08-10T23:00:00+00:00",
         route_id="route-a",
     )
@@ -2663,7 +2663,7 @@ def test_frontier_ignores_unbounded_history_but_fails_on_unbounded_current_work(
     with pytest.raises(ValueError, match="64-record bound"):
         server._trusted_review_frontier_ids(
             cycle_id="cycle-1",
-            cycle="minute30",
+            cycle="minute60",
             due_at_utc="2026-08-10T23:00:00+00:00",
             route_id="route-a",
         )
@@ -2731,7 +2731,7 @@ def test_pre_due_fallback_evidence_is_visible_but_never_active_route_progress(
     )
     frontier, progress = server._trusted_review_frontier_ids(
         cycle_id="cycle-1",
-        cycle="minute30",
+        cycle="minute60",
         due_at_utc="2026-08-10T23:00:00+00:00",
         route_id="route-a",
     )
@@ -2739,7 +2739,7 @@ def test_pre_due_fallback_evidence_is_visible_but_never_active_route_progress(
     assert progress == []
 
 
-def test_minute60_cutoff_survives_later_targeted_review_supersession(
+def test_minute120_cutoff_survives_later_targeted_review_supersession(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     prior_review_id = "review_" + "0" * 32
@@ -2804,7 +2804,7 @@ def test_minute60_cutoff_survives_later_targeted_review_supersession(
                 "schema_version": server._REVIEW_MEMORY_SCHEMA,
                 "state": "official_published",
                 "cycle_id": "cycle-1",
-                "cycle": "minute30",
+                "cycle": "minute60",
                 "review_ordinal": 1,
                 "review_id": prior_review_id,
                 "snapshot_sha256": "e" * 64,
@@ -2860,7 +2860,7 @@ def test_minute60_cutoff_survives_later_targeted_review_supersession(
     request = server._build_trusted_review_request(
         review_id=REVIEW_ID,
         cycle_id="cycle-1",
-        cycle="minute60",
+        cycle="minute120",
         review_ordinal=2,
         due_at_utc="2026-08-10T23:30:00+00:00",
         root_thread_id="thread-1",
@@ -2886,7 +2886,7 @@ def test_minute60_cutoff_survives_later_targeted_review_supersession(
     assert active_prior["decision"] == prior_decision
 
 
-def test_next_cycle_minute30_uses_prior_cycle_same_route_yellow_cutoff(
+def test_next_cycle_minute60_uses_prior_cycle_same_route_yellow_cutoff(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     prior_review_id = "review_" + "0" * 32
@@ -2947,7 +2947,7 @@ def test_next_cycle_minute30_uses_prior_cycle_same_route_yellow_cutoff(
                 "schema_version": server._REVIEW_MEMORY_SCHEMA,
                 "state": "official_published",
                 "cycle_id": "cycle-previous",
-                "cycle": "minute60",
+                "cycle": "minute120",
                 "review_ordinal": 2,
                 "review_id": prior_review_id,
                 "snapshot_sha256": "e" * 64,
@@ -2985,7 +2985,7 @@ def test_next_cycle_minute30_uses_prior_cycle_same_route_yellow_cutoff(
     )
     frontier, progress = server._trusted_review_frontier_ids(
         cycle_id="cycle-current",
-        cycle="minute30",
+        cycle="minute60",
         due_at_utc="2026-08-10T23:30:00+00:00",
         route_id="route-a",
     )
@@ -2995,13 +2995,13 @@ def test_next_cycle_minute30_uses_prior_cycle_same_route_yellow_cutoff(
     pair = server._prior_official_review_record(
         records,
         cycle_id="cycle-current",
-        cycle="minute30",
+        cycle="minute60",
         route_id="route-a",
     )
     assert pair is not None
     prior = server._prior_official_review_payload(*pair)
     assert prior["cycle_id"] == "cycle-previous"
-    assert prior["cycle"] == "minute60"
+    assert prior["cycle"] == "minute120"
     assert prior["review_ordinal"] == 2
     assert prior["decision"]["yellow_streak"] == 1
 

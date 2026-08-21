@@ -4058,7 +4058,7 @@ def _official_review_record(
             matches.append((dict(record), deepcopy(body)))
     if len(matches) != 1:
         raise ValueError(
-            "minute60 requires exactly one durable official minute30 review"
+            "minute120 requires exactly one durable official minute60 review"
         )
     return matches[0]
 
@@ -4072,9 +4072,9 @@ def _prior_official_review_record(
 ) -> tuple[Dict[str, Any], Dict[str, Any]] | None:
     """Resolve the immutable same-route predecessor across or within cycles."""
 
-    if cycle == "minute60":
+    if cycle == "minute120":
         return _official_review_record(active_records, cycle_id=cycle_id)
-    if cycle != "minute30":
+    if cycle != "minute60":
         raise ValueError("review cycle is invalid")
     candidates: List[tuple[datetime, str, Dict[str, Any], Dict[str, Any]]] = []
     for record in active_records.values():
@@ -4085,7 +4085,7 @@ def _prior_official_review_record(
             or body.get("schema_version") != _REVIEW_MEMORY_SCHEMA
             or body.get("state") != "official_published"
             or body.get("cycle_id") == cycle_id
-            or body.get("cycle") != "minute60"
+            or body.get("cycle") != "minute120"
             or body.get("review_ordinal") != 2
             or not isinstance(decision, dict)
             or decision.get("route_id") != route_id
@@ -4230,12 +4230,12 @@ def _build_trusted_review_request(
         if record["kind"] not in PROGRESS_KINDS:
             raise ValueError("progress id lacks a durable qualifying progress kind")
 
-    if cycle == "minute30" and review_ordinal != 1:
-        raise ValueError("minute30 review ordinal must be 1")
-    if cycle == "minute60" and review_ordinal != 2:
-        raise ValueError("minute60 review ordinal must be 2")
-    if cycle not in {"minute30", "minute60"}:
-        raise ValueError("cycle must be minute30 or minute60")
+    if cycle == "minute60" and review_ordinal != 1:
+        raise ValueError("minute60 review ordinal must be 1")
+    if cycle == "minute120" and review_ordinal != 2:
+        raise ValueError("minute120 review ordinal must be 2")
+    if cycle not in {"minute60", "minute120"}:
+        raise ValueError("cycle must be minute60 or minute120")
     prior_pair = _prior_official_review_record(
         active_records,
         cycle_id=cycle_id,
@@ -4247,7 +4247,7 @@ def _build_trusted_review_request(
     )
 
     snapshot = {
-        "schema_version": "rethlas_route_review_snapshot_v2",
+        "schema_version": "rethlas_route_review_snapshot_v3",
         "run_id": run_id,
         "problem_id": problem_id,
         "cycle_id": cycle_id,
@@ -4314,9 +4314,9 @@ def _trusted_review_frontier_ids(
         active, cycle_id=cycle_id, cycle=cycle, route_id=route_id
     )
     if prior_pair is None:
-        if cycle != "minute30":
-            raise ValueError("minute60 requires its official minute30 cutoff")
-        progress_cutoff = due_at - timedelta(seconds=1800)
+        if cycle != "minute60":
+            raise ValueError("minute120 requires its official minute60 cutoff")
+        progress_cutoff = due_at - timedelta(seconds=3600)
         progress_after = False
     else:
         _prior_record, prior_body = prior_pair
@@ -5637,7 +5637,7 @@ def verify_review_claim(
     deadline = datetime.fromisoformat(admission["verification_deadline_utc"])
     remaining_seconds = int((deadline - datetime.now(timezone.utc)).total_seconds())
     if remaining_seconds <= 0:
-        raise ValueError("targeted verifier has no time remaining before T90")
+        raise ValueError("targeted verifier has no time remaining before T150")
     dispatching_body = deepcopy(body)
     dispatching_body["targeted_verification"]["state"] = "dispatching"
     record, body = _replace_official_review_body(
@@ -5958,7 +5958,7 @@ def route_cycle_close(
     disposition: str,
     next_milestone: Dict[str, Any],
 ) -> Dict[str, Any]:
-    """Request one durable next cycle; the host still owns the T90 interrupt."""
+    """Request one durable next cycle; the host still owns the T150 interrupt."""
 
     status = _adapter_context_handoff_status(
         handoff_id=handoff_id, content_sha256=content_sha256
@@ -6736,7 +6736,7 @@ def build_mcp_app() -> Optional[Any]:
         disposition: str,
         next_milestone: Dict[str, Any],
     ) -> Dict[str, Any]:
-        """Request continuation at T87; T90 remains an external hard stop."""
+        """Request continuation at T147; T150 remains an external hard stop."""
         return route_cycle_close(
             handoff_id=handoff_id,
             content_sha256=content_sha256,
