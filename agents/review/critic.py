@@ -410,6 +410,36 @@ def _bounded_error(error: str | None, default: str) -> str:
     return encoded.decode("utf-8", errors="replace")
 
 
+def _canonicalize_yellow_milestone(value: Any) -> Any:
+    """Derive yellow's redundant milestone from its authoritative fatal doubt.
+
+    The public report contract intentionally remains strict.  This one narrow
+    reviewer-wire normalization prevents harmless model paraphrase from
+    creating two actions: under yellow, only ``fatal_doubt`` has continuation
+    authority, so the host copies that exact object into ``next_milestone``.
+    Missing or malformed objects are left untouched and fail validation.
+    """
+
+    if not isinstance(value, dict) or value.get("verdict") != "yellow":
+        return value
+    answers = value.get("answers")
+    fatal_doubt = value.get("fatal_doubt")
+    milestone = answers.get("next_milestone") if isinstance(answers, dict) else None
+    exact_keys = {"description", "test"}
+    if (
+        not isinstance(answers, dict)
+        or not isinstance(milestone, dict)
+        or set(milestone) != exact_keys
+        or not isinstance(fatal_doubt, dict)
+        or set(fatal_doubt) != exact_keys
+        or not all(isinstance(item, str) for item in fatal_doubt.values())
+    ):
+        return value
+    normalized = deepcopy(value)
+    normalized["answers"]["next_milestone"] = deepcopy(fatal_doubt)
+    return normalized
+
+
 def _execution_envelope(
     request: Mapping[str, Any],
     *,
@@ -498,7 +528,7 @@ def launch_once(
     try:
         parsed = strict_json_loads(observation.output, label="reviewer output")
         report = validate_review_report(
-            parsed,
+            _canonicalize_yellow_milestone(parsed),
             review_id=normalized["review_id"],
             snapshot=normalized["snapshot"],
         )

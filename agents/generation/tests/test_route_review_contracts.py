@@ -908,6 +908,48 @@ def test_malformed_reviewer_output_is_operational_not_red() -> None:
     assert result["retry_allowed"] is False
 
 
+def test_reviewer_boundary_canonicalizes_yellow_milestone_to_fatal_doubt() -> None:
+    bound = snapshot()
+    request = critic.build_review_request(
+        review_id=REVIEW_ID,
+        snapshot=bound,
+        expected_model="gpt-5.6-sol",
+        reasoning_effort="high",
+        policy_sha256=POLICY_SHA,
+    )
+    wire_report = report(bound, verdict="yellow")
+    wire_report["answers"]["next_milestone"] = {
+        "description": "A paraphrased milestone that has no yellow authority.",
+        "test": "A different test that must not become the allowed action.",
+    }
+    with pytest.raises(
+        contracts.ReviewContractError,
+        match="yellow next milestone must be exactly the fatal-doubt test",
+    ):
+        contracts.validate_review_report(
+            wire_report,
+            review_id=REVIEW_ID,
+            snapshot=bound,
+        )
+
+    def completed(_invocation: critic.CriticInvocation) -> critic.LaunchObservation:
+        return critic.LaunchObservation(
+            dispatch_confirmed=True,
+            terminal_observed=True,
+            output=contracts.canonical_json_bytes(wire_report),
+        )
+
+    result = critic.launch_once(request, completed)
+
+    assert result["state"] == "completed"
+    assert result["report"]["answers"]["next_milestone"] == result["report"][
+        "fatal_doubt"
+    ]
+    assert result["report"]["answers"]["next_milestone"] != wire_report["answers"][
+        "next_milestone"
+    ]
+
+
 def test_context_handoff_is_content_addressed_and_forbids_transcript() -> None:
     content = handoff()
     normalized = contracts.validate_context_handoff(content)

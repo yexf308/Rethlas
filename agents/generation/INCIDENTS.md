@@ -997,3 +997,27 @@ an incident.
   the failed live boundary, with the newly persisted cutoff receipt supplied,
   reached `state=prepared` for the same review id and the same two epoch-2
   frontier records without launching a model.
+
+## 2026-08-21: semantically valid yellow critic failed a redundant equality
+
+- **Classification:** stochastic reviewer-wire redundancy; fixed. The critic
+  completed normally and chose yellow, but the review remained fail-closed.
+- **Trigger:** fresh isolated high-effort run
+  `arxivhard-am2606047-guardian-high-review10-epoch2-20260821-05` reached its
+  first scheduled boundary with one active route and a valid immutable
+  snapshot.
+- **Observed effect:** the tool-free critic returned both the required fatal
+  doubt and a next milestone, but paraphrased one of the two redundant objects.
+  Strict validation rejected it with `yellow next milestone must be exactly the
+  fatal-doubt test`. This explains why otherwise equivalent live reviews had
+  appeared to pass intermittently.
+- **Remediation:** the public review-report validator remains strict. At the
+  one fresh-reviewer wire boundary only, yellow now treats `fatal_doubt` as the
+  sole continuation-authoritative object and host-copies it into the redundant
+  `answers.next_milestone` field before validation. Missing, malformed, green,
+  or red fields receive no normalization and still fail closed. The discarded
+  paraphrase cannot broaden the allowed action.
+- **Regression evidence:** direct validation still rejects mismatched yellow
+  objects. A one-shot critic execution with two different objects now completes
+  with an exact canonical report whose milestone equals the fatal doubt; all
+  31 review-contract tests pass in both the main and isolated checkouts.
