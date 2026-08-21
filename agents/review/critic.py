@@ -440,6 +440,35 @@ def _canonicalize_yellow_milestone(value: Any) -> Any:
     return normalized
 
 
+def _canonicalize_reviewer_bindings(
+    value: Any, request: Mapping[str, Any]
+) -> Any:
+    """Fill immutable report bindings and verdict-redundant null fields."""
+
+    if not isinstance(value, dict):
+        return value
+    snapshot = request["snapshot"]
+    normalized = deepcopy(value)
+    normalized["review_id"] = request["review_id"]
+    normalized["snapshot_sha256"] = request["snapshot_sha256"]
+    normalized["route_id"] = snapshot["route_id"]
+    answers = normalized.get("answers")
+    if isinstance(answers, dict):
+        answers["core_bridge"] = snapshot["active_route"]["core_bridge"]
+    verdict = normalized.get("verdict")
+    if verdict == "green":
+        normalized["fatal_doubt"] = None
+        normalized["freeze_reason"] = None
+    elif verdict == "yellow":
+        normalized["freeze_reason"] = None
+    elif verdict == "red":
+        if isinstance(answers, dict):
+            answers["next_milestone"] = None
+        normalized["fatal_doubt"] = None
+        normalized["load_bearing_claim"] = None
+    return normalized
+
+
 def _canonicalize_reviewer_evidence(
     value: Any, snapshot: Mapping[str, Any]
 ) -> Any:
@@ -601,6 +630,7 @@ def launch_once(
         )
     try:
         parsed = strict_json_loads(observation.output, label="reviewer output")
+        parsed = _canonicalize_reviewer_bindings(parsed, normalized)
         parsed = _canonicalize_reviewer_evidence(
             _canonicalize_yellow_milestone(parsed), normalized["snapshot"]
         )

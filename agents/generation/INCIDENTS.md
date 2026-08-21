@@ -1043,8 +1043,8 @@ an incident.
   paraphrase cannot broaden the allowed action.
 - **Regression evidence:** direct validation still rejects mismatched yellow
   objects. A one-shot critic execution with two different objects now completes
-  with an exact canonical report whose milestone equals the fatal doubt; all
-  31 review-contract tests pass in both the main and isolated checkouts.
+  with an exact canonical report whose milestone equals the fatal doubt; the
+  review-contract suite passes in both the main and isolated checkouts.
 - **Evidence-reference follow-up:** the second critic in run
   `arxivhard-am2606047-guardian-high-review10-epoch2-20260821-09` was rejected
   because `obstruction_risk.evidence_ids` cited an id outside its bound
@@ -1054,5 +1054,12 @@ an incident.
   progress onto exact progress id/kind pairs. It never adds a reference; an
   unsupported `reduced` claim is downgraded to `unclear`. Direct public report
   validation remains fail-closed for every out-of-snapshot id. The expanded
-  32-test contract suite covers filtering, deduplication, conservative
+  contract suite covers filtering, deduplication, conservative
   downgrade, and invalid confirmed-progress removal in both checkouts.
+- **Immutable-binding hardening:** the same wire boundary now derives
+  `review_id`, snapshot digest, route id, and the exact active core bridge from
+  the request rather than asking the critic to copy authority fields. It also
+  clears verdict-incompatible redundant fields without inventing a verdict,
+  milestone, fatal doubt, or freeze reason. The public validator still rejects
+  every mismatched direct report. The 33-test suite covers these host-derived
+  bindings in both checkouts.

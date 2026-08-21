@@ -1001,6 +1001,48 @@ def test_reviewer_boundary_projects_evidence_to_bound_snapshot() -> None:
     }
 
 
+def test_reviewer_boundary_derives_immutable_bindings_from_request() -> None:
+    bound = snapshot()
+    request = critic.build_review_request(
+        review_id=REVIEW_ID,
+        snapshot=bound,
+        expected_model="gpt-5.6-sol",
+        reasoning_effort="high",
+        policy_sha256=POLICY_SHA,
+    )
+    wire_report = report(bound, verdict="yellow")
+    wire_report["review_id"] = "review_" + "f" * 32
+    wire_report["snapshot_sha256"] = "f" * 64
+    wire_report["route_id"] = "route-copied-incorrectly"
+    wire_report["answers"]["core_bridge"] = "A paraphrased bridge."
+    wire_report["freeze_reason"] = "A yellow report cannot freeze the route."
+    with pytest.raises(contracts.ReviewContractError, match="review_id binding"):
+        contracts.validate_review_report(
+            wire_report,
+            review_id=REVIEW_ID,
+            snapshot=bound,
+        )
+
+    def completed(_invocation: critic.CriticInvocation) -> critic.LaunchObservation:
+        return critic.LaunchObservation(
+            dispatch_confirmed=True,
+            terminal_observed=True,
+            output=contracts.canonical_json_bytes(wire_report),
+        )
+
+    result = critic.launch_once(request, completed)
+
+    assert result["state"] == "completed"
+    normalized = result["report"]
+    assert normalized["review_id"] == REVIEW_ID
+    assert normalized["snapshot_sha256"] == request["snapshot_sha256"]
+    assert normalized["route_id"] == bound["route_id"]
+    assert normalized["answers"]["core_bridge"] == bound["active_route"][
+        "core_bridge"
+    ]
+    assert normalized["freeze_reason"] is None
+
+
 def test_context_handoff_is_content_addressed_and_forbids_transcript() -> None:
     content = handoff()
     normalized = contracts.validate_context_handoff(content)
