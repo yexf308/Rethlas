@@ -66,9 +66,30 @@ the candidate directly.
   recoverable after SQL/filesystem crash cuts, and rejects noncanonical
   checkpoint inputs before publication.
 
+### Cooperative review-boundary preservation
+
+At T+60m and T+120m, the host freezes the current proof-lane set and steers
+only the root. Codex app-server v2 forbids direct host input to multi-agent-v2
+children, so the root uses native collaboration to request bounded terminal
+reports from the already-running solvers. Normal review does not interrupt
+them. After a five-minute drain window, the host interrupts only children that
+are still live, then content-addresses every complete or partial report. A
+fresh root epoch may receive those reports only as explicitly untrusted
+scratch; they are never proof evidence, a review verdict, or route authority.
+
+This path was exercised with a real network-disabled Codex app-server run under
+an isolated accelerated clock. At the first boundary, two of three children
+returned complete terminal reports and only the remaining straggler was
+interrupted. All three reports were sealed, the first official review returned
+yellow, and the fresh epoch received the exact partial-report bundle. The
+second official review returned red and closed as `route_frozen`. The
+305-event ledger hash chain verified with zero control failures and zero
+quarantines. This smoke validates the RPC/state transitions and preservation
+path; it does not replace a full-duration 150-minute wall-clock soak.
+
 The current release was validated with a real three-solver fanout, a complete
 generation-to-verification publication smoke, and the full repository suite:
-1,135 tests and 56 subtests passed, with one expected skip.
+1,176 tests and 56 subtests passed, with one expected skip.
 
 ## Repository Layout
 
