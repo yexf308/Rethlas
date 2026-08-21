@@ -5367,6 +5367,7 @@ def test_expired_active_authorization_is_superseded_before_turn_rpc(
     clock[0] += 2.0
     rpc = _RpcStub()
     adapter = _leased_adapter(ledger, rpc)
+    adapter.wall_clock = lambda: clock[0]
     adapter.thread_id = "thread-1"
     adapter.pending_cycle_continuation = ledger.pending_cycle_continuation("run-1")
     assert adapter.pending_cycle_continuation is not None
@@ -5392,6 +5393,61 @@ def test_expired_active_authorization_is_superseded_before_turn_rpc(
                 "generation_control_receipt": _generation_control_receipt(),
             },
         )
+
+
+def test_unexpired_active_authorization_dispatches_inside_rpc_timeout_window(
+    ledger: hotjoin.ConversationLedger,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(hotjoin, "_TEST_ALLOW_UNRELEASED_PAID_WORK", True)
+    clock = [10_000.0]
+    monkeypatch.setattr(hotjoin.time, "time", lambda: clock[0])
+    remaining = 25.0
+    started_at = clock[0] - (
+        float(hotjoin.REVIEW_CADENCE_POLICY["review_1_due_seconds"]) - remaining
+    )
+    lease, _cycle = _materialize_cadence_turn(ledger, started_at=started_at)
+    terminal = _turn("turn-1", "completed")
+    ledger.stage_turn_terminal(
+        "run-1", thread_id="thread-1", turn=terminal, lease=lease
+    )
+    ledger.finalize_turn(
+        "run-1",
+        turn_id="turn-1",
+        status="completed",
+        assistant_message="ended inside the RPC timeout window",
+        error=None,
+        terminal_audit=terminal,
+        lease=lease,
+    )
+    token = _bind_continuation_capability(ledger)
+    ledger.release_lease("run-1", lease)
+    monkeypatch.setenv(hotjoin.REVIEW_CONTROL_TOKEN_ENV, token)
+    hotjoin._cadence_admit_control(
+        ledger,
+        {
+            "operation": "continue_active_cycle",
+            "run_id": "run-1",
+            "generation_control_receipt": _generation_control_receipt(),
+        },
+    )
+    rpc = _RpcStub()
+    rpc.add("turn/start", {"turn": _turn("turn-near-due", "inProgress")})
+    adapter = _leased_adapter(ledger, rpc)
+    adapter.wall_clock = lambda: clock[0]
+    adapter.thread_id = "thread-1"
+    adapter.pending_cycle_continuation = ledger.pending_cycle_continuation("run-1")
+
+    assert (
+        adapter._start_turn(
+            adapter._cycle_continuation_prompt() or "missing",
+            "bootstrap:near-due-active",
+            kind="bootstrap",
+        )
+        == "turn-near-due"
+    )
+    assert [method for method, _params in rpc.calls] == ["turn/start"]
+    ledger.release_lease("run-1", adapter._lease())
 
 
 def test_turn_response_after_continuation_expiry_is_unknown_and_never_retried(
@@ -19903,7 +19959,7 @@ You may use local read-only shell/Python for the `q=7` arithmetic. Do not use th
     private_adapter.write_text(private_source, encoding="utf-8")
     private_adapter_sha256 = hashlib.sha256(private_adapter.read_bytes()).hexdigest()
     assert private_adapter_sha256 == (
-        "66c464f5b936d65f6bccc522b1475d8703e8b93431626d364e7e0cbb48987639"
+        "2be62a2fa5bac4dc44e897d153206cfdada3851cae803c65a914158f013ace67"
     )
 
     monkeypatch.setattr(hotjoin, "__file__", str(private_adapter))

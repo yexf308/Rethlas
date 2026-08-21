@@ -7117,9 +7117,8 @@ class ConversationLedger:
                     raise HotJoinError(
                         "turn intent cadence authorization binding changed"
                     )
-                expired = cycle is None or (
-                    now_epoch + DEFAULT_RPC_TIMEOUT_SECONDS
-                    >= float(continuation["expires_at"])
+                expired = cycle is None or now_epoch >= float(
+                    continuation["expires_at"]
                 )
                 if expired:
                     sequence, _, _ = self._append_event(

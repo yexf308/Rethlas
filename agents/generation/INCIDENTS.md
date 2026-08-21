@@ -981,6 +981,17 @@ an incident.
   epoch. A mock end-to-end review, epoch-2 early terminal, owner continuation,
   and second same-epoch root proves that the thread remains epoch 2 and retains
   its handoff rather than being rejected or incremented.
+- **Near-boundary dispatch follow-up:** after several successful short
+  continuations, run
+  `arxivhard-am2606047-guardian-high-review10-epoch2-20260821-12` reserved one
+  final turn while its authorization still had positive time, but rejected it
+  because the old pre-dispatch test added the full 30-second RPC timeout to the
+  current clock. Guardian already owns the absolute review interrupt, and a
+  response that actually crosses expiry is separately marked
+  `delivery_unknown` with no retry. Pre-dispatch expiry now tests the current
+  wall instant only. Paired regressions require a turn with 25 seconds
+  remaining to dispatch, an already expired authorization to make zero RPCs,
+  and a response that crosses expiry to remain unknown and non-retryable.
 
 ## 2026-08-21: second review rejected the first review's immutable cutoff
 
