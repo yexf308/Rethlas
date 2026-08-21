@@ -5772,6 +5772,7 @@ def _publish_control_review(
         {
             **close_base,
             "publication_receipt": publication("pending", "5", 0),
+            "official_cutoff_publication_receipt": None,
         },
         environment,
     )
@@ -5800,11 +5801,14 @@ def _publish_control_review(
                 hotjoin._canonical_json(transition_seed).encode("utf-8")
             ).hexdigest(),
         }
+    official_cutoff = publication("official", "4", 1)
+    official_receipt = publication("official", "6", 2)
     official = _invoke_control_subprocess(
         "review-close",
         {
             **close_base,
-            "publication_receipt": publication("official", "6", 1),
+            "publication_receipt": official_receipt,
+            "official_cutoff_publication_receipt": official_cutoff,
             "route_transition": official_transition,
         },
         environment,
@@ -5831,7 +5835,7 @@ def _publish_control_review(
         ledger.cadence_control_state("run-1")["review_cadence"]["phase"]
         == expected_phase
     )
-    return {**result, "_official_publication_receipt": publication("official", "6", 1)}
+    return {**result, "_official_publication_receipt": official_cutoff}
 
 
 def test_review_drive_one_shot_claim_prevents_concurrent_paid_spawn(
@@ -7142,6 +7146,7 @@ def test_review_control_exact_subprocess_launch_is_fresh_authenticated_and_tool_
         "request_sha256": request["request_sha256"],
         "snapshot_sha256": request["snapshot_sha256"],
         "publication_receipt": receipt("pending", suffix="5", second=3_000),
+        "official_cutoff_publication_receipt": None,
         "route_transition": transition,
     }
     pending_close = _invoke_control_subprocess(
@@ -7161,7 +7166,10 @@ def test_review_control_exact_subprocess_launch_is_fresh_authenticated_and_tool_
 
     official_close_payload = {
         **pending_close_payload,
-        "publication_receipt": receipt("official", suffix="6", second=3_001),
+        "publication_receipt": receipt("official", suffix="6", second=3_002),
+        "official_cutoff_publication_receipt": receipt(
+            "official", suffix="4", second=3_001
+        ),
     }
     official_close = _invoke_control_subprocess(
         "review-close", official_close_payload, environment
@@ -19862,7 +19870,7 @@ You may use local read-only shell/Python for the `q=7` arithmetic. Do not use th
     private_adapter.write_text(private_source, encoding="utf-8")
     private_adapter_sha256 = hashlib.sha256(private_adapter.read_bytes()).hexdigest()
     assert private_adapter_sha256 == (
-        "050089ce32aa91cfb97193d4e4f61b0a6cf428514df3f01ccb2e8b991f617d91"
+        "66c464f5b936d65f6bccc522b1475d8703e8b93431626d364e7e0cbb48987639"
     )
 
     monkeypatch.setattr(hotjoin, "__file__", str(private_adapter))

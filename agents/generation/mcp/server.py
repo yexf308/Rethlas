@@ -4111,8 +4111,20 @@ def _prior_official_review_record(
 def _prior_official_review_payload(
     record: Mapping[str, Any], body: Mapping[str, Any]
 ) -> Dict[str, Any]:
+    cutoff_receipt = body.get("official_published_publication_receipt")
+    if (
+        not isinstance(cutoff_receipt, dict)
+        or cutoff_receipt.get("publication_state") != "official"
+        or cutoff_receipt.get("record_id")
+        != body.get("official_published_record_id")
+        or cutoff_receipt.get("timestamp_utc")
+        != body.get("official_published_timestamp_utc")
+        or cutoff_receipt.get("record_sha256")
+        != body.get("official_published_record_sha256")
+    ):
+        raise ValueError("official review cutoff receipt is inconsistent")
     prior = {
-        "record_id": record["record_id"],
+        "record_id": body["official_published_record_id"],
         "review_id": body["review_id"],
         "cycle_id": body["cycle_id"],
         "cycle": body["cycle"],
@@ -4489,6 +4501,7 @@ def _ensure_immutable_official_cutoff(
         "official_published_record_id",
         "official_published_timestamp_utc",
         "official_published_record_sha256",
+        "official_published_publication_receipt",
     }
     present = fields & set(body)
     if present:
@@ -4505,6 +4518,9 @@ def _ensure_immutable_official_cutoff(
             "official_published_record_sha256": hashlib.sha256(
                 canonical_json_bytes(body)
             ).hexdigest(),
+            "official_published_publication_receipt": deepcopy(
+                dict(publication_receipt)
+            ),
         }
     )
     return _append_review_memory(
@@ -5135,6 +5151,7 @@ def route_review_close(
             request_sha256=request_sha256,
             snapshot_sha256=snapshot_sha256,
             publication_receipt=pending_receipt,
+            official_cutoff_publication_receipt=None,
             route_transition_publication_receipt=None,
             **transition,
         )
@@ -5149,17 +5166,23 @@ def route_review_close(
                 "route_transition": deepcopy(transition),
             }
         )
-        official_receipt = _append_review_memory(
+        official_cutoff_receipt = _append_review_memory(
             problem_id=problem_id,
             body=official_body,
             supersedes=[record["record_id"]],
         )
         official_receipt = _ensure_immutable_official_cutoff(
-            problem_id=problem_id, publication_receipt=official_receipt
+            problem_id=problem_id,
+            publication_receipt=official_cutoff_receipt,
         )
     elif body.get("state") == "official_published":
         if body.get("route_transition") != transition:
             raise ValueError("official route transition cannot change on retry")
+        official_cutoff_receipt = body.get(
+            "official_published_publication_receipt"
+        )
+        if not isinstance(official_cutoff_receipt, dict):
+            raise ValueError("official review lost its immutable cutoff receipt")
         official_receipt = _publication_receipt_for_existing(problem_id, record, body)
     else:
         raise ValueError("review result must be durably published before close")
@@ -5179,6 +5202,7 @@ def route_review_close(
         request_sha256=request_sha256,
         snapshot_sha256=snapshot_sha256,
         publication_receipt=official_receipt,
+        official_cutoff_publication_receipt=official_cutoff_receipt,
         route_transition_publication_receipt=(route_transition_publication_receipt),
         **transition,
     )

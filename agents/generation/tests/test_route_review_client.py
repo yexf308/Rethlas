@@ -1656,6 +1656,10 @@ def test_red_close_uses_only_the_snapshot_committed_fallback(
                 "active_route": active_route(),
                 "fallback_route_candidates": [candidate],
                 "decision": {"effective_verdict": "red"},
+                "official_published_publication_receipt": {
+                    "publication_state": "official",
+                    "record_id": "mem_cutoff",
+                },
                 "route_transition": {
                     "next_route_id": "route-fallback",
                     "fallback_evidence_record_ids": ["mem_1"],
@@ -1920,6 +1924,10 @@ def test_red_close_without_fallback_requires_frozen_projection_before_host_cas(
         "active_route": active_route(),
         "fallback_route_candidates": [],
         "decision": {"effective_verdict": "red"},
+        "official_published_publication_receipt": {
+            "publication_state": "official",
+            "record_id": "mem_cutoff",
+        },
         "route_transition": {
             "next_route_id": None,
             "fallback_evidence_record_ids": [],
@@ -1965,6 +1973,10 @@ def test_red_close_without_fallback_requires_frozen_projection_before_host_cas(
                 "publication_state": "official",
                 "record_id": "mem_official",
             },
+            "official_cutoff_publication_receipt": {
+                "publication_state": "official",
+                "record_id": "mem_cutoff",
+            },
             "route_transition_publication_receipt": frozen_receipt,
             "next_route_id": None,
             "fallback_evidence_record_ids": [],
@@ -2008,6 +2020,11 @@ def test_review_close_transition_receipt_is_exact_and_bound_before_host_call(
         "record_sha256": "6" * 64,
         "publication_state": "official",
     }
+    cutoff_receipt = {
+        **publication_receipt,
+        "record_id": "mem_cutoff",
+        "timestamp_utc": "2026-08-10T22:59:59+00:00",
+    }
     captured: dict[str, Any] = {}
 
     def invoke(command: str, envelope: dict[str, Any], *, timeout_seconds: int):
@@ -2046,11 +2063,29 @@ def test_review_close_transition_receipt_is_exact_and_bound_before_host_call(
         request_sha256="1" * 64,
         snapshot_sha256="2" * 64,
         publication_receipt=publication_receipt,
+        official_cutoff_publication_receipt=cutoff_receipt,
         next_route_id="route-fallback",
         fallback_evidence_record_ids=["mem_1"],
         route_transition_publication_receipt=transition_receipt,
     )
     assert captured["route_transition"]["publication_receipt"] == transition_receipt
+    assert captured["official_cutoff_publication_receipt"] == cutoff_receipt
+
+    late_cutoff = {
+        **cutoff_receipt,
+        "timestamp_utc": "2026-08-10T23:00:01+00:00",
+    }
+    with pytest.raises(review_client.ReviewAdapterError, match="immutable cutoff"):
+        review_client.route_review_close(
+            review_id=REVIEW_ID,
+            request_sha256="1" * 64,
+            snapshot_sha256="2" * 64,
+            publication_receipt=publication_receipt,
+            official_cutoff_publication_receipt=late_cutoff,
+            next_route_id="route-fallback",
+            fallback_evidence_record_ids=["mem_1"],
+            route_transition_publication_receipt=transition_receipt,
+        )
 
     forged = deepcopy(transition_receipt)
     forged["to_route_id"] = "route-invented"
@@ -2060,6 +2095,7 @@ def test_review_close_transition_receipt_is_exact_and_bound_before_host_call(
             request_sha256="1" * 64,
             snapshot_sha256="2" * 64,
             publication_receipt=publication_receipt,
+            official_cutoff_publication_receipt=cutoff_receipt,
             next_route_id="route-fallback",
             fallback_evidence_record_ids=["mem_1"],
             route_transition_publication_receipt=forged,
@@ -2081,6 +2117,7 @@ def test_review_close_transition_receipt_is_exact_and_bound_before_host_call(
         request_sha256="1" * 64,
         snapshot_sha256="2" * 64,
         publication_receipt=publication_receipt,
+        official_cutoff_publication_receipt=cutoff_receipt,
         next_route_id=None,
         fallback_evidence_record_ids=[],
         route_transition_publication_receipt=freeze_receipt,
@@ -2776,6 +2813,12 @@ def test_minute60_cutoff_survives_later_targeted_review_supersession(
                 "official_published_record_id": "mem_first_official",
                 "official_published_timestamp_utc": "2026-08-10T23:00:00+00:00",
                 "official_published_record_sha256": "d" * 64,
+                "official_published_publication_receipt": {
+                    "publication_state": "official",
+                    "record_id": "mem_first_official",
+                    "timestamp_utc": "2026-08-10T23:00:00+00:00",
+                    "record_sha256": "d" * 64,
+                },
             },
         },
         "mem_progress": {
@@ -2826,6 +2869,9 @@ def test_minute60_cutoff_survives_later_targeted_review_supersession(
         route_id="route-a",
         frontier_record_ids=["mem_progress"],
         progress_record_ids=["mem_progress"],
+    )
+    assert request["snapshot"]["prior_official_review"]["record_id"] == (
+        "mem_first_official"
     )
     assert request["snapshot"]["prior_official_review"]["timestamp_utc"] == (
         "2026-08-10T23:00:00+00:00"
@@ -2905,6 +2951,12 @@ def test_next_cycle_minute30_uses_prior_cycle_same_route_yellow_cutoff(
                 "official_published_record_id": "mem_prior_cycle",
                 "official_published_timestamp_utc": "2026-08-10T23:00:00+00:00",
                 "official_published_record_sha256": "d" * 64,
+                "official_published_publication_receipt": {
+                    "publication_state": "official",
+                    "record_id": "mem_prior_cycle",
+                    "timestamp_utc": "2026-08-10T23:00:00+00:00",
+                    "record_sha256": "d" * 64,
+                },
             },
         },
         "mem_old": {

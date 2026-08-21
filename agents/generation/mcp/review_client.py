@@ -1654,6 +1654,7 @@ def route_review_close(
     request_sha256: str,
     snapshot_sha256: str,
     publication_receipt: Mapping[str, Any],
+    official_cutoff_publication_receipt: Mapping[str, Any] | None,
     next_route_id: str | None,
     fallback_evidence_record_ids: list[str],
     route_transition_publication_receipt: Mapping[str, Any] | None,
@@ -1663,12 +1664,34 @@ def route_review_close(
     if SHA256_RE.fullmatch(request_sha256) is None or SHA256_RE.fullmatch(snapshot_sha256) is None:
         raise ReviewAdapterError("review request binding is invalid")
     receipt = _validate_publication_receipt(publication_receipt)
+    cutoff_receipt = (
+        None
+        if official_cutoff_publication_receipt is None
+        else _validate_publication_receipt(official_cutoff_publication_receipt)
+    )
     if (
         receipt["review_id"] != review_id
         or receipt["request_sha256"] != request_sha256
         or receipt["snapshot_sha256"] != snapshot_sha256
     ):
         raise ReviewAdapterError("review publication receipt binding mismatch")
+    if receipt["publication_state"] == "pending":
+        if cutoff_receipt is not None:
+            raise ReviewAdapterError(
+                "pending review ACK cannot bind an official cutoff"
+            )
+    elif (
+        cutoff_receipt is None
+        or cutoff_receipt["publication_state"] != "official"
+        or cutoff_receipt["review_id"] != review_id
+        or cutoff_receipt["request_sha256"] != request_sha256
+        or cutoff_receipt["snapshot_sha256"] != snapshot_sha256
+        or datetime.fromisoformat(cutoff_receipt["timestamp_utc"])
+        > datetime.fromisoformat(receipt["timestamp_utc"])
+    ):
+        raise ReviewAdapterError(
+            "official review publication lacks its immutable cutoff"
+        )
     if next_route_id is not None and (
         not isinstance(next_route_id, str)
         or not next_route_id
@@ -1726,6 +1749,7 @@ def route_review_close(
                 "request_sha256": request_sha256,
                 "snapshot_sha256": snapshot_sha256,
                 "publication_receipt": receipt,
+                "official_cutoff_publication_receipt": cutoff_receipt,
                 "route_transition": {
                     "next_route_id": next_route_id,
                     "fallback_evidence_record_ids": list(

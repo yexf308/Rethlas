@@ -4124,6 +4124,7 @@ class ConversationLedger:
                     closed INTEGER NOT NULL DEFAULT 0 CHECK(closed IN (0, 1)),
                     pending_publication_receipt_json TEXT,
                     publication_receipt_json TEXT,
+                    official_cutoff_receipt_json TEXT,
                     route_transition_json TEXT,
                     route_transition_publication_receipt_json TEXT,
                     official INTEGER NOT NULL DEFAULT 0 CHECK(official IN (0, 1)),
@@ -4830,6 +4831,7 @@ class ConversationLedger:
                 "closed": "INTEGER NOT NULL DEFAULT 0 CHECK(closed IN (0, 1))",
                 "publication_receipt_json": "TEXT",
                 "pending_publication_receipt_json": "TEXT",
+                "official_cutoff_receipt_json": "TEXT",
                 "route_transition_json": "TEXT",
                 "route_transition_publication_receipt_json": "TEXT",
                 "official": "INTEGER NOT NULL DEFAULT 0 CHECK(official IN (0, 1))",
@@ -29912,11 +29914,24 @@ def _prepare_review_control(
             or prior.get("cycle")
             != ("minute30" if int(prior_review["review_ordinal"]) == 1 else "minute60")
             or prior_review["publication_receipt_json"] is None
+            or prior_review["official_cutoff_receipt_json"] is None
         ):
             raise HotJoinError("review lacks its exact official predecessor cutoff")
-        prior_receipt = _json_loads_strict(
-            str(prior_review["publication_receipt_json"])
+        final_prior_receipt = _validate_review_publication_receipt(
+            prior_review,
+            _json_loads_strict(str(prior_review["publication_receipt_json"])),
         )
+        prior_receipt = _validate_review_publication_receipt(
+            prior_review,
+            _json_loads_strict(str(prior_review["official_cutoff_receipt_json"])),
+        )
+        if (
+            prior_receipt["publication_state"] != "official"
+            or final_prior_receipt["publication_state"] != "official"
+            or datetime.fromisoformat(prior_receipt["timestamp_utc"])
+            > datetime.fromisoformat(final_prior_receipt["timestamp_utc"])
+        ):
+            raise HotJoinError("review official predecessor cutoff is malformed")
         expected_prior = {
             "record_id": prior_receipt.get("record_id"),
             "review_id": prior_review["review_id"],
@@ -31039,7 +31054,11 @@ def _review_close_control(
     ledger: ConversationLedger, payload: Mapping[str, Any]
 ) -> dict[str, Any]:
     base_keys = {"review_id", "request_sha256", "snapshot_sha256"}
-    completed_keys = base_keys | {"publication_receipt", "route_transition"}
+    completed_keys = base_keys | {
+        "publication_receipt",
+        "official_cutoff_publication_receipt",
+        "route_transition",
+    }
     if set(payload) not in {frozenset(base_keys), frozenset(completed_keys)}:
         raise ValueError("review_close payload has an unsupported shape")
     base = {key: payload[key] for key in base_keys}
@@ -31047,12 +31066,19 @@ def _review_close_control(
         ledger, operation="review_close", payload=base
     )
     receipt_raw = payload.get("publication_receipt")
+    cutoff_receipt_raw = payload.get("official_cutoff_publication_receipt")
     receipt: dict[str, Any] | None = None
+    cutoff_receipt: dict[str, Any] | None = None
     transition: dict[str, Any] | None = None
     transition_base: dict[str, Any] | None = None
     transition_publication_receipt: dict[str, Any] | None = None
     if receipt_raw is not None:
         receipt = _validate_review_publication_receipt(review, receipt_raw)
+        cutoff_receipt = (
+            None
+            if cutoff_receipt_raw is None
+            else _validate_review_publication_receipt(review, cutoff_receipt_raw)
+        )
         transition = _validate_review_route_transition(
             review, payload.get("route_transition")
         )
@@ -31063,15 +31089,30 @@ def _review_close_control(
         decision = _json_loads_strict(str(review["decision_json"]))
         transition_publication_receipt = transition["publication_receipt"]
         if receipt["publication_state"] == "pending":
-            if transition_publication_receipt is not None:
+            if (
+                cutoff_receipt is not None
+                or transition_publication_receipt is not None
+            ):
                 raise HotJoinError(
-                    "pending review ACK cannot precede route transition publication"
+                    "pending review ACK cannot precede official cutoff or route "
+                    "transition publication"
                 )
+        elif (
+            cutoff_receipt is None
+            or cutoff_receipt["publication_state"] != "official"
+            or datetime.fromisoformat(cutoff_receipt["timestamp_utc"])
+            > datetime.fromisoformat(receipt["timestamp_utc"])
+        ):
+            raise HotJoinError(
+                "official review lacks its immutable publication cutoff"
+            )
         elif decision.get("effective_verdict") == "red":
             if transition_publication_receipt is None:
                 raise HotJoinError(
                     "official red review requires its route transition publication"
                 )
+    elif cutoff_receipt_raw is not None:
+        raise HotJoinError("failed review cannot accept an official cutoff receipt")
     idempotent = False
     with ledger._connect() as connection:
         connection.execute("BEGIN IMMEDIATE")
@@ -31088,6 +31129,9 @@ def _review_close_control(
         ).fetchone()
         if run is None or (
             receipt is not None and receipt["problem_id"] != run["problem_id"]
+        ) or (
+            cutoff_receipt is not None
+            and cutoff_receipt["problem_id"] != run["problem_id"]
         ):
             raise HotJoinError("review publication receipt problem binding mismatch")
         if (
@@ -31115,8 +31159,14 @@ def _review_close_control(
                 if current["route_transition_publication_receipt_json"] is not None
                 else None
             )
+            stored_cutoff = (
+                _json_loads_strict(str(current["official_cutoff_receipt_json"]))
+                if current["official_cutoff_receipt_json"] is not None
+                else None
+            )
             if (
                 stored != receipt
+                or stored_cutoff != cutoff_receipt
                 or stored_transition != transition_base
                 or stored_transition_publication != transition_publication_receipt
             ):
@@ -31162,6 +31212,10 @@ def _review_close_control(
                 if receipt["publication_state"] == "pending":
                     stored_pending = current["pending_publication_receipt_json"]
                     stored_transition = current["route_transition_json"]
+                    if current["official_cutoff_receipt_json"] is not None:
+                        raise IdempotencyConflict(
+                            "pending publication cannot replace an official cutoff"
+                        )
                     if stored_pending is not None:
                         if (
                             stored_pending != receipt_json
@@ -31290,12 +31344,14 @@ def _review_close_control(
                         """
                         UPDATE route_reviews SET official = 1, closed = 1,
                             publication_receipt_json = ?,
+                            official_cutoff_receipt_json = ?,
                             route_transition_publication_receipt_json = ?,
                             updated_sequence = ?
                         WHERE review_id = ?
                         """,
                         (
                             receipt_json,
+                            _canonical_json(cutoff_receipt),
                             transition_publication_receipt_json,
                             sequence,
                             current["review_id"],

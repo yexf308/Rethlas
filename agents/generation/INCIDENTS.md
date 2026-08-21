@@ -959,3 +959,41 @@ an incident.
   first drive and requires `review_drive_required` for ordinal 2. In the
   incident run, the second review then correctly failed closed for a separate
   policy reason: epoch 2 had published no post-review active-route checkpoint.
+
+## 2026-08-21: second review rejected the first review's immutable cutoff
+
+- **Classification:** cross-review publication-provenance mismatch; fixed. The
+  second root epoch and both of its pre-boundary checkpoints were valid, but no
+  second critic launched.
+- **Trigger:** isolated run
+  `arxivhard-am2606047-guardian-high-review10-epoch2-20260821-03` used
+  `gpt-5.6-sol` at `high` with the T+10/T+20 smoke cadence. Its first review
+  published official yellow, epoch 2 restored
+  `one_bounded_cycle_on_fatal_doubt`, and the fresh root published two accepted
+  same-route checkpoints before the second boundary.
+- **Observed effect:** the second review driver derived the correct route and
+  frontier, then `review-prepare` failed with
+  `official-review provenance differs from durable host state`. The active
+  official memory record preserved the first official publication cutoff, but
+  the host compared that immutable timestamp with the later timestamp of the
+  stamped superseding record.
+- **Root cause:** official review publication has two distinct admitted
+  records. The first record establishes the immutable cutoff; a second record
+  stamps that cutoff for later supersessions. The server intentionally carried
+  the first record id and timestamp into the next review, while the adapter
+  retained only the second publication receipt. Unit tests manually built the
+  next-review provenance from the second receipt and therefore could not
+  reproduce the real two-record pipeline.
+- **Remediation:** the server now embeds the full first official publication
+  receipt in the stamped memory body. The private close protocol passes both
+  the immutable cutoff receipt and the final active publication receipt. The
+  host validates their common review digests and ordering, stores both, and
+  reconstructs the next review predecessor from the immutable receipt. Pending
+  close cannot carry a cutoff, and replay cannot replace either receipt.
+- **Regression evidence:** the route-review client and host cadence tests now
+  bind the distinct cutoff receipt, reject a cutoff newer than the final
+  publication, and require the next snapshot to use the first official record
+  id and timestamp even after a later supersession. A copied-ledger replay of
+  the failed live boundary, with the newly persisted cutoff receipt supplied,
+  reached `state=prepared` for the same review id and the same two epoch-2
+  frontier records without launching a model.
