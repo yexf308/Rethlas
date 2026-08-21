@@ -1055,6 +1055,25 @@ an incident.
   differs from its immutable official cutoff, and a copied-ledger replay of the
   failed result now reaches `completed_pending_close` with effective red.
 
+## 2026-08-21: isolated smoke ledger contained one zeroed active table page
+
+- **Classification:** physical SQLite corruption in the disposable smoke
+  ledger; quarantined, root cause unresolved. This was not treated as a code
+  fix or as evidence about reviewer compatibility.
+- **Trigger:** run
+  `arxivhard-am2606047-guardian-high-review10-epoch2-20260821-04` stopped before
+  its first review when cadence projection reported `database disk image is
+  malformed`.
+- **Evidence:** `PRAGMA quick_check` and `integrity_check` both identified
+  `cadence_cycles` tree page 2660. A raw page read showed all 4,096 bytes were
+  zero while adjacent pages had valid B-tree headers; the WAL was already
+  empty. The database, SHM, WAL, recovery marker, and SHA-256 were moved
+  intact to the smoke checkout's `corrupt-ledger-20260821-0119` quarantine.
+- **Disposition:** no in-place repair was attempted. Later tests used a fresh
+  ledger, avoided direct SQLite reads while paid work was active, and finished
+  with both `quick_check=ok` and a valid event chain. This narrows impact to the
+  isolated smoke ledger but does not establish the original zero-page cause.
+
 ## 2026-08-21: semantically valid yellow critic failed a redundant equality
 
 - **Classification:** stochastic reviewer-wire redundancy; fixed. The critic
