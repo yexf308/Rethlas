@@ -842,3 +842,40 @@ an incident.
   `owner_wait_advisor` with `paid_turn_allowed=false`. The benchmark answer was
   not produced, so this closes the control incident but is not a mathematical
   solve.
+
+## 2026-08-20: Guardian ancestry recheck rejected a short-lived paid helper
+
+- **Classification:** authenticated descendant-attestation liveness race;
+  fixed. The failed production run remained fail-closed and published no
+  review or mathematical result.
+- **Trigger:** production run
+  `arxivhard-am2606047-review-production-max-20260820-02` used the unchanged
+  T+30/T+60/T+87/T+90 cadence on the same `am-2606-047` statement. At T+22m it
+  created the short-lived setsid leader with PGID `15090` during an otherwise
+  ordinary paid turn.
+- **Observed effect:** the pinned Guardian captured the exact leader identity,
+  UID, PGID, and microsecond start marker. Before the separate host callback
+  completed two ancestry snapshots, the helper's parent exited and the helper
+  was reparented or became empty. The host rejected the authenticated capture
+  as `guardian discovered ancestry changed or is unreachable`; cleanup proved
+  the group empty, killed the remaining exact paid topology, committed
+  `execution_unknown`, and the wrapper exited `70` before any reviewer launch.
+- **Root cause:** host admission incorrectly required a live process's current
+  parent chain to reproduce the Guardian's earlier observation. Parentage is
+  mutable and cannot serve as durable identity. This duplicated validation was
+  stricter than the existing safe handling of a leader that had already exited
+  with same-UID leaderless members.
+- **Remediation:** the authenticated pinned Guardian remains the authority for
+  the historical descendant observation. The host still independently checks
+  the boot domain, owner UID, stable leader PID equals PGID, and exact start
+  identity twice. It now admits only safe lifecycle transitions from an exact
+  live leader to the same live leader, same-UID leaderless residual group, or
+  proven empty group, even when ordinary reparenting has made ancestry
+  historical. Identity replacement, PID or PGID reuse, foreign membership,
+  reserved root or daemon collisions, boot drift, and empty-to-live changes
+  still roll the transaction back. Each accepted capture records its concrete
+  validation disposition in the ledger event.
+- **Regression evidence:** focused tests cover reparenting before the host
+  callback, reparenting between its two snapshots, exit during validation,
+  transition to an exact same-UID leaderless group, and candidate PID reuse.
+  The reuse case produces no paid-group row, poll receipt, or discovery event.

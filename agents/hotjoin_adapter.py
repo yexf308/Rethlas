@@ -13717,14 +13717,10 @@ class ConversationLedger:
                     )
                 )
                 owner_uid = int(registration["owner_uid"])
+                first_discovered_states: dict[str, str] = {}
                 live_discovered: list[tuple[dict[str, Any], str]] = []
-                ancestry_bound_discovered: list[
-                    tuple[dict[str, Any], str]
-                ] = []
-                leaderless_live_discovered: list[
-                    tuple[dict[str, Any], str]
-                ] = []
                 empty_discovered: list[tuple[dict[str, Any], str]] = []
+                capture_validation: dict[str, str] = {}
 
                 def exact_leaderless_members(
                     identity: Mapping[str, Any], members: Sequence[Any]
@@ -13736,6 +13732,37 @@ class ConversationLedger:
                         and member.uid == uid
                         and member.pid != pgid
                         for member in members
+                    )
+
+                def discovered_runtime_state(identity: Mapping[str, Any]) -> str:
+                    """Classify one authenticated Guardian capture exactly.
+
+                    The pinned Guardian is the authority that observed the
+                    process as a descendant.  Host validation independently
+                    binds its exact leader identity, UID, PGID, and boot
+                    domain.  Parentage itself is intentionally not required
+                    to remain observable here: a legitimate setsid leader can
+                    be reparented as soon as its short-lived parent exits.
+                    """
+
+                    pid = int(identity["pid"])
+                    pgid = int(identity["pgid"])
+                    observed = inspector.identity(pid)
+                    if observed is not None:
+                        if observed.as_dict() != identity:
+                            raise HotJoinError(
+                                "guardian discovered group identity is not exact"
+                            )
+                        return "live_leader"
+                    members = inspector.group_members(pgid)
+                    if not members:
+                        return "empty"
+                    if exact_leaderless_members(identity, members):
+                        # Same-UID residual members keep the original POSIX
+                        # group alive and prevent numeric PGID reuse.
+                        return "live_leaderless"
+                    raise HotJoinError(
+                        "guardian discovered leader vanished with ambiguous members"
                     )
 
                 for group, source_id in new_discovered:
@@ -13751,36 +13778,9 @@ class ConversationLedger:
                         raise HotJoinError(
                             "guardian discovered group is not an exact root descendant"
                         )
-                    observed = inspector.identity(int(identity["pid"]))
-                    if observed is None:
-                        members = inspector.group_members(int(identity["pgid"]))
-                        if not members:
-                            empty_discovered.append((group, source_id))
-                        elif exact_leaderless_members(identity, members):
-                            # Guardian observed the exact leader while it was a
-                            # root descendant.  Its same-UID residual members
-                            # keep the original POSIX process group alive and
-                            # prevent numeric PGID reuse, so retain that bound
-                            # identity as live kill coverage.
-                            live_discovered.append((group, source_id))
-                            leaderless_live_discovered.append((group, source_id))
-                        else:
-                            raise HotJoinError(
-                                "guardian discovered leader vanished with "
-                                "ambiguous members"
-                            )
-                    elif observed.as_dict() != identity:
-                        raise HotJoinError(
-                            "guardian discovered group identity is not exact"
-                        )
-                    else:
-                        live_discovered.append((group, source_id))
-                        ancestry_bound_discovered.append((group, source_id))
-                first_descendants = self._guardian_extend_descendant_topology_snapshot(
-                    inspector=inspector,
-                    initial_descendants=first_descendants,
-                    groups=ancestry_bound_discovered,
-                )
+                    first_discovered_states[source_id] = discovered_runtime_state(
+                        identity
+                    )
                 if inspector.boot_identity() != registration["boot_identity"]:
                     raise HotJoinError("guardian discovery boot changed during validation")
                 second_root_fingerprint, second_descendants = (
@@ -13794,42 +13794,53 @@ class ConversationLedger:
                     raise HotJoinError(
                         "guardian discovery durable roots changed during validation"
                     )
-                second_descendants = self._guardian_extend_descendant_topology_snapshot(
-                    inspector=inspector,
-                    initial_descendants=second_descendants,
-                    groups=ancestry_bound_discovered,
-                )
-                for group, _source_id in ancestry_bound_discovered:
+                for group, source_id in new_discovered:
                     identity = group["identity"]
-                    observed = inspector.identity(int(identity["pid"]))
-                    if (
-                        observed is None
-                        or observed.as_dict() != identity
-                        or second_descendants.get(int(identity["pid"])) != identity
-                    ):
-                        raise HotJoinError(
-                            "guardian discovered ancestry changed during validation"
-                        )
-                for group, _source_id in leaderless_live_discovered:
-                    identity = group["identity"]
-                    if inspector.identity(int(identity["pid"])) is not None:
-                        raise HotJoinError(
-                            "guardian discovered leaderless PID was reused"
-                        )
-                    members = inspector.group_members(int(identity["pgid"]))
-                    if members and not exact_leaderless_members(identity, members):
-                        raise HotJoinError(
-                            "guardian discovered leaderless membership changed "
-                            "during validation"
-                        )
-                for group, _source_id in empty_discovered:
-                    identity = group["identity"]
-                    if inspector.identity(int(identity["pid"])) is not None or (
-                        inspector.group_members(int(identity["pgid"]))
-                    ):
+                    pgid = int(identity["pgid"])
+                    first_state = first_discovered_states[source_id]
+                    second_state = discovered_runtime_state(identity)
+                    if first_state == "empty" and second_state != "empty":
                         raise HotJoinError(
                             "guardian empty discovery changed during validation"
                         )
+                    if (
+                        first_state == "live_leaderless"
+                        and second_state == "live_leader"
+                    ):
+                        raise HotJoinError(
+                            "guardian discovered leaderless PID was reused"
+                        )
+                    if second_state == "empty":
+                        empty_discovered.append((group, source_id))
+                        capture_validation[str(pgid)] = (
+                            "already_empty"
+                            if first_state == "empty"
+                            else "became_empty_during_validation"
+                        )
+                        continue
+                    live_discovered.append((group, source_id))
+                    if second_state == "live_leaderless":
+                        capture_validation[str(pgid)] = "leaderless_live"
+                        continue
+                    first_reachable = (
+                        first_descendants.get(int(identity["pid"])) == identity
+                    )
+                    second_reachable = (
+                        second_descendants.get(int(identity["pid"])) == identity
+                    )
+                    if first_reachable and second_reachable:
+                        disposition = "host_reachable_stable"
+                    elif first_reachable:
+                        disposition = "host_reachable_then_reparented"
+                    elif second_reachable:
+                        disposition = "host_reachable_late"
+                    else:
+                        # The authenticated pinned Guardian observed this exact
+                        # stable leader before the host callback started.  Its
+                        # unchanged identity is safe durable kill coverage even
+                        # after ordinary parent exit made ancestry historical.
+                        disposition = "guardian_attested_reparented_live"
+                    capture_validation[str(pgid)] = disposition
                 if inspector.boot_identity() != registration["boot_identity"]:
                     raise HotJoinError(
                         "guardian discovery boot changed during final validation"
@@ -13856,6 +13867,7 @@ class ConversationLedger:
                             )
                             for item in empty_discovered
                         },
+                        "capture_validation": capture_validation,
                         "pgids": [
                             int(item[0]["identity"]["pgid"])
                             for item in new_discovered

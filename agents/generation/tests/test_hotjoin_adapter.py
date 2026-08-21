@@ -13534,7 +13534,7 @@ def test_guardian_poll_attests_discovered_leaderless_same_uid_group(
     ] == [10_101]
 
 
-def test_guardian_poll_discovery_rejects_ancestry_toctou_atomically(
+def test_guardian_poll_accepts_authenticated_capture_reparented_during_validation(
     ledger: hotjoin.ConversationLedger,
 ) -> None:
     registered = _arm_initial_guardian(
@@ -13566,8 +13566,261 @@ def test_guardian_poll_discovery_rejects_ancestry_toctou_atomically(
             return (candidate,) if self.calls == 1 else ()
 
     inspector = _MovingAncestryInspector()
+    result = ledger.poll_guardian(
+        "run-1",
+        registration_id=ack["registration_id"],
+        request_sha256=ack["request_sha256"],
+        discovered_groups=[{"role": "root", "identity": candidate.as_dict()}],
+        expected_previous_snapshot_sha256=None,
+        guardian_token="4" * 64,
+        inspector=inspector,
+    )
+    assert [
+        group["identity"]["pgid"] for group in result["snapshot"]["paid_groups"]
+    ] == [10_101, 30_303]
+    with ledger._connect() as connection:
+        row = connection.execute(
+            "SELECT * FROM guardian_paid_groups WHERE pgid = 30303"
+        ).fetchone()
+        assert row is not None
+        assert row["state"] == "released"
+        event = connection.execute(
+            "SELECT payload_json FROM events "
+            "WHERE kind = 'guardian_paid_groups_discovered'"
+        ).fetchone()
+        assert event is not None
+        assert json.loads(event["payload_json"])["capture_validation"] == {
+            "30303": "host_reachable_then_reparented"
+        }
+
+
+def test_guardian_poll_accepts_authenticated_capture_reparented_before_host(
+    ledger: hotjoin.ConversationLedger,
+) -> None:
+    registered = _arm_initial_guardian(
+        ledger, wall_epoch=1_000.0, monotonic_epoch=2_000.0
+    )
+    ack = registered["registration_ack"]
+    root = _GuardianIdentity(
+        pid=10_101,
+        uid=os.getuid(),
+        pgid=10_101,
+        start_marker="root-birth-1",
+    )
+    candidate = _GuardianIdentity(
+        pid=30_303,
+        uid=os.getuid(),
+        pgid=30_303,
+        start_marker="already-reparented-child",
+    )
+    inspector = _GuardianInspector(
+        boot_identity="boot-test-1",
+        identities=[root, candidate],
+        descendants={10_101: []},
+    )
+
+    result = ledger.poll_guardian(
+        "run-1",
+        registration_id=ack["registration_id"],
+        request_sha256=ack["request_sha256"],
+        discovered_groups=[{"role": "root", "identity": candidate.as_dict()}],
+        expected_previous_snapshot_sha256=None,
+        guardian_token="4" * 64,
+        inspector=inspector,
+    )
+
+    assert [
+        group["identity"]["pgid"] for group in result["snapshot"]["paid_groups"]
+    ] == [10_101, 30_303]
+    event = next(
+        event
+        for event in ledger.events("run-1")
+        if event["kind"] == "guardian_paid_groups_discovered"
+    )
+    assert event["payload"]["capture_validation"] == {
+        "30303": "guardian_attested_reparented_live"
+    }
+
+
+def test_guardian_poll_commits_capture_that_exits_during_host_validation(
+    ledger: hotjoin.ConversationLedger,
+) -> None:
+    registered = _arm_initial_guardian(
+        ledger, wall_epoch=1_000.0, monotonic_epoch=2_000.0
+    )
+    ack = registered["registration_ack"]
+    root = _GuardianIdentity(
+        pid=10_101,
+        uid=os.getuid(),
+        pgid=10_101,
+        start_marker="root-birth-1",
+    )
+    candidate = _GuardianIdentity(
+        pid=30_303,
+        uid=os.getuid(),
+        pgid=30_303,
+        start_marker="exits-during-validation",
+    )
+
+    class _ExitingCandidateInspector(_GuardianInspector):
+        def __init__(self) -> None:
+            super().__init__(
+                boot_identity="boot-test-1",
+                identities=[root, candidate],
+                descendants={10_101: []},
+            )
+            self.root_scans = 0
+
+        def descendants(self, pid: int) -> tuple[_GuardianIdentity, ...]:
+            if pid == root.pid:
+                self.root_scans += 1
+                if self.root_scans == 2:
+                    self.remove(candidate.pid)
+            return super().descendants(pid)
+
+    inspector = _ExitingCandidateInspector()
+    result = ledger.poll_guardian(
+        "run-1",
+        registration_id=ack["registration_id"],
+        request_sha256=ack["request_sha256"],
+        discovered_groups=[{"role": "root", "identity": candidate.as_dict()}],
+        expected_previous_snapshot_sha256=None,
+        guardian_token="4" * 64,
+        inspector=inspector,
+    )
+
+    assert [
+        group["identity"]["pgid"] for group in result["snapshot"]["paid_groups"]
+    ] == [10_101]
+    with ledger._connect() as connection:
+        receipt = connection.execute(
+            "SELECT * FROM guardian_discovered_empty_receipts "
+            "WHERE registration_id = ?",
+            (ack["registration_id"],),
+        ).fetchone()
+        assert receipt is not None
+        event = connection.execute(
+            "SELECT payload_json FROM events "
+            "WHERE kind = 'guardian_paid_groups_discovered'"
+        ).fetchone()
+        assert event is not None
+        assert json.loads(event["payload_json"])["capture_validation"] == {
+            "30303": "became_empty_during_validation"
+        }
+
+
+def test_guardian_poll_attests_capture_that_becomes_leaderless_during_validation(
+    ledger: hotjoin.ConversationLedger,
+) -> None:
+    registered = _arm_initial_guardian(
+        ledger, wall_epoch=1_000.0, monotonic_epoch=2_000.0
+    )
+    ack = registered["registration_ack"]
+    root = _GuardianIdentity(
+        pid=10_101,
+        uid=os.getuid(),
+        pgid=10_101,
+        start_marker="root-birth-1",
+    )
+    candidate = _GuardianIdentity(
+        pid=30_303,
+        uid=os.getuid(),
+        pgid=30_303,
+        start_marker="leader-exits-during-validation",
+    )
+    residual = _GuardianIdentity(
+        pid=30_304,
+        uid=os.getuid(),
+        pgid=30_303,
+        start_marker="same-group-residual",
+    )
+
+    class _LeaderlessCandidateInspector(_GuardianInspector):
+        def __init__(self) -> None:
+            super().__init__(
+                boot_identity="boot-test-1",
+                identities=[root, candidate],
+                descendants={10_101: []},
+            )
+            self.root_scans = 0
+
+        def descendants(self, pid: int) -> tuple[_GuardianIdentity, ...]:
+            if pid == root.pid:
+                self.root_scans += 1
+                if self.root_scans == 2:
+                    self.remove(candidate.pid)
+                    self.add(residual)
+            return super().descendants(pid)
+
+    inspector = _LeaderlessCandidateInspector()
+    result = ledger.poll_guardian(
+        "run-1",
+        registration_id=ack["registration_id"],
+        request_sha256=ack["request_sha256"],
+        discovered_groups=[{"role": "root", "identity": candidate.as_dict()}],
+        expected_previous_snapshot_sha256=None,
+        guardian_token="4" * 64,
+        inspector=inspector,
+    )
+
+    assert [
+        group["identity"]["pgid"] for group in result["snapshot"]["paid_groups"]
+    ] == [10_101, 30_303]
+    event = next(
+        event
+        for event in ledger.events("run-1")
+        if event["kind"] == "guardian_paid_groups_discovered"
+    )
+    assert event["payload"]["capture_validation"] == {
+        "30303": "leaderless_live"
+    }
+
+
+def test_guardian_poll_rejects_capture_identity_reuse_during_validation(
+    ledger: hotjoin.ConversationLedger,
+) -> None:
+    registered = _arm_initial_guardian(
+        ledger, wall_epoch=1_000.0, monotonic_epoch=2_000.0
+    )
+    ack = registered["registration_ack"]
+    root = _GuardianIdentity(
+        pid=10_101,
+        uid=os.getuid(),
+        pgid=10_101,
+        start_marker="root-birth-1",
+    )
+    candidate = _GuardianIdentity(
+        pid=30_303,
+        uid=os.getuid(),
+        pgid=30_303,
+        start_marker="original-candidate",
+    )
+    replacement = _GuardianIdentity(
+        pid=30_303,
+        uid=os.getuid(),
+        pgid=30_303,
+        start_marker="reused-candidate-pid",
+    )
+
+    class _ReusedCandidateInspector(_GuardianInspector):
+        def __init__(self) -> None:
+            super().__init__(
+                boot_identity="boot-test-1",
+                identities=[root, candidate],
+                descendants={10_101: []},
+            )
+            self.root_scans = 0
+
+        def descendants(self, pid: int) -> tuple[_GuardianIdentity, ...]:
+            if pid == root.pid:
+                self.root_scans += 1
+                if self.root_scans == 2:
+                    self._identities[candidate.pid] = replacement
+            return super().descendants(pid)
+
+    inspector = _ReusedCandidateInspector()
     event_count = len(ledger.events("run-1"))
-    with pytest.raises(hotjoin.HotJoinError, match="ancestry changed"):
+    with pytest.raises(hotjoin.HotJoinError, match="identity is not exact"):
         ledger.poll_guardian(
             "run-1",
             registration_id=ack["registration_id"],
@@ -13579,18 +13832,12 @@ def test_guardian_poll_discovery_rejects_ancestry_toctou_atomically(
         )
     assert len(ledger.events("run-1")) == event_count
     with ledger._connect() as connection:
-        assert (
-            connection.execute(
-                "SELECT COUNT(*) FROM guardian_paid_groups WHERE pgid = 30303"
-            ).fetchone()[0]
-            == 0
-        )
-        assert (
-            connection.execute(
-                "SELECT COUNT(*) FROM guardian_poll_request_receipts"
-            ).fetchone()[0]
-            == 0
-        )
+        assert connection.execute(
+            "SELECT COUNT(*) FROM guardian_paid_groups WHERE pgid = 30303"
+        ).fetchone()[0] == 0
+        assert connection.execute(
+            "SELECT COUNT(*) FROM guardian_poll_request_receipts"
+        ).fetchone()[0] == 0
 
 
 def test_guardian_poll_accepts_nested_child_of_reparented_durable_root(
@@ -19444,7 +19691,7 @@ You may use local read-only shell/Python for the `q=7` arithmetic. Do not use th
     private_adapter.write_text(private_source, encoding="utf-8")
     private_adapter_sha256 = hashlib.sha256(private_adapter.read_bytes()).hexdigest()
     assert private_adapter_sha256 == (
-        "1a5783b5fb874ec665daa9c04b0c5ecdefe4837c81da70e5cc260bda9d54d676"
+        "17b230f3e07cac287841b08bebed8fdff5a0cd7f273d05cb80f8a223e4d39cf5"
     )
 
     monkeypatch.setattr(hotjoin, "__file__", str(private_adapter))
