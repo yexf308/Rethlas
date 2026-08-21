@@ -3809,8 +3809,11 @@ if (
     and review.get("allowed_action") != "post_review_handoff_required"
 ):
     fail("reviewed fresh-epoch continuation lacks its durable handoff action")
-if disposition == "route_frozen" and review.get("allowed_action") != "freeze_route":
-    fail("frozen route projection lacks freeze_route authority")
+if disposition == "route_frozen" and review.get("allowed_action") not in {
+    "freeze_route",
+    "recovery_only",
+}:
+    fail("frozen route projection lacks terminal freeze authority")
 if required_mode is not None and (
     continuation is None
     or continuation["mode"] != required_mode

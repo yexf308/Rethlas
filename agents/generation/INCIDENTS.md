@@ -992,6 +992,18 @@ an incident.
   wall instant only. Paired regressions require a turn with 25 seconds
   remaining to dispatch, an already expired authorization to make zero RPCs,
   and a response that crosses expiry to remain unknown and non-retryable.
+- **Successful live terminal:** run
+  `arxivhard-am2606047-guardian-high-review10-epoch2-20260821-13` completed
+  epoch 1, official yellow review 1, a fresh epoch 2, one current-window
+  checkpoint, and official red review 2. The second critic completed normally;
+  the host published and closed it, froze the no-fallback route, closed the
+  cycle, disabled paid continuation, and verified its 271-event ledger. The
+  remaining wrapper message was a projection-validator mismatch: a fully
+  terminal frozen cycle correctly narrows `allowed_action` from `freeze_route`
+  to `recovery_only`. The validator now accepts both the pre-terminal freeze
+  gate and the closed terminal action. Mock red-review, initial frozen restart,
+  and post-turn frozen tests all require a normal unsolved exit with zero extra
+  paid work.
 
 ## 2026-08-21: second review rejected the first review's immutable cutoff
 

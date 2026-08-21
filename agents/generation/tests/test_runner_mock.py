@@ -1884,7 +1884,7 @@ if command in {"review-drive", "guarded-review-drive"}:
         disposition["next_milestone"] = None
     disposition_sha256 = hashlib.sha256(canonical(disposition).encode()).hexdigest()
     if os.environ.get("MOCK_REVIEW_DRIVE_RED"):
-        state["allowed_action"] = "freeze_route"
+        state["allowed_action"] = "recovery_only"
         state["disposition"] = "route_frozen"
     else:
         prior_epoch = state["thread_epoch"]
@@ -2721,7 +2721,7 @@ def _seed_mock_cadence_projection(
     }:
         state["allowed_action"] = "post_review_handoff_required"
     elif disposition == "route_frozen":
-        state["allowed_action"] = "freeze_route"
+        state["allowed_action"] = "recovery_only"
     state_path.write_text(
         json.dumps(state, allow_nan=False, sort_keys=True, separators=(",", ":")),
         encoding="utf-8",
@@ -3815,7 +3815,7 @@ def test_due_review_red_freezes_route_without_owner_yield_or_paid_root(
     assert not _cadence_calls(calls_path, "cadence-close")
     state = json.loads(state_path.read_text(encoding="utf-8"))
     assert state["disposition"] == "route_frozen"
-    assert state["allowed_action"] == "freeze_route"
+    assert state["allowed_action"] == "recovery_only"
     _assert_guarded_review_drive_is_fd_only(calls_path, state_path)
     assert "owner_wait" not in (completed.stdout + completed.stderr)
     assert "official review froze the active route after red" in completed.stderr
