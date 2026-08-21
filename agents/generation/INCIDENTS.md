@@ -997,6 +997,18 @@ an incident.
   the failed live boundary, with the newly persisted cutoff receipt supplied,
   reached `state=prepared` for the same review id and the same two epoch-2
   frontier records without launching a model.
+- **Completion follow-up:** run
+  `arxivhard-am2606047-guardian-high-review10-epoch2-20260821-07` proved that
+  second-review prepare and critic execution now succeed. Its tool-free critic
+  returned zero and the host correctly reduced a second same-route yellow with
+  no confirmed progress to effective red. Publication then failed because the
+  completion reducer still looked up the immutable first-record id directly in
+  the active projection, where only its stamped supersession can exist. The
+  reducer now resolves exactly one active official body by all immutable
+  predecessor bindings, including the first record id and timestamp, before
+  reading the prior decision. Unit tests exercise an active record whose id
+  differs from its immutable official cutoff, and a copied-ledger replay of the
+  failed result now reaches `completed_pending_close` with effective red.
 
 ## 2026-08-21: semantically valid yellow critic failed a redundant equality
 

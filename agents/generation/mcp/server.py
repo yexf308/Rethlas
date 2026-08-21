@@ -4138,6 +4138,35 @@ def _prior_official_review_payload(
     return prior
 
 
+def _active_prior_official_review_body(
+    problem_id: str, prior: Mapping[str, Any]
+) -> Dict[str, Any]:
+    """Resolve the active supersession of one immutable official cutoff."""
+
+    matches: List[Dict[str, Any]] = []
+    for record in _trusted_checkpoint_records(problem_id).values():
+        body = record["record"]
+        if (
+            record["channel"] == "route_reviews"
+            and body.get("schema_version") == _REVIEW_MEMORY_SCHEMA
+            and body.get("state") == "official_published"
+            and body.get("review_id") == prior.get("review_id")
+            and body.get("cycle_id") == prior.get("cycle_id")
+            and body.get("cycle") == prior.get("cycle")
+            and body.get("review_ordinal") == prior.get("review_ordinal")
+            and body.get("snapshot_sha256") == prior.get("snapshot_sha256")
+            and body.get("official_published_record_id") == prior.get("record_id")
+            and body.get("official_published_timestamp_utc")
+            == prior.get("timestamp_utc")
+            and body.get("report") == prior.get("report")
+            and body.get("decision") == prior.get("decision")
+        ):
+            matches.append(deepcopy(body))
+    if len(matches) != 1:
+        raise ValueError("prior official review has no unique active supersession")
+    return matches[0]
+
+
 def _build_trusted_review_request(
     *,
     review_id: str,
@@ -4729,11 +4758,10 @@ def _pending_review_body(
     previous_decision = None
     prior = request["snapshot"]["prior_official_review"]
     if prior is not None:
-        active = _trusted_checkpoint_records(request["snapshot"]["problem_id"])
-        prior_record = active.get(prior["record_id"])
-        if prior_record is None:
-            raise ValueError("prior official review is no longer active")
-        previous_decision = prior_record["record"].get("decision")
+        prior_body = _active_prior_official_review_body(
+            request["snapshot"]["problem_id"], prior
+        )
+        previous_decision = prior_body.get("decision")
     expected_decision = apply_effective_verdict(
         report,
         review_id=request["review_id"],

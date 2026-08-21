@@ -2879,6 +2879,11 @@ def test_minute60_cutoff_survives_later_targeted_review_supersession(
     assert request["snapshot"]["progress_records"][0]["timestamp_utc"] == (
         "2026-08-10T23:10:00+00:00"
     )
+    active_prior = server._active_prior_official_review_body(
+        "frontier/example", request["snapshot"]["prior_official_review"]
+    )
+    assert active_prior["official_published_record_id"] == "mem_first_official"
+    assert active_prior["decision"] == prior_decision
 
 
 def test_next_cycle_minute30_uses_prior_cycle_same_route_yellow_cutoff(
